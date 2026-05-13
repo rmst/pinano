@@ -10,7 +10,8 @@
 //   // Persist credentials somewhere (file, secret manager, etc).
 //
 //   const model = {
-//     id: "gpt-5.1-codex",
+//     id: "gpt-5.5",
+//     wireModel: "gpt-5.5",
 //     provider: "openai-codex",
 //     baseUrl: "https://chatgpt.com/backend-api",
 //     reasoning: true,

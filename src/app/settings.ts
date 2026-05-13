@@ -18,12 +18,12 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-	model: "gpt-5.5",
+	model: "openai-codex/gpt-5.5",
 	thinkingLevel: "medium",
 	// Default off — matches COMPARISON.md "Default = no auto-resume". Toggle
 	// via /settings if you want -r behavior to be the default.
 	autoResume: false,
-	scopedModelIds: ["gpt-5.5", "gpt-5.4-mini", "gpt-5.5-codex", "gpt-4o-mini"],
+	scopedModelIds: ["openai-codex/gpt-5.5", "gpt-5.5", "gpt-5.4-mini", "gpt-5.3-chat-latest"],
 	autocompactThreshold: 0.85,
 	doubleEscapeAction: "fork",
 }

@@ -65,7 +65,7 @@ function buildHeaders(model, accountId, token, sessionId, optionsHeaders) {
 function buildBody(model, context, options) {
 	const messages = convertResponsesMessages(model, context, { includeSystemPrompt: false })
 	const body = {
-		model: model.id,
+		model: model.wireModel ?? model.id,
 		store: false,
 		stream: true,
 		instructions: context.systemPrompt,

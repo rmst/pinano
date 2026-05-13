@@ -50,7 +50,7 @@ Last synced against pi @ [`3d5cbe98`](https://github.com/earendil-works/pi/commi
 - [ ] Anthropic, Gemini, Copilot, Groq, OpenRouter (won't add)
 
 ## Model registry
-- [x] Curated registry: OpenAI cloud (gpt-5.x, gpt-4o*), Codex (gpt-5.x-codex), llamacpp, Kimi K2.x, DeepSeek V4. Numbers backfilled from pi's `models.generated.ts`.
+- [x] Curated registry: OpenAI cloud (gpt-5.3+), Codex via ChatGPT OAuth (`openai-codex/gpt-5.3+`, legacy `gpt-5.5-codex` / `gpt-5.4-codex` / `gpt-5.3-codex` settings still resolve), llamacpp, Kimi K2.x, DeepSeek V4. Numbers backfilled from pi's `models.generated.ts`.
 - [x] `--baseurl` and `--model` overrides; `/model` switch keeps the override (regression-tested)
 - [x] `/scoped-models` toggle list
 - [ ] `Ctrl+P` keybind to cycle through scoped models
@@ -135,4 +135,4 @@ Last synced against pi @ [`3d5cbe98`](https://github.com/earendil-works/pi/commi
 - **Session manager.** Reimplemented leaner. Pi's `compaction`, `model_change`, `branch_summary`, `custom_message`, `thinking_level_change` entry types dropped — we keep `message`, `label`, `session_info`, `custom`. Pi: ~750 LOC, pinano: ~400 LOC.
 - **App glue.** Fresh code (~600 LOC) instead of pi-coding-agent's ~22k LOC interactive mode + ~30 components.
 - **ai-apis quirks.** `src/ai-apis/sse.js` byte-buffers at event boundaries (qn's TextDecoder rejects `{ stream: true }`).
-- **API surface.** `src/ai-apis/` speaks both `/v1/chat/completions` and `/v1/responses`; the `stream`/`complete` exports dispatch on `model.transport`. gpt-5.x reasoning models are flagged `transport: "responses"` because OpenAI rejects tools+reasoning_effort on Chat Completions for that family. Everything else (gpt-4o, kimi, deepseek, llama.cpp) stays on Chat Completions.
+- **API surface.** `src/ai-apis/` speaks both `/v1/chat/completions` and `/v1/responses`; the `stream`/`complete` exports dispatch on `model.transport`. gpt-5.x reasoning models are flagged `transport: "responses"` because OpenAI rejects tools+reasoning_effort on Chat Completions for that family. Everything else (gpt-5.3-chat-latest, kimi, deepseek, llama.cpp) stays on Chat Completions.

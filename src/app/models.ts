@@ -2,24 +2,30 @@
 // pi-mono's `packages/ai/src/models.generated.ts` (commit 3d5cbe98) and are
 // kept in sync manually for the providers we actually care about:
 //
-//   - OpenAI cloud (API key)        — gpt-5.5 series, gpt-4o*
-//   - Codex (ChatGPT subscription)  — gpt-5.x-codex via OAuth
+//   - OpenAI cloud (API key)        — gpt-5.5 / gpt-5.4 / gpt-5.3+
+//   - Codex (ChatGPT subscription)  — gpt-5.x via OAuth
 //   - Local llama.cpp / OpenAI-compat
 //   - Moonshot Kimi K2.x
 //   - DeepSeek V4
 //
 // src/ai-apis speaks both /v1/chat/completions and /v1/responses. The
 // reasoning gpt-5.x family is responses-only when combined with tools, so we
-// flag those entries with `transport: "responses"`. Everything else (gpt-4o,
-// kimi, deepseek, llama.cpp) stays on chat completions, which is also what
+// flag those entries with `transport: "responses"`. Everything else (kimi,
+// deepseek, llama.cpp) stays on chat completions, which is also what
 // most OpenAI-compatible servers speak.
+
+import { resolveApiKey } from "./auth.ts"
+
+export type ModelProvider = "openai" | "openai-codex" | "llamacpp" | "moonshot" | "deepseek"
 
 export interface ModelEntry {
 	id: string
 	displayName: string
-	provider: "openai" | "openai-codex" | "llamacpp" | "moonshot" | "deepseek"
-	authProvider: "openai" | "openai-codex" | "llamacpp" | "moonshot" | "deepseek"
+	provider: ModelProvider
+	authProvider: ModelProvider
 	baseUrl: string
+	wireModel?: string
+	legacyIds?: string[]
 	reasoning: boolean
 	contextWindow: number
 	maxTokens: number
@@ -125,61 +131,14 @@ export const MODEL_REGISTRY: ModelEntry[] = [
 		maxTokens: 16_384,
 		cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
 	},
-	{
-		id: "gpt-5.2",
-		displayName: "GPT-5.2",
-		provider: "openai",
-		authProvider: "openai",
-		baseUrl: OPENAI_BASE,
-		reasoning: true,
-		transport: "responses",
-		contextWindow: 272_000,
-		maxTokens: 128_000,
-		cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-	},
-	{
-		id: "gpt-5.1",
-		displayName: "GPT-5.1",
-		provider: "openai",
-		authProvider: "openai",
-		baseUrl: OPENAI_BASE,
-		reasoning: true,
-		transport: "responses",
-		contextWindow: 400_000,
-		maxTokens: 16_384,
-		cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-	},
-	{
-		id: "gpt-4o",
-		displayName: "GPT-4o",
-		provider: "openai",
-		authProvider: "openai",
-		baseUrl: OPENAI_BASE,
-		reasoning: false,
-		contextWindow: 128_000,
-		maxTokens: 16_384,
-		cost: { input: 2.5, output: 10, cacheRead: 1.25, cacheWrite: 0 },
-	},
-	{
-		id: "gpt-4o-mini",
-		displayName: "GPT-4o mini",
-		provider: "openai",
-		authProvider: "openai",
-		baseUrl: OPENAI_BASE,
-		reasoning: false,
-		contextWindow: 128_000,
-		maxTokens: 16_384,
-		cost: { input: 0.15, output: 0.6, cacheRead: 0.075, cacheWrite: 0 },
-		tags: ["cheap"],
-	},
-
 	// ─── Codex (ChatGPT subscription, OAuth) ────────────────────────────────
 	{
-		id: "gpt-5.5-codex",
+		id: "gpt-5.5",
 		displayName: "GPT-5.5 (Codex)",
 		provider: "openai-codex",
 		authProvider: "openai-codex",
 		baseUrl: CODEX_BASE,
+		legacyIds: ["gpt-5.5-codex"],
 		reasoning: true,
 		contextWindow: 272_000,
 		maxTokens: 128_000,
@@ -187,11 +146,12 @@ export const MODEL_REGISTRY: ModelEntry[] = [
 		tags: ["subscription"],
 	},
 	{
-		id: "gpt-5.4-codex",
+		id: "gpt-5.4",
 		displayName: "GPT-5.4 (Codex)",
 		provider: "openai-codex",
 		authProvider: "openai-codex",
 		baseUrl: CODEX_BASE,
+		legacyIds: ["gpt-5.4-codex"],
 		reasoning: true,
 		contextWindow: 272_000,
 		maxTokens: 128_000,
@@ -199,42 +159,18 @@ export const MODEL_REGISTRY: ModelEntry[] = [
 		tags: ["subscription"],
 	},
 	{
-		id: "gpt-5.3-codex",
+		id: "gpt-5.3",
 		displayName: "GPT-5.3 Codex",
 		provider: "openai-codex",
 		authProvider: "openai-codex",
 		baseUrl: CODEX_BASE,
+		legacyIds: ["gpt-5.3-codex"],
 		reasoning: true,
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		tags: ["subscription"],
 	},
-	{
-		id: "gpt-5.2-codex",
-		displayName: "GPT-5.2 Codex",
-		provider: "openai-codex",
-		authProvider: "openai-codex",
-		baseUrl: CODEX_BASE,
-		reasoning: true,
-		contextWindow: 272_000,
-		maxTokens: 128_000,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		tags: ["subscription"],
-	},
-	{
-		id: "gpt-5.1-codex",
-		displayName: "GPT-5.1 Codex",
-		provider: "openai-codex",
-		authProvider: "openai-codex",
-		baseUrl: CODEX_BASE,
-		reasoning: true,
-		contextWindow: 272_000,
-		maxTokens: 128_000,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		tags: ["subscription"],
-	},
-
 	// ─── Local llama.cpp / OpenAI-compat ────────────────────────────────────
 	{
 		id: "local",
@@ -328,8 +264,47 @@ export const MODEL_REGISTRY: ModelEntry[] = [
 	},
 ]
 
-export function findModelEntry(id: string): ModelEntry | undefined {
-	return MODEL_REGISTRY.find((m) => m.id === id)
+function parseModelRef(ref: string): { provider?: ModelProvider; id: string } {
+	const match = ref.match(/^([^/]+)\/(.+)$/)
+	if (!match) return { id: ref }
+	return { provider: match[1] as ModelProvider, id: match[2] }
+}
+
+export function modelRef(entry: ModelEntry): string {
+	return entry.provider === "openai-codex" ? `${entry.provider}/${entry.id}` : entry.id
+}
+
+export function modelEntryMatches(entry: ModelEntry, id: string, provider?: ModelProvider): boolean {
+	const parsed = parseModelRef(id)
+	const expectedProvider = provider ?? parsed.provider
+	if (expectedProvider && entry.provider !== expectedProvider) return false
+	return entry.id === parsed.id || (entry.legacyIds ?? []).includes(parsed.id)
+}
+
+export function modelRefMatches(entry: ModelEntry, id: string): boolean {
+	if (id === modelRef(entry)) return true
+	if ((entry.legacyIds ?? []).includes(id)) return true
+	return !id.includes("/") && entry.provider !== "openai-codex" && modelEntryMatches(entry, id)
+}
+
+export function findModelEntry(id: string, options: { provider?: ModelProvider } = {}): ModelEntry | undefined {
+	const parsed = parseModelRef(id)
+	const provider = options.provider ?? parsed.provider
+	return MODEL_REGISTRY.find((m) => modelEntryMatches(m, parsed.id, provider))
+}
+
+export async function availableModelEntries(): Promise<ModelEntry[]> {
+	const providers = Array.from(new Set(MODEL_REGISTRY.map((m) => m.authProvider)))
+	const available = new Set(
+		(await Promise.all(providers.map(async (p) => ((await resolveApiKey(p)) ? p : undefined)))).filter(Boolean) as ModelProvider[],
+	)
+	return MODEL_REGISTRY
+		.filter((m) => available.has(m.authProvider))
+		.sort((a, b) => {
+			if (a.authProvider === "openai-codex" && b.authProvider !== "openai-codex") return -1
+			if (a.authProvider !== "openai-codex" && b.authProvider === "openai-codex") return 1
+			return 0
+		})
 }
 
 /**
@@ -339,7 +314,9 @@ export function findModelEntry(id: string): ModelEntry | undefined {
 export function buildModel(entry: ModelEntry, overrides: { baseUrl?: string; id?: string } = {}) {
 	return {
 		id: overrides.id ?? entry.id,
+		wireModel: entry.wireModel ?? entry.id,
 		provider: entry.provider,
+		authProvider: entry.authProvider,
 		baseUrl: overrides.baseUrl ?? entry.baseUrl,
 		reasoning: entry.reasoning,
 		transport: entry.transport,
@@ -356,6 +333,7 @@ export function buildModel(entry: ModelEntry, overrides: { baseUrl?: string; id?
  * local-llamacpp template — useful for local models like `qwen2.5-coder`.
  */
 export function resolveModel(id: string, overrides: { baseUrl?: string } = {}) {
-	const entry = findModelEntry(id) ?? findModelEntry("local")!
-	return buildModel(entry, { id: findModelEntry(id) ? undefined : id, baseUrl: overrides.baseUrl })
+	const entry = findModelEntry(id)
+	if (entry) return buildModel(entry, { baseUrl: overrides.baseUrl })
+	return buildModel(findModelEntry("local")!, { id, baseUrl: overrides.baseUrl })
 }

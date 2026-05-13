@@ -1,13 +1,13 @@
-// Overlay-driven slash commands: /model, /thinking, /resume, /login,
-// /scoped-models. Each opens a SelectList overlay and applies the choice.
+// Slash commands backed by modal overlays or full-width inline selectors.
 
 import type { SlashCommand } from "../slash-commands.ts"
 import { pickFromOverlay } from "../components/picker.ts"
+import { pickModel, rowsForModels } from "../components/model-selector.ts"
 import { pickSession } from "../components/session-selector.ts"
 import type { SessionRow } from "../components/session-selector.ts"
 import { promptForInput } from "../components/prompt-input.ts"
 import { theme } from "../theme.ts"
-import { MODEL_REGISTRY, resolveModel } from "../models.ts"
+import { availableModelEntries, modelRef, modelRefMatches, resolveModel } from "../models.ts"
 import { listSessions, loadSessionPreview } from "../session-store.ts"
 import { loadSettings, updateSetting } from "../settings.ts"
 import { setCredential } from "../auth.ts"
@@ -20,12 +20,20 @@ export const modelCommand: SlashCommand = {
 	name: "model",
 	description: "switch model",
 	handler: async (ctx) => {
-		const items = MODEL_REGISTRY.map((m) => ({
-			value: m.id,
-			label: `${m.id}${m.tags?.length ? ` (${m.tags.join(", ")})` : ""}`,
-			description: m.displayName,
-		}))
-		const chosen = await pickFromOverlay(ctx.tui, items)
+		const models = await availableModelEntries()
+		if (models.length === 0) {
+			ctx.appendLine(theme.dim("no authenticated models available; run /login first"))
+			return
+		}
+		const settings = await loadSettings()
+		const rows = rowsForModels(models, {
+			currentId: ctx.agent.state.model.id,
+			currentProvider: ctx.agent.state.model.provider,
+			scopedModelIds: settings.scopedModelIds,
+		})
+		const chosen = await pickModel(ctx, rows, {
+			initialSelectedValue: rows.find((r) => r.current)?.value,
+		})
 		if (!chosen) return
 		// Preserve any --baseurl override from the CLI so e.g. local llamacpp
 		// pointing at llamacpp.localhost survives a /model switch.
@@ -63,15 +71,21 @@ export const scopedModelsCommand: SlashCommand = {
 	description: "toggle which models cycle on Ctrl+P",
 	handler: async (ctx) => {
 		const settings = await loadSettings()
-		const items = MODEL_REGISTRY.map((m) => ({
-			value: m.id,
-			label: `${settings.scopedModelIds.includes(m.id) ? "[x]" : "[ ]"} ${m.id}`,
-			description: m.displayName,
-		}))
-		const chosen = await pickFromOverlay(ctx.tui, items)
+		const models = await availableModelEntries()
+		if (models.length === 0) {
+			ctx.appendLine(theme.dim("no authenticated models available; run /login first"))
+			return
+		}
+		const rows = rowsForModels(models, {
+			currentId: ctx.agent.state.model.id,
+			currentProvider: ctx.agent.state.model.provider,
+			scopedModelIds: settings.scopedModelIds,
+		})
+		const chosen = await pickModel(ctx, rows, { mode: "toggle" })
 		if (!chosen) return
-		const next = settings.scopedModelIds.includes(chosen)
-			? settings.scopedModelIds.filter((id) => id !== chosen)
+		const entry = models.find((m) => modelRef(m) === chosen)
+		const next = entry && settings.scopedModelIds.some((id) => modelRefMatches(entry, id))
+			? settings.scopedModelIds.filter((id) => !modelRefMatches(entry, id))
 			: [...settings.scopedModelIds, chosen]
 		await updateSetting("scopedModelIds", next)
 		ctx.appendLine(theme.dim(`scoped models: ${next.join(", ") || "(empty)"}`))

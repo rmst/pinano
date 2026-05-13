@@ -31,7 +31,7 @@ export class Footer {
 
 	update(): void {
 		const m = this.agent.state.model
-		const entry = findModelEntry(m.id)
+		const entry = findModelEntry(m.id, { provider: m.provider })
 		const modelLabel = entry?.displayName ?? m.id
 		const thinking = this.agent.state.thinkingLevel
 

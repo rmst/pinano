@@ -3,7 +3,8 @@
 // keybind in the TUI.
 
 import type { Settings } from "./settings.ts"
-import { MODEL_REGISTRY } from "./models.ts"
+import type { ModelEntry } from "./models.ts"
+import { MODEL_REGISTRY, modelEntryMatches, modelRef, modelRefMatches } from "./models.ts"
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"] as const
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number]
@@ -19,14 +20,15 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number]
 export function cycleModelId(
 	currentId: string,
 	scopedIds: string[],
+	models: ModelEntry[] = MODEL_REGISTRY,
 ): { id: string; isScoped: boolean } | null {
 	const scoped = scopedIds.length > 0
-		? MODEL_REGISTRY.filter((m) => scopedIds.includes(m.id))
-		: MODEL_REGISTRY
+		? models.filter((m) => scopedIds.some((id) => modelRefMatches(m, id)))
+		: models
 	if (scoped.length === 0) return null
-	const idx = scoped.findIndex((m) => m.id === currentId)
+	const idx = scoped.findIndex((m) => modelEntryMatches(m, currentId))
 	const next = scoped[(idx + 1) % scoped.length]!
-	return { id: next.id, isScoped: scopedIds.length > 0 }
+	return { id: modelRef(next), isScoped: scopedIds.length > 0 }
 }
 
 /** Cycle through the five thinking levels in fixed order. */

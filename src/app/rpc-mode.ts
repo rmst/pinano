@@ -17,7 +17,7 @@ import type { Session } from "../session-manager/index.js"
 
 import { compact } from "./compaction.ts"
 import { cycleModelId, cycleThinkingLevel } from "./cycle.ts"
-import { MODEL_REGISTRY, buildModel, resolveModel } from "./models.ts"
+import { MODEL_REGISTRY, availableModelEntries, buildModel, resolveModel } from "./models.ts"
 import { sessionsDir } from "./paths.ts"
 import {
 	createSession,
@@ -216,7 +216,11 @@ export async function runRpcMode(opts: RpcModeOptions): Promise<void> {
 
 			case "cycle_model": {
 				const settings = await loadSettings()
-				const cycled = cycleModelId(agent.state.model.id, settings.scopedModelIds)
+				const models = await availableModelEntries()
+				const currentId = agent.state.model.provider === "openai-codex"
+					? `openai-codex/${agent.state.model.id}`
+					: agent.state.model.id
+				const cycled = cycleModelId(currentId, settings.scopedModelIds, models)
 				if (!cycled) return success(id, "cycle_model", null)
 				agent.state.model = resolveModel(cycled.id, { baseUrl: baseUrlOverride }) as any
 				return success(id, "cycle_model", {
@@ -227,7 +231,7 @@ export async function runRpcMode(opts: RpcModeOptions): Promise<void> {
 			}
 
 			case "get_available_models": {
-				const models = MODEL_REGISTRY.map((entry) => buildModel(entry, { baseUrl: baseUrlOverride }))
+				const models = (await availableModelEntries()).map((entry) => buildModel(entry, { baseUrl: baseUrlOverride }))
 				return success(id, "get_available_models", { models })
 			}
 

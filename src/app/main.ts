@@ -16,7 +16,7 @@ import { Agent } from "../agent-core/agent.js"
 import { createDefaultTools } from "../tools/index.js"
 import { runChat } from "./chat-mode.ts"
 import { resolveApiKey, getCredential, updateCredential } from "./auth.ts"
-import { resolveModel, findModelEntry } from "./models.ts"
+import { availableModelEntries, modelEntryMatches, modelRef, resolveModel, findModelEntry } from "./models.ts"
 import { loadSettings } from "./settings.ts"
 import { sessionsDir } from "./paths.ts"
 import { LazyContextLoader, formatLazyContextNotice, extractToolPath } from "./lazy-context.ts"
@@ -115,7 +115,7 @@ function printHelp() {
 			"",
 			"Options:",
 			"  --cwd DIR       working directory the agent operates in (default: $PWD)",
-			"  --model ID      model id (e.g. gpt-5.5, gpt-4o-mini, kimi-k2.6). Overrides settings.",
+			"  --model ID      model id (e.g. gpt-5.5, gpt-5.3-chat-latest, kimi-k2.6). Overrides settings.",
 			"  --baseurl URL   override the API base URL (for local llamacpp / openai-compat)",
 			"  -r, --resume    open a session picker on startup (default: start a new session)",
 			"  --session ARG   open a specific session — file path or session-id prefix (no picker)",
@@ -204,7 +204,9 @@ async function main() {
 	}
 
 	const settings = await loadSettings()
-	const modelId = args.model ?? settings.model
+	const availableModels = args.model ? [] : await availableModelEntries()
+	const configuredModel = availableModels.find((m) => modelEntryMatches(m, settings.model))
+	const modelId = args.model ?? (configuredModel ? settings.model : (availableModels[0] ? modelRef(availableModels[0]) : settings.model))
 	const model = resolveModel(modelId, { baseUrl: args.baseUrl })
 
 	// Resolve --session up-front so its stored cwd can drive the agent's
