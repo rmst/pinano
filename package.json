@@ -1,0 +1,21 @@
+{
+	"name": "pinano",
+	"version": "0.0.1",
+	"description": "Interactive AI assistant TUI — a slim port of pi.",
+	"type": "module",
+	"bin": {
+		"pinano": "./bin/pinano.js"
+	},
+	"scripts": {
+		"test": "node --test --no-warnings --experimental-transform-types 'test/**/*.test.js' 'test/**/*.test.ts'",
+		"start": "node --no-warnings --experimental-transform-types src/app/main.ts"
+	},
+	"engines": {
+		"node": ">=22.6.0"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/rmst/pinano.git"
+	},
+	"license": "MIT"
+}
