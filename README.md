@@ -1,6 +1,9 @@
 # pinano
 
-Interactive AI assistant TUI. Fork of [pi](https://github.com/earendil-works/pi) with all npm dependencies stripped — pure Node, nothing to install beyond the source.
+Interactive AI coding agent harness (TUI). Fork of [pi](https://github.com/earendil-works/pi) with:
+
+- **No npm dependencies.** Pure Node, nothing to install beyond the source.
+- **No build step.** Plain JS with JSDoc types throughout — same type-checking story as the TS source it was ported from, but no transform/compile step.
 
 A few small behavioural tweaks bring it closer to Claude Code (lazy `AGENTS.md`/`CLAUDE.md` loading, `@import` in context files, etc.). See **[COMPARISON.md](./COMPARISON.md)** for the feature-by-feature gap to upstream pi.
 
@@ -110,19 +113,19 @@ src/
   ai-apis/           zero-dep OpenAI Chat-Completions / Responses / Codex clients
   tools/             read, write, edit, bash, ls, grep, find
   session-manager/   JSONL + in-memory storage, parent-link tree
-  tui/               ported pi-tui — markdown.ts dropped, east-asian-width
+  tui/               ported pi-tui — markdown.js dropped, east-asian-width
                      vendored, Intl.Segmenter polyfilled for [qn](https://github.com/rmst/qn)
   app/
-    main.ts          entry, args, settings/auth wiring
-    chat-mode.ts     transcript + editor + slash dispatch + footer
-    slash-commands.ts registry
+    main.js          entry, args, settings/auth wiring
+    chat-mode.js     transcript + editor + slash dispatch + footer
+    slash-commands.js registry
     commands/        simple/, overlays/, compact/, branching/
     components/      footer, keybind-hints, picker, prompt-input
-    auth.ts          multi-provider credential store
-    models.ts        curated model registry
-    settings.ts      $XDG_CONFIG_HOME/pinano/settings.json
-    session-store.ts wraps Session for app-level open/list/resume/index
-    compaction.ts    auto-summarize older messages near context limit
+    auth.js          multi-provider credential store
+    models.js        curated model registry
+    settings.js      $XDG_CONFIG_HOME/pinano/settings.json
+    session-store.js wraps Session for app-level open/list/resume/index
+    compaction.js    auto-summarize older messages near context limit
 ```
 
 ## Notes / caveats

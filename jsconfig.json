@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"module": "nodenext",
+		"moduleResolution": "nodenext",
+		"target": "es2022",
+		"checkJs": true,
+		"noEmit": true,
+		"allowJs": true,
+		"strict": false,
+		"noImplicitAny": false,
+		"skipLibCheck": true,
+		"resolveJsonModule": true,
+		"types": ["node"]
+	},
+	"include": ["src/**/*.js", "test/**/*.js"],
+	"exclude": ["node_modules", "src/tools/vendor"]
+}
