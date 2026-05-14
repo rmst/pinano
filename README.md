@@ -1,13 +1,15 @@
-# pinano
+# Pinano
 
-Interactive AI coding agent harness (TUI). Fork of [pi](https://github.com/earendil-works/pi) with:
+(<i>experimental</i>)
+
+Interactive AI coding agent harness (terminal ui). Fork of [Pi](https://github.com/earendil-works/pi) with:
 
 - **No npm dependencies.** Pure Node, nothing to install beyond the source.
 - **No build step.** Plain JS with JSDoc types throughout — same type-checking story as the TS source it was ported from, but no transform/compile step.
 
-A few small behavioural tweaks bring it closer to Claude Code (lazy `AGENTS.md`/`CLAUDE.md` loading, `@import` in context files, etc.). See **[COMPARISON.md](./COMPARISON.md)** for the feature-by-feature gap to upstream pi.
+This avoids relying on the [wonky supply chains](https://simonramstedt.com/blog/2026-04-09-wonky-software-supply-chains/) of the original Pi agent.
 
-> **Status:** experimental, pre-1.0. APIs and CLI flags may change without notice.
+A few small behavioural tweaks bring it closer to Claude Code (lazy `AGENTS.md`/`CLAUDE.md` loading, `@import` in context files, etc.). See **[comparison.md](./comparison.md)** for the feature-by-feature gap to upstream Pi.
 
 ## Install & run
 
@@ -57,7 +59,7 @@ Type `/` to autocomplete. The full list (also via `/help`):
 |---|---|
 | `/help` | list commands |
 | `/hotkeys` | show keyboard shortcuts |
-| `/quit`, `/exit` | exit pinano |
+| `/quit`, `/exit` | exit Pinano |
 | `/clear` | clear the on-screen transcript (history is preserved) |
 | `/new` | start a new session for the current cwd |
 | `/resume` | session picker for the current cwd |
@@ -132,5 +134,5 @@ src/
 
 - **Runs on both [qn](https://github.com/rmst/qn) and Node.**
 - **Zero runtime dependencies.** `get-east-asian-width` is vendored under `src/tui/utils-vendor/` with its upstream LICENSE preserved.
-- **No markdown rendering, no syntax highlighting, no image processing** — explicitly out of scope per [COMPARISON.md](./COMPARISON.md).
+- **No markdown rendering, no syntax highlighting, no image processing** — explicitly out of scope per [comparison.md](./comparison.md).
 - **Session state lives in `$XDG_DATA_HOME/pinano/`.** Override the whole config+data root with `$PINANO_HOME`.
