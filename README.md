@@ -7,7 +7,7 @@ Interactive AI coding agent harness (terminal ui). Fork of [Pi](https://github.c
 - **No npm dependencies.** Pure Node, nothing to install beyond the source.
 - **No build step.** Plain JS with JSDoc types throughout — same type-checking story as the TS source it was ported from, but no transform/compile step.
 
-This avoids relying on the [wonky supply chains](https://simonramstedt.com/blog/2026-04-09-wonky-software-supply-chains/) of the original Pi agent.
+This avoids relying on [wonky supply chains](https://simonramstedt.com/blog/2026-04-09-wonky-software-supply-chains/).
 
 A few small behavioural tweaks bring it closer to Claude Code (lazy `AGENTS.md`/`CLAUDE.md` loading, `@import` in context files, etc.). See **[comparison.md](./comparison.md)** for the feature-by-feature gap to upstream Pi.
 
@@ -24,9 +24,7 @@ Or clone and run without installing:
 
 ```bash
 git clone https://github.com/rmst/pinano
-cd pinano
-./bin/pinano.js          # same as `pinano` once installed
-npm start                # equivalent
+node pinano/bin/pinano.js
 ```
 
 Usage:
@@ -42,7 +40,7 @@ pinano --help
 
 Auth on first run: type `/login` in the TUI.
 
-Pinano recognizes the following env vars as fallback API keys:
+Pinano recognizes the following env vars as API keys:
 
 - `OPENAI_API_KEY`
 - `LLAMACPP_API_KEY`
@@ -89,11 +87,11 @@ Rewind: press `Esc Esc` on an empty editor to roll back to a previous user messa
 
 Pinano auto-discovers `AGENTS.md` (or `CLAUDE.md` as fallback) at session start. Three passes:
 
-1. **Globals** — `$XDG_CONFIG_HOME/pinano/` (or `$PINANO_HOME/config/`) and `~/.pinano/`.
+1. **Globals** — `~/.pinano/`.
 2. **Ancestors of cwd** — walks up to `/`, one file per dir. cwd's own file has highest priority.
 3. **Subdirs on demand** — when a tool touches a path under cwd, any not-yet-loaded `AGENTS.md`/`CLAUDE.md` between cwd and that path is included in the tool's result.
 
-Within a single directory the priority is `AGENTS.md > AGENTS.MD > CLAUDE.md > CLAUDE.MD`.
+Within a single directory the priority is `AGENTS.md > CLAUDE.md`.
 
 Edits only apply to **new** sessions; resume replays the captured context verbatim.
 
@@ -130,9 +128,7 @@ src/
     compaction.js    auto-summarize older messages near context limit
 ```
 
-## Notes / caveats
+## Notes
 
-- **Runs on both [qn](https://github.com/rmst/qn) and Node.**
-- **Zero runtime dependencies.** `get-east-asian-width` is vendored under `src/tui/utils-vendor/` with its upstream LICENSE preserved.
+- If you don't like Node.js, Pinano also runs on our experimental hyper-minimalist [Qn](https://github.com/rmst/qn) runtime.
 - **No markdown rendering, no syntax highlighting, no image processing** — explicitly out of scope per [comparison.md](./comparison.md).
-- **Session state lives in `$XDG_DATA_HOME/pinano/`.** Override the whole config+data root with `$PINANO_HOME`.
