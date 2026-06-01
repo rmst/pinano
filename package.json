@@ -6,6 +6,12 @@
 	"bin": {
 		"pinano": "./bin/pinano.js"
 	},
+	"files": [
+		"bin/",
+		"src/",
+		"README.md",
+		"jsconfig.json"
+	],
 	"scripts": {
 		"test": "node --test --no-warnings --experimental-transform-types 'test/**/*.test.js' 'test/**/*.test.ts'",
 		"start": "node --no-warnings src/app/main.js"
