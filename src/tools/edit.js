@@ -67,9 +67,10 @@ function prepareEditArguments(input) {
 
 /**
  * @param {string} cwd
+ * @param {{ beforeFileMutation?: (info: { absolutePath: string, path: string }) => Promise<void> | void }} [options]
  * @returns {import("../agent-core/types.js").AgentTool}
  */
-export function createEditTool(cwd) {
+export function createEditTool(cwd, options = {}) {
 	return {
 		name: "edit",
 		label: "edit",
@@ -100,6 +101,8 @@ export function createEditTool(cwd) {
 				if (signal?.aborted) throw new Error("Operation aborted")
 
 				const finalContent = bom + restoreLineEndings(newContent, ending)
+				await options.beforeFileMutation?.({ absolutePath: abs, path })
+				if (signal?.aborted) throw new Error("Operation aborted")
 				await writeFile(abs, finalContent, "utf-8")
 
 				const { diff, firstChangedLine } = generateDiffString(baseContent, newContent)

@@ -1,29 +1,64 @@
 // Centralized path resolution for pinano on-disk state.
 //
-// Defaults to XDG ($XDG_CONFIG_HOME, $XDG_DATA_HOME), falls back to ~/.config
-// and ~/.local/share. Override the entire config/data root with $PINANO_HOME
-// — useful for tests.
+// Defaults to ~/.pinano. Override the entire config/data root with
+// $PINANO_HOME — useful for tests and custom installs.
 
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
+
+function pinanoHome() {
+	return process.env.PINANO_HOME || join(homedir(), ".pinano")
+}
+
+export function isPinanoTestProcess() {
+	if (process.env.PINANO_TEST === "1") return true
+	if (process.env.NODE_TEST_CONTEXT) return true
+	return process.argv.some((arg) => arg === "--test" || /\.test\.[cm]?[jt]s$/.test(arg))
+}
+
+function assertSafeTestHome() {
+	if (!isPinanoTestProcess() || process.env.PINANO_ALLOW_PRODUCTION_HOME_IN_TESTS === "1") return
+	const home = process.env.PINANO_HOME
+	const persistentAgentHome = resolve(homedir(), ".pinano")
+	if (!home) {
+		throw new Error("Pinano tests require an isolated PINANO_HOME. Set PINANO_HOME to a temp directory.")
+	}
+	const resolved = resolve(home)
+	if (resolved === persistentAgentHome || resolved.startsWith(`${persistentAgentHome}/`)) {
+		throw new Error(`Pinano tests refuse to use persistent PINANO_HOME (${home}). Set PINANO_HOME to a temp directory.`)
+	}
+}
 
 /** @returns {string} */
 export function configRoot() {
-	if (process.env.PINANO_HOME) return join(process.env.PINANO_HOME, "config")
-	const xdg = process.env.XDG_CONFIG_HOME
-	return join(xdg ?? join(homedir(), ".config"), "pinano")
+	assertSafeTestHome()
+	return join(pinanoHome(), "config")
 }
 
 /** @returns {string} */
 export function dataRoot() {
-	if (process.env.PINANO_HOME) return join(process.env.PINANO_HOME, "data")
-	const xdg = process.env.XDG_DATA_HOME
-	return join(xdg ?? join(homedir(), ".local/share"), "pinano")
+	assertSafeTestHome()
+	return join(pinanoHome(), "data")
 }
 
 /** @returns {string} */
 export function settingsPath() {
 	return join(configRoot(), "settings.json")
+}
+
+/** @returns {string} */
+export function defaultSettingsPath() {
+	return join(configRoot(), "default-settings.json")
+}
+
+/** @returns {string} */
+export function serviceConfigPath() {
+	return join(configRoot(), "service.json")
+}
+
+/** @returns {string} */
+export function environmentsConfigPath() {
+	return join(configRoot(), "environments.json")
 }
 
 /** @returns {string} */
@@ -40,17 +75,11 @@ export function authFilePath(provider) {
 }
 
 /**
- * Sessions live under data/, one file per session.
+ * SQLite database used by Pinano server/web mode and the TUI/RPC session store.
+ * It is the canonical store for session metadata, transcript entries, run state,
+ * and service lifecycle records.
  * @returns {string}
  */
-export function sessionsDir() {
-	return join(dataRoot(), "sessions")
-}
-
-/**
- * Index of cwd → most-recent-session-id.
- * @returns {string}
- */
-export function sessionIndexPath() {
-	return join(dataRoot(), "session-index.json")
+export function serverDbPath() {
+	return join(dataRoot(), "server.sqlite")
 }

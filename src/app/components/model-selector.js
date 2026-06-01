@@ -1,4 +1,4 @@
-// Full-width model selector shown via chat-mode's `showSelector` swap.
+// Full-width model selector shown via the chat `showSelector` swap.
 // Mirrors pi's model selector shape: search input, provider badges, current
 // marker, and an optional all/scoped toggle when scoped models are configured.
 
@@ -380,7 +380,7 @@ export function rowsForModels(models, opts = {}) {
 		return {
 			value,
 			entry,
-			current: opts.currentId ? modelEntryMatches(entry, opts.currentId, /** @type {any} */ (opts.currentProvider)) : false,
+			current: opts.currentId ? (opts.currentProvider ? modelEntryMatches(entry, opts.currentId, /** @type {any} */ (opts.currentProvider)) : modelRefMatches(entry, opts.currentId)) : false,
 			scoped: (opts.scopedModelIds ?? []).some((id) => modelRefMatches(entry, id)),
 		}
 	})

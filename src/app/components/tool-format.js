@@ -1,16 +1,20 @@
 // Concise one-line formatters for known tool calls. Mirrors pi's
 // `formatXxxCall` helpers (one per tool) — but inlined here as a single
 // dispatch table so we don't need to wire up pi's full ToolDefinition surface
-// (renderCall/renderResult/etc., per COMPARISON.md "won't add").
+// (renderCall/renderResult/etc.).
 //
-// Format: `<bold tool name> <accent arg>` plus optional dim suffix for
-// secondary args (limit, timeout, glob, line range). Unknown tools fall back
-// to JSON dump — same as pi's `formatToolExecution` fallback.
+// Format: `<bold tool name> <quiet arg>` plus optional dim suffix for
+// secondary args (limit, timeout, glob, line range). Unknown tools show an
+// inline JSON arg dump so every tool-call header remains one terminal row.
 
 import { homedir } from "node:os"
+import { formatSessionWriteSummary } from "../session-write-summary.js"
 import { theme } from "../theme.js"
 
 const HOME = homedir()
+
+/** @typedef {"pending" | "success" | "error"} ToolCallState */
+/** @typedef {{ state?: ToolCallState }} ToolCallFormatOptions */
 
 /**
  * @param {string} p
@@ -34,11 +38,30 @@ function pickStr(...candidates) {
 }
 
 /**
+ * @param {ToolCallState | undefined} state
+ * @returns {"toolTitle" | "toolTitleSuccess" | "toolTitleError"}
+ */
+function titleToken(state) {
+	if (state === "success") return "toolTitleSuccess"
+	if (state === "error") return "toolTitleError"
+	return "toolTitle"
+}
+
+/**
  * @param {string} name
+ * @param {ToolCallFormatOptions} [options]
  * @returns {string}
  */
-function title(name) {
-	return theme.bold(theme.fg("toolTitle", name))
+function title(name, options = {}) {
+	return theme.bold(theme.fg(titleToken(options.state), name))
+}
+
+/**
+ * @param {string} s
+ * @returns {string}
+ */
+function oneLine(s) {
+	return s.replace(/\s+/g, " ").trim()
 }
 
 /**
@@ -46,7 +69,7 @@ function title(name) {
  * @returns {string}
  */
 function arg(s) {
-	return theme.fg("accent", s)
+	return theme.fg("toolArg", s)
 }
 
 /**
@@ -54,17 +77,17 @@ function arg(s) {
  * @returns {string}
  */
 function dimNote(s) {
-	return theme.fg("muted", s)
+	return theme.fg("toolText", s)
 }
 
 /**
  * @param {any} args
  * @returns {string}
  */
-function fmtRead(args) {
+function fmtRead(args, options) {
 	const path = pickStr(args?.file_path, args?.path)
 	const display = path === null ? dimNote("(missing path)") : path ? arg(shorten(path)) : dimNote("...")
-	let out = `${title("read")} ${display}`
+	let out = `${title("read", options)} ${display}`
 	const offset = args?.offset
 	const limit = args?.limit
 	if (typeof offset === "number" || typeof limit === "number") {
@@ -79,31 +102,44 @@ function fmtRead(args) {
  * @param {any} args
  * @returns {string}
  */
-function fmtWrite(args) {
+function fmtWrite(args, options) {
 	const path = pickStr(args?.file_path, args?.path)
 	const display = path === null ? dimNote("(missing path)") : path ? arg(shorten(path)) : dimNote("...")
-	return `${title("write")} ${display}`
+	return `${title("write", options)} ${display}`
+}
+
+/**
+ * @param {any} input
+ * @param {ToolCallFormatOptions} [options]
+ * @returns {string}
+ */
+function fmtApplyPatch(input, options) {
+	const text = typeof input === "string" ? input : ""
+	const files = [...text.matchAll(/^\*\*\* (?:Add File|Update File|Delete File): (.+)$/gm)].map((match) => shorten(match[1]))
+	const suffix = files.length > 0 ? arg(files.slice(0, 3).join(", ")) : dimNote("...")
+	const more = files.length > 3 ? dimNote(` +${files.length - 3} more`) : ""
+	return `${title("edit", options)} ${suffix}${more}`
 }
 
 /**
  * @param {any} args
  * @returns {string}
  */
-function fmtEdit(args) {
+function fmtEdit(args, options) {
 	const path = pickStr(args?.file_path, args?.path)
 	const display = path === null ? dimNote("(missing path)") : path ? arg(shorten(path)) : dimNote("...")
-	return `${title("edit")} ${display}`
+	return `${title("edit", options)} ${display}`
 }
 
 /**
  * @param {any} args
  * @returns {string}
  */
-function fmtBash(args) {
+function fmtBash(args, options) {
 	const cmd = pickStr(args?.command)
 	const timeout = args?.timeout
-	const display = cmd === null ? dimNote("(missing command)") : cmd ? cmd : dimNote("...")
-	let out = title(`$ ${display}`)
+	const display = cmd === null ? dimNote("(missing command)") : cmd ? arg(oneLine(cmd)) : dimNote("...")
+	let out = `${title("$", options)} ${display}`
 	if (typeof timeout === "number") out += dimNote(` (timeout ${timeout}s)`)
 	return out
 }
@@ -112,9 +148,9 @@ function fmtBash(args) {
  * @param {any} args
  * @returns {string}
  */
-function fmtLs(args) {
+function fmtLs(args, options) {
 	const path = pickStr(args?.path) ?? "."
-	let out = `${title("ls")} ${arg(shorten(path))}`
+	let out = `${title("ls", options)} ${arg(shorten(path))}`
 	if (typeof args?.limit === "number") out += dimNote(` (limit ${args.limit})`)
 	return out
 }
@@ -123,10 +159,10 @@ function fmtLs(args) {
  * @param {any} args
  * @returns {string}
  */
-function fmtGrep(args) {
+function fmtGrep(args, options) {
 	const pattern = pickStr(args?.pattern)
 	const path = pickStr(args?.path) ?? "."
-	let out = `${title("grep")} ${pattern === null ? dimNote("(missing pattern)") : arg(pattern)} ${shorten(path)}`
+	let out = `${title("grep", options)} ${pattern === null ? dimNote("(missing pattern)") : arg(pattern)} ${arg(shorten(path))}`
 	const glob = pickStr(args?.glob)
 	if (glob) out += dimNote(` --glob ${glob}`)
 	if (typeof args?.limit === "number") out += dimNote(` (limit ${args.limit})`)
@@ -137,37 +173,70 @@ function fmtGrep(args) {
  * @param {any} args
  * @returns {string}
  */
-function fmtFind(args) {
+function fmtFind(args, options) {
 	const pattern = pickStr(args?.pattern)
 	const path = pickStr(args?.path) ?? "."
-	let out = `${title("find")} ${pattern === null ? dimNote("(missing pattern)") : arg(pattern)} ${shorten(path)}`
+	let out = `${title("find", options)} ${pattern === null ? dimNote("(missing pattern)") : arg(pattern)} ${arg(shorten(path))}`
 	if (typeof args?.limit === "number") out += dimNote(` (limit ${args.limit})`)
 	return out
 }
 
-/** @type {Record<string, (args: any) => string>} */
+/**
+ * @param {any} args
+ * @returns {string}
+ */
+function fmtJs(args, options) {
+	const code = pickStr(args?.code)
+	const display = code === null ? dimNote("(missing code)") : code ? oneLine(code) : dimNote("...")
+	return `${title("js", options)} ${arg(display.length > 100 ? `${display.slice(0, 100)}…` : display)}`
+}
+
+function fmtSessionSet(args, options) {
+	return `${title("session", options)} ${arg(formatSessionWriteSummary(args, { formatPath: shorten }))}`
+}
+
+/** @type {Record<string, (args: any, options: ToolCallFormatOptions) => string>} */
 const REGISTRY = {
 	read: fmtRead,
 	write: fmtWrite,
+	apply_patch: fmtApplyPatch,
 	edit: fmtEdit,
 	bash: fmtBash,
 	ls: fmtLs,
 	grep: fmtGrep,
 	find: fmtFind,
+	js: fmtJs,
+	sessionWrite: fmtSessionSet,
 }
 
 /**
- * Render a tool-call header. Returns just the title line — callers append
- * args/result rendering as needed. For unknown tools, returns the JSON
- * arg dump so the user can still see what's happening (the pi fallback path).
+ * @param {any} args
+ * @returns {string}
+ */
+function inlineJson(args) {
+	if (args === undefined || args === null) return ""
+	try {
+		const json = JSON.stringify(args)
+		return json === "{}" ? "" : json
+	} catch {
+		return oneLine(String(args))
+	}
+}
+
+/**
+ * Render a tool-call header. Returns a single title line; callers append
+ * result rendering as needed. For unknown tools, includes a compact inline
+ * arg dump so the user can still see what's happening.
  *
  * @param {string} name
  * @param {any} args
- * @returns {{ line: string, jsonFallback: boolean }}
+ * @param {ToolCallFormatOptions} [options]
+ * @returns {{ line: string }}
  */
-export function formatToolCall(name, args) {
+export function formatToolCall(name, args, options = {}) {
 	const fmt = REGISTRY[name]
-	if (fmt) return { line: fmt(args), jsonFallback: false }
-	const stripped = `${title(name)}`
-	return { line: stripped, jsonFallback: true }
+	if (fmt) return { line: fmt(args, options) }
+	const json = inlineJson(args)
+	const suffix = json ? ` ${dimNote(json)}` : ""
+	return { line: `${title(name, options)}${suffix}` }
 }

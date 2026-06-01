@@ -293,7 +293,7 @@ async function walkDirectoryWithFd(baseDir, fdPath, query, maxResults, signal) {
  * @implements {AutocompleteProvider}
  */
 export class CombinedAutocompleteProvider {
-	/** @type {(SlashCommand | AutocompleteItem)[]} */
+	/** @type {(SlashCommand | AutocompleteItem)[] | (() => (SlashCommand | AutocompleteItem)[])} */
 	commands;
 	/** @type {string} */
 	basePath;
@@ -301,7 +301,7 @@ export class CombinedAutocompleteProvider {
 	fdPath;
 
 	/**
-	 * @param {(SlashCommand | AutocompleteItem)[]} [commands]
+	 * @param {(SlashCommand | AutocompleteItem)[] | (() => (SlashCommand | AutocompleteItem)[])} [commands]
 	 * @param {string} basePath
 	 * @param {string | null} [fdPath]
 	 */
@@ -342,7 +342,8 @@ export class CombinedAutocompleteProvider {
 
 			if (spaceIndex === -1) {
 				const prefix = textBeforeCursor.slice(1);
-				const commandItems = this.commands.map((cmd) => {
+				const commands = typeof this.commands === "function" ? this.commands() : this.commands;
+				const commandItems = commands.map((cmd) => {
 					const name = "name" in cmd ? cmd.name : cmd.value;
 					const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
 					const desc = cmd.description ?? "";
@@ -370,8 +371,9 @@ export class CombinedAutocompleteProvider {
 
 			const commandName = textBeforeCursor.slice(1, spaceIndex);
 			const argumentText = textBeforeCursor.slice(spaceIndex + 1);
+			const commands = typeof this.commands === "function" ? this.commands() : this.commands;
 
-			const command = this.commands.find((cmd) => {
+			const command = commands.find((cmd) => {
 				const name = "name" in cmd ? cmd.name : cmd.value;
 				return name === commandName;
 			});

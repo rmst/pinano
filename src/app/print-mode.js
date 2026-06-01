@@ -1,6 +1,6 @@
 // Print mode (single-shot, non-interactive).
 //
-// Used for `pinano -p "do this"` and friends. Sends one or more prompts to the
+// Used for the hidden `pinano session print "do this"` helper. Sends one or more prompts to the
 // agent, then exits. Two output modes:
 //
 //   text  default. Streams nothing; on completion, writes the final assistant

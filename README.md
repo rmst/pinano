@@ -2,133 +2,183 @@
 
 (<i>experimental</i>)
 
-Interactive AI coding agent harness (terminal ui). Fork of [Pi](https://github.com/earendil-works/pi) with:
+Pinano is an interactive AI coding agent for the terminal. It is a deliberately slimmed-down fork of [Pi](https://github.com/earendil-works/pi), focused on a small, inspectable codebase:
 
-- **No npm dependencies.** Pure Node, nothing to install beyond the source.
-- **No build step.** Plain JS with JSDoc types throughout — same type-checking story as the TS source it was ported from, but no transform/compile step.
+- **No npm dependency tree for the core terminal app.**
+- **No build step.** Source is plain JavaScript with JSDoc types.
+- **Reconnectable sessions.** Agent runs can continue while terminal windows detach and reconnect.
 
-This avoids relying on [wonky supply chains](https://simonramstedt.com/blog/2026-04-09-wonky-software-supply-chains/).
+Pinano also borrows a few ideas from Claude Code and Codex CLI, including lazy `AGENTS.md` / `CLAUDE.md` loading and `@import` in context files.
 
-A few small behavioural tweaks bring it closer to Claude Code (lazy `AGENTS.md`/`CLAUDE.md` loading, `@import` in context files, etc.). See **[comparison.md](./comparison.md)** for the feature-by-feature gap to upstream Pi.
+## Screenshots and videos
 
-## Install & run
+Coming soon:
 
-Requires **Node ≥ 22.6**. No runtime dependencies.
+- screenshot: session overview
+- screenshot: open chat session
+- video: dispatching and reviewing background agents
+
+## Install
+
+Requires **Node ≥ 22.6**.
 
 ```bash
 npm install -g github:rmst/pinano
 pinano
 ```
 
-Or clone and run without installing:
+Or clone and run directly:
 
 ```bash
 git clone https://github.com/rmst/pinano
-node pinano/bin/pinano.js
+./pinano/bin/pinano.js
 ```
 
-Usage:
+On first run, Pinano opens model provider credentials when no provider is configured. Pinano is currently optimized for use with a ChatGPT subscription; **Use your ChatGPT subscription** starts the OpenAI OAuth flow. You can also open this page later with `pinano open /settings/credentials`, `/credentials` from the session overview, or the credentials item inside `/settings`.
+
+API keys are also supported. Pinano can import supported API keys from the launch environment (`OPENAI_API_KEY`, `MOONSHOT_API_KEY`/`KIMI_API_KEY`, `DEEPSEEK_API_KEY`, `LLAMACPP_API_KEY`) or accept manual entry from the credentials page. Deployment-level API key fallbacks can also be configured in `$PINANO_HOME/config/service.json`:
+
+```json
+{
+	"providers": {
+		"openai": { "apiKey": "..." },
+		"moonshot": { "apiKey": "..." },
+		"llamacpp": { "apiKey": "..." },
+		"deepseek": { "apiKey": "..." }
+	}
+}
+```
+
+Launcher/deployment defaults for user settings can be placed in `$PINANO_HOME/config/default-settings.json`. Pinano merges built-in defaults, `default-settings.json`, and user-owned `settings.json` in that order.
+
+## Common commands
 
 ```bash
-pinano                                                  # fresh session, model from settings.json
-pinano -r                                               # open the resume picker on startup
-pinano --baseurl http://localhost:8080/v1 --model local # local llama.cpp / openai-compat host
-pinano -p "summarize README.md"                         # print mode: single-shot, exit
-pinano --mode json "do this"                            # print mode: one JSON event per line
+pinano                           # open the session overview
+pinano open /                    # open the session overview
+pinano open /chat/<id>           # open a session
+pinano open /settings/credentials # manage ChatGPT/API-key credentials
+pinano service                   # show local service status
+pinano service status --json     # show local service status as JSON
 pinano --help
 ```
 
-Auth on first run: type `/login` in the TUI.
+## Session overview
 
-Pinano recognizes the following env vars as API keys:
+Running `pinano` opens an overview of your sessions. Type a task and press `Enter` to start a new background session in the current directory. Use `/model` from the overview to update the global default model for newly dispatched sessions.
 
-- `OPENAI_API_KEY`
-- `LLAMACPP_API_KEY`
-- `MOONSHOT_API_KEY`
-- `DEEPSEEK_API_KEY`
+Useful keys:
 
-For ChatGPT subscriptions, `/login openai-codex` opens a PKCE OAuth flow; tokens are refreshed on demand.
+| Key | Action |
+|---|---|
+| `↑` / `↓` | select a session |
+| `Enter` / `→` | open the selected session |
+| `←` | return to the overview |
+| `Space` | peek at the selected session or reply to it |
+| `Esc` | interrupt an open running session |
+| `Ctrl+X` | stop a selected running session |
+| `Ctrl+C` | detach this terminal without stopping running sessions |
 
-## In-app slash commands
+Sessions are grouped by review state, such as `Needs input`, `Ready for review`, `Working`, `Deferred`, and `Completed`.
 
-Type `/` to autocomplete. The full list (also via `/help`):
+Pinano keeps running sessions alive when you detach from the terminal and shuts down automatically after all sessions are idle.
+
+## In-app commands
+
+Type `/` to autocomplete. `/help` shows the full command list for the current view.
+
+### Overview commands
 
 | Command | What it does |
 |---|---|
-| `/help` | list commands |
-| `/hotkeys` | show keyboard shortcuts |
-| `/quit`, `/exit` | exit Pinano |
-| `/clear` | clear the on-screen transcript (history is preserved) |
-| `/new` | start a new session for the current cwd |
-| `/resume` | session picker for the current cwd |
-| `/sessions` | print sessions list for the current cwd |
-| `/session` | show metadata for the active session |
-| `/name <text>` | name the active session |
-| `/model` | model selector |
-| `/scoped-models` | toggle which models cycle on Ctrl+P |
-| `/thinking [level]` | switch reasoning effort (off/minimal/low/medium/high) |
-| `/compact` | summarize older messages into a single compaction note |
-| `/fork` | fork from a previous user message in this session |
-| `/clone` | duplicate the session at the current point |
-| `/tree` | switch to a different branch (leaf) of the session tree |
-| `/login` | OpenAI API key entry or Codex OAuth |
-| `/logout [provider]` | drop a stored credential |
-| `/copy` | copy last assistant message to clipboard (OSC 52) |
-| `/cwd` | print current working directory |
-| `/system` | print the current system prompt |
-| `/reload` | rebuild session index, reload settings |
-| `/settings` | overlay UI for settings.json (model, thinking, autoResume, threshold, scoped models, doubleEscapeAction) |
+| `/model [model]` | select the default model for new sessions |
+| `/reasoning` | set the default reasoning effort for new sessions |
+| `/usage` | show ChatGPT/Codex usage limits |
+| `/settings` | edit local settings; includes credentials |
 
-Bash shortcut: type `!cmd` (e.g. `!ls`) to run a shell command directly without an LLM round-trip — output is appended to the transcript and to context. `!!cmd` does the same but excludes the result from agent context.
+### Session commands
 
-Rewind: press `Esc Esc` on an empty editor to roll back to a previous user message. Defaults to opening `/fork` — pick a past user message, then choose `Rewind` or `Rewind with branch summary` (one-shot LLM summary of the discarded tail attached at the new leaf). Either way the picked message is dropped back into the editor so you can edit and re-send. Set `doubleEscapeAction` to `tree` for the leaf picker instead, or `none` to disable.
+| Command | What it does |
+|---|---|
+| `/agents`, `/bg`, `/background` | return to the session overview |
+| `/continue` | resume an interrupted turn, or ask the model to continue |
+| `/abort` | abort the current turn |
+| `/session` | show current session metadata |
+| `/fast on|off|status` | toggle Codex Fast mode when supported by the model |
+| `/compact` | compact older conversation messages |
+| `/branch` | create a new session from the current conversation branch |
+| `/rewind` | rewind to an earlier prompt or switch branch |
+| `/context` | show context usage |
+| `/system` | show system prompt, tools, and loaded project context |
+| `/log [clear]` | show captured stderr or clear it |
 
-## Project context (AGENTS.md / CLAUDE.md)
+In an open session, type `!cmd` to run a shell command directly. Use `!!cmd` to run it without adding the result to agent context.
 
-Pinano auto-discovers `AGENTS.md` (or `CLAUDE.md` as fallback) at session start. Three passes:
+## Branching and rewind
 
-1. **Globals** — `~/.pinano/`.
-2. **Ancestors of cwd** — walks up to `/`, one file per dir. cwd's own file has highest priority.
-3. **Subdirs on demand** — when a tool touches a path under cwd, any not-yet-loaded `AGENTS.md`/`CLAUDE.md` between cwd and that path is included in the tool's result.
+`/branch` creates a new session from the current conversation point. The original session remains unchanged and both sessions can continue independently.
 
-Within a single directory the priority is `AGENTS.md > CLAUDE.md`.
+Press `Esc Esc` on an empty editor to open `/rewind`. You can return to an earlier prompt, switch to another branch tip, and optionally restore files changed through Pinano's `write` and `edit` tools.
 
-Edits only apply to **new** sessions; resume replays the captured context verbatim.
+## Tool environments
+
+By default tools run locally. You can also configure Docker or SSH environments in `$PINANO_HOME/config/environments.json`:
+
+```json
+{
+	"default": "local",
+	"environments": {
+		"local": { "worker": "local" },
+		"container": {
+			"worker": "docker:pinano-tools",
+			"cwd": "/workspace/project"
+		},
+		"remote": {
+			"worker": "ssh:devbox",
+			"cwd": "/home/me/project"
+		}
+	}
+}
+
+```
+
+`cwd` is the working directory inside that environment. Pinano does not guess host/container path mappings.
+
+## Project context
+
+Pinano reads project instructions from `AGENTS.md` or `CLAUDE.md`:
+
+1. Global instructions under `~/.pinano/`.
+2. Instructions in ancestor directories of the current working directory.
+3. Additional instructions in subdirectories when a tool first touches files there.
+
+If both files exist in the same directory, `AGENTS.md` wins.
+
+Context files are captured when a session starts or when a subdirectory is loaded. Resuming an old session reuses the captured instructions, so later edits only affect new sessions.
 
 ### `@import`
 
-A line whose only non-whitespace content is `@<path>` is replaced with that file's contents (recursive, max 5 levels). Relative paths resolve against the importing file; `~/` expands to `$HOME`. Only line-based imports — `@anthropic-ai/sdk` or `@deprecated` in prose is left alone.
+`@<path>` references in normal Markdown text are replaced with that file's contents. Relative paths resolve against the importing file; `~/` expands to `$HOME`. Inline code and fenced code blocks are left alone.
 
-```
+```md
 # project rules
-see also: @./conventions.md
+See @README for project overview.
+@./conventions.md
 @~/.pinano/personal-style.md
 ```
 
-## Layout
+## Repository layout
 
-```
+```text
 src/
-  agent-core/        AgentLoop + Agent (streamFn-driven), JSDoc types
-  ai-apis/           zero-dep OpenAI Chat-Completions / Responses / Codex clients
-  tools/             read, write, edit, bash, ls, grep, find
-  session-manager/   JSONL + in-memory storage, parent-link tree
-  tui/               ported pi-tui — markdown.js dropped, east-asian-width
-                     vendored, Intl.Segmenter polyfilled for [qn](https://github.com/rmst/qn)
-  app/
-    main.js          entry, args, settings/auth wiring
-    chat-mode.js     transcript + editor + slash dispatch + footer
-    slash-commands.js registry
-    commands/        simple/, overlays/, compact/, branching/
-    components/      footer, keybind-hints, picker, prompt-input
-    auth.js          multi-provider credential store
-    models.js        curated model registry
-    settings.js      $XDG_CONFIG_HOME/pinano/settings.json
-    session-store.js wraps Session for app-level open/list/resume/index
-    compaction.js    auto-summarize older messages near context limit
+  agent-core/        Agent loop and state
+  ai-apis/           OpenAI Chat Completions / Responses / Codex clients
+  tools/             read, write, edit, bash, ls, grep, find, js
+  session-manager/   SQLite + in-memory session storage
+  tui/               terminal UI components
+  app/               CLI, settings, auth, service, overview, chat UI
 ```
 
 ## Notes
 
-- If you don't like Node.js, Pinano also runs on our experimental hyper-minimalist [Qn](https://github.com/rmst/qn) runtime.
-- **No markdown rendering, no syntax highlighting, no image processing** — explicitly out of scope per [comparison.md](./comparison.md).
+- Pinano also runs on the experimental [Qn](https://github.com/rmst/qn) runtime.

@@ -1,3 +1,4 @@
+import { RetainedComponent } from "../tui.js";
 import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 
 /** @typedef {import("../tui.js").Component} Component */
@@ -7,7 +8,7 @@ import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.
  *
  * @implements {Component}
  */
-export class Text {
+export class Text extends RetainedComponent {
 	/** @type {string} */
 	text;
 	/** @type {number} */
@@ -32,6 +33,7 @@ export class Text {
 	 * @param {(text: string) => string} [customBgFn]
 	 */
 	constructor(text = "", paddingX = 1, paddingY = 1, customBgFn) {
+		super();
 		this.text = text;
 		this.paddingX = paddingX;
 		this.paddingY = paddingY;
@@ -44,6 +46,7 @@ export class Text {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.markDirty();
 	}
 
 	/** @param {(text: string) => string} [customBgFn] */
@@ -52,12 +55,14 @@ export class Text {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.markDirty();
 	}
 
 	invalidate() {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.markDirty();
 	}
 
 	/**

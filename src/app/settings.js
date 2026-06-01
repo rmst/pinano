@@ -4,42 +4,133 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises"
 import { dirname } from "node:path"
 
-import { settingsPath } from "./paths.js"
+import { normalizeReasoningLevel } from "../reasoning.js"
+import { defaultSettingsPath, settingsPath } from "./paths.js"
 
-/** @typedef {"off" | "minimal" | "low" | "medium" | "high"} ThinkingLevel */
+/** @typedef {import("../reasoning.js").ReasoningLevel} ThinkingLevel */
+
+/**
+ * @typedef {object} ModelSettings
+ * @property {string} [extends]
+ * @property {string} [displayName]
+ * @property {"openai" | "openai-codex" | "llamacpp" | "moonshot" | "deepseek"} [provider]
+ * @property {"openai" | "openai-codex" | "llamacpp" | "moonshot" | "deepseek"} [authProvider]
+ * @property {string} [baseUrl]
+ * @property {string} [wireModel]
+ * @property {boolean} [reasoning]
+ * @property {number} [contextWindow]
+ * @property {number} [maxTokens]
+ * @property {{ input?: number, output?: number, cacheRead?: number, cacheWrite?: number }} [cost]
+ * @property {("text" | "image")[]} [input]
+ * @property {Record<string, unknown>} [compat]
+ * @property {{ implicitResponses?: boolean }} [compaction]
+ * @property {"chat" | "responses"} [transport]
+ * @property {"default" | "apply_patch"} [toolProfile]
+ * @property {string[]} [tags]
+ */
 
 /**
  * @typedef {object} Settings
  * @property {string} model
- * @property {"off" | "minimal" | "low" | "medium" | "high"} thinkingLevel
- * @property {boolean} autoResume
+ * @property {Record<string, ModelSettings>} models
+ * @property {ThinkingLevel} thinkingLevel
  * @property {string[]} scopedModelIds
  * @property {number} autocompactThreshold
- * @property {"tree" | "fork" | "none"} doubleEscapeAction
+ * @property {"rewind" | "none"} doubleEscapeAction
+ * @property {boolean} web
+ * @property {boolean} showThinkingOutput
+ * @property {boolean} showToolOutput
  */
 
 /** @type {Settings} */
 export const DEFAULT_SETTINGS = {
 	model: "openai-codex/gpt-5.5",
-	thinkingLevel: "medium",
-	// Default off — matches COMPARISON.md "Default = no auto-resume". Toggle
-	// via /settings if you want -r behavior to be the default.
-	autoResume: false,
-	scopedModelIds: ["openai-codex/gpt-5.5", "gpt-5.5", "gpt-5.4-mini", "gpt-5.3-chat-latest"],
+	models: {},
+	thinkingLevel: "high",
+	scopedModelIds: ["openai-codex/gpt-5.5", "openai-codex/gpt-5.4-mini", "gpt-5.5", "gpt-5.4-mini"],
 	autocompactThreshold: 0.85,
-	doubleEscapeAction: "fork",
+	doubleEscapeAction: "rewind",
+	web: false,
+	showThinkingOutput: false,
+	showToolOutput: false,
+}
+
+const SETTING_KEYS = /** @type {const} */ ([
+	"model",
+	"models",
+	"thinkingLevel",
+	"scopedModelIds",
+	"autocompactThreshold",
+	"doubleEscapeAction",
+	"web",
+	"showThinkingOutput",
+	"showToolOutput",
+])
+
+/**
+ * @param {string} path
+ * @returns {Promise<Partial<Settings>>}
+ */
+async function readSettingsFile(path) {
+	try {
+		const text = await readFile(path, "utf-8")
+		const parsed = /** @type {Record<string, unknown>} */ (JSON.parse(text))
+		/** @type {Partial<Settings>} */
+		const settings = {}
+		for (const key of SETTING_KEYS) {
+			if (Object.hasOwn(parsed, key)) settings[key] = /** @type {any} */ (parsed[key])
+		}
+		return settings
+	} catch (/** @type {any} */ err) {
+		if (err.code === "ENOENT") return {}
+		throw err
+	}
+}
+
+function plainObject(value) {
+	return value && typeof value === "object" && !Array.isArray(value) ? value : {}
+}
+
+function mergeModelSettings(...sources) {
+	const merged = {}
+	for (const source of sources) {
+		for (const [id, config] of Object.entries(plainObject(source))) {
+			if (config && typeof config === "object" && !Array.isArray(config)) merged[id] = { ...(merged[id] ?? {}), ...config }
+		}
+	}
+	return merged
 }
 
 /** @returns {Promise<Settings>} */
 export async function loadSettings() {
-	try {
-		const text = await readFile(settingsPath(), "utf-8")
-		const parsed = /** @type {Partial<Settings>} */ (JSON.parse(text))
-		return { ...DEFAULT_SETTINGS, ...parsed }
-	} catch (/** @type {any} */ err) {
-		if (err.code === "ENOENT") return { ...DEFAULT_SETTINGS }
-		throw err
+	const defaultSettings = await readSettingsFile(defaultSettingsPath())
+	const userSettings = await readSettingsFile(settingsPath())
+	const merged = { ...DEFAULT_SETTINGS, ...defaultSettings, ...userSettings }
+	merged.models = mergeModelSettings(DEFAULT_SETTINGS.models, defaultSettings.models, userSettings.models)
+	merged.thinkingLevel = normalizeReasoningLevel(merged.thinkingLevel) ?? DEFAULT_SETTINGS.thinkingLevel
+	if (merged.doubleEscapeAction === "fork" || merged.doubleEscapeAction === "tree") merged.doubleEscapeAction = "rewind"
+	return merged
+}
+
+/**
+ * @param {Settings} settings
+ * @returns {{ showThinkingOutput: boolean, showToolOutput: boolean }}
+ */
+export function messageRenderOptionsFromSettings(settings) {
+	return {
+		showThinkingOutput: settings.showThinkingOutput,
+		showToolOutput: settings.showToolOutput,
 	}
+}
+
+/**
+ * @param {Partial<Settings>} settings
+ * @returns {Promise<void>}
+ */
+async function writeUserSettings(settings) {
+	const path = settingsPath()
+	await mkdir(dirname(path), { recursive: true })
+	await writeFile(path, JSON.stringify(settings, null, 2))
 }
 
 /**
@@ -47,9 +138,7 @@ export async function loadSettings() {
  * @returns {Promise<void>}
  */
 export async function saveSettings(settings) {
-	const path = settingsPath()
-	await mkdir(dirname(path), { recursive: true })
-	await writeFile(path, JSON.stringify(settings, null, 2))
+	await writeUserSettings(settings)
 }
 
 /**
@@ -60,8 +149,7 @@ export async function saveSettings(settings) {
  * @returns {Promise<Settings>}
  */
 export async function updateSetting(key, value) {
-	const current = await loadSettings()
-	const next = { ...current, [key]: value }
-	await saveSettings(next)
-	return next
+	const userSettings = await readSettingsFile(settingsPath())
+	await writeUserSettings({ ...userSettings, [key]: value })
+	return loadSettings()
 }

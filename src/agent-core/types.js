@@ -11,6 +11,7 @@
  * @typedef {import("../ai-apis/types.js").Message} Message
  * @typedef {import("../ai-apis/types.js").AssistantMessage} AssistantMessage
  * @typedef {import("../ai-apis/types.js").AssistantMessageEvent} AssistantMessageEvent
+ * @typedef {import("../ai-apis/types.js").AssistantAuth} AssistantAuth
  * @typedef {import("../ai-apis/types.js").ToolResultMessage} ToolResultMessage
  * @typedef {import("../ai-apis/types.js").ToolCall} ToolCall
  * @typedef {import("../ai-apis/types.js").Tool} Tool
@@ -18,13 +19,13 @@
  * @typedef {import("../ai-apis/types.js").Context} Context
  */
 
-/** @typedef {"off" | "minimal" | "low" | "medium" | "high"} ThinkingLevel */
+/** @typedef {import("../reasoning.js").ReasoningLevel | "off"} ThinkingLevel */
 
 /** @typedef {"sequential" | "parallel"} ToolExecutionMode */
 
 /** @typedef {Message | { role: string, [k: string]: any }} AgentMessage */
 
-/** @typedef {{ type: "toolCall", id: string, name: string, arguments: Record<string, any> }} AgentToolCall */
+/** @typedef {{ type: "toolCall", id: string, name: string, arguments?: Record<string, any>, input?: string }} AgentToolCall */
 
 /**
  * @template T
@@ -102,7 +103,9 @@
  * @typedef {object} AgentLoopConfig
  * @property {Model} model
  * @property {ThinkingLevel} [reasoning]
+ * @property {string} [serviceTier]
  * @property {string} [apiKey]
+ * @property {AssistantAuth} [auth]
  * @property {string} [sessionId]
  * @property {AbortSignal} [signal]
  * @property {ToolExecutionMode} [toolExecution]

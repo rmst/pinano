@@ -6,6 +6,7 @@
 
 import { EventStream, validateToolArguments } from "../ai-apis/index.js"
 import { streamSimple as defaultStreamFn } from "./stream-adapter.js"
+import { isUncertainToolExecutionError } from "./tool-errors.js"
 
 /** @typedef {import("./types.js").AgentContext} AgentContext */
 /** @typedef {import("./types.js").AgentEvent} AgentEvent */
@@ -26,6 +27,63 @@ function createAgentStream() {
 		(event) => event.type === "agent_end",
 		(event) => (event.type === "agent_end" ? event.messages : []),
 	)
+}
+
+/** @param {AgentMessage | undefined} message */
+function toolCallsOf(message) {
+	return message?.role === "assistant" && Array.isArray(message.content)
+		? message.content.filter((c) => c?.type === "toolCall")
+		: []
+}
+
+/**
+ * If the transcript ends in an assistant tool-call turn plus zero or more
+ * toolResults, return the still-unanswered tool-call IDs. This covers durable
+ * recovery after only part of a sequential tool batch was persisted: the next
+ * action is to execute the not-yet-answered calls, not to call the model with an
+ * incomplete batch and not to repeat already answered side effects.
+ * @param {AgentMessage[]} messages
+ * @returns {{ message: AgentMessage, pendingToolCallIds: string[] } | undefined}
+ */
+function pendingToolBatch(messages) {
+	let assistantIndex = messages.length - 1
+	while (assistantIndex >= 0 && messages[assistantIndex]?.role === "toolResult") assistantIndex--
+	const assistant = messages[assistantIndex]
+	const toolCalls = toolCallsOf(assistant)
+	if (toolCalls.length === 0) return undefined
+	const answered = new Set(
+		messages
+			.slice(assistantIndex + 1)
+			.filter((m) => m?.role === "toolResult")
+			.map((m) => m.toolCallId),
+	)
+	const pendingToolCallIds = toolCalls.map((tc) => tc.id).filter((id) => id && !answered.has(id))
+	return pendingToolCallIds.length > 0 ? { message: assistant, pendingToolCallIds } : undefined
+}
+
+/**
+ * Derive the next executable agent action from durable conversation messages.
+ * This is intentionally not resume-specific: normal /continue, service recovery,
+ * and tests all ask the same state machine what can happen next.
+ * @param {AgentMessage[]} messages
+ * @returns {{ type: "call_model" } | { type: "execute_tool_calls", message: AgentMessage, pendingToolCallIds?: string[] } | { type: "wait_for_user", reason: string }}
+ */
+export function nextAgentAction(messages) {
+	const last = messages[messages.length - 1]
+	if (!last) return { type: "wait_for_user", reason: "empty" }
+	if (last.role === "user") return { type: "call_model" }
+	if (last.role === "assistant") {
+		if (last.stopReason === "error" || last.stopReason === "aborted" || last.errorMessage) return { type: "wait_for_user", reason: "failed_assistant" }
+		const pending = pendingToolBatch(messages)
+		if (pending) return { type: "execute_tool_calls", ...pending }
+		return { type: "wait_for_user", reason: "assistant_complete" }
+	}
+	if (last.role === "toolResult") {
+		const pending = pendingToolBatch(messages)
+		if (pending) return { type: "execute_tool_calls", ...pending }
+		return { type: "call_model" }
+	}
+	return { type: "wait_for_user", reason: `unsupported_role:${last.role ?? "unknown"}` }
 }
 
 /**
@@ -53,11 +111,9 @@ export function agentLoop(prompts, context, config, signal, streamFn) {
  * @param {StreamFn} [streamFn]
  */
 export function agentLoopContinue(context, config, signal, streamFn) {
-	if (context.messages.length === 0) {
-		throw new Error("Cannot continue: no messages in context")
-	}
-	if (context.messages[context.messages.length - 1].role === "assistant") {
-		throw new Error("Cannot continue from message role: assistant")
+	const action = nextAgentAction(context.messages)
+	if (action.type === "wait_for_user") {
+		throw new Error(`Cannot continue: ${action.reason}`)
 	}
 	const stream = createAgentStream()
 	void runAgentLoopContinue(context, config, async (event) => stream.push(event), signal, streamFn).then(
@@ -99,11 +155,9 @@ export async function runAgentLoop(prompts, context, config, emit, signal, strea
  * @returns {Promise<AgentMessage[]>}
  */
 export async function runAgentLoopContinue(context, config, emit, signal, streamFn) {
-	if (context.messages.length === 0) {
-		throw new Error("Cannot continue: no messages in context")
-	}
-	if (context.messages[context.messages.length - 1].role === "assistant") {
-		throw new Error("Cannot continue from message role: assistant")
+	const action = nextAgentAction(context.messages)
+	if (action.type === "wait_for_user") {
+		throw new Error(`Cannot continue: ${action.reason}`)
 	}
 	const newMessages = []
 	const currentContext = { ...context }
@@ -111,13 +165,14 @@ export async function runAgentLoopContinue(context, config, emit, signal, stream
 	await emit({ type: "agent_start" })
 	await emit({ type: "turn_start" })
 
-	await runLoop(currentContext, newMessages, config, signal, emit, streamFn)
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn, action)
 	return newMessages
 }
 
-async function runLoop(currentContext, newMessages, config, signal, emit, streamFn) {
+async function runLoop(currentContext, newMessages, config, signal, emit, streamFn, initialAction = undefined) {
 	let firstTurn = true
 	let pendingMessages = (await config.getSteeringMessages?.()) || []
+	let pendingAction = initialAction
 
 	// signal.aborted is the single source of truth for stopping the loop:
 	// every checkpoint *between* turns / phases routes through this exit so
@@ -134,7 +189,7 @@ async function runLoop(currentContext, newMessages, config, signal, emit, stream
 	while (true) {
 		let hasMoreToolCalls = true
 
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
+		while (hasMoreToolCalls || pendingMessages.length > 0 || pendingAction) {
 			if (!firstTurn) {
 				if (aborted()) return exitAborted()
 				await emit({ type: "turn_start" })
@@ -152,50 +207,21 @@ async function runLoop(currentContext, newMessages, config, signal, emit, stream
 				pendingMessages = []
 			}
 
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn)
-			newMessages.push(message)
-
-			if (message.stopReason === "error" || message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] })
-				await emit({ type: "agent_end", messages: newMessages })
-				return
+			let message
+			let pendingToolCallIds
+			if (pendingAction?.type === "execute_tool_calls") {
+				message = pendingAction.message
+				pendingToolCallIds = pendingAction.pendingToolCallIds
+				pendingAction = undefined
+			} else {
+				pendingAction = undefined
+				message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn)
+				newMessages.push(message)
 			}
 
-			// Abort might have fired while the stream was completing successfully.
-			if (aborted()) {
-				await emit({ type: "turn_end", message, toolResults: [] })
-				return exitAborted()
-			}
-
-			const toolCalls = message.content.filter((c) => c.type === "toolCall")
-			const toolResults = []
-			hasMoreToolCalls = false
-			if (toolCalls.length > 0) {
-				const batch = await executeToolCalls(currentContext, message, config, signal, emit)
-				toolResults.push(...batch.messages)
-				hasMoreToolCalls = !batch.terminate
-				for (const result of toolResults) {
-					currentContext.messages.push(result)
-					newMessages.push(result)
-				}
-			}
-
-			await emit({ type: "turn_end", message, toolResults })
-
-			if (aborted()) return exitAborted()
-
-			if (
-				await config.shouldStopAfterTurn?.({
-					message,
-					toolResults,
-					context: currentContext,
-					newMessages,
-				})
-			) {
-				await emit({ type: "agent_end", messages: newMessages })
-				return
-			}
-
+			const turn = await finishAssistantTurn(currentContext, newMessages, message, config, signal, emit, exitAborted, pendingToolCallIds)
+			if (turn.agentEnded) return
+			hasMoreToolCalls = turn.hasMoreToolCalls
 			pendingMessages = (await config.getSteeringMessages?.()) || []
 		}
 
@@ -210,6 +236,133 @@ async function runLoop(currentContext, newMessages, config, signal, emit, stream
 	}
 
 	await emit({ type: "agent_end", messages: newMessages })
+}
+
+async function finishAssistantTurn(currentContext, newMessages, message, config, signal, emit, exitAborted, pendingToolCallIds = undefined) {
+	if (message.stopReason === "error" || message.stopReason === "aborted") {
+		await emit({ type: "turn_end", message, toolResults: [] })
+		await emit({ type: "agent_end", messages: newMessages })
+		return { agentEnded: true, hasMoreToolCalls: false }
+	}
+
+	// Abort might have fired while the stream was completing successfully.
+	if (signal?.aborted === true) {
+		await emit({ type: "turn_end", message, toolResults: [] })
+		await exitAborted()
+		return { agentEnded: true, hasMoreToolCalls: false }
+	}
+
+	const toolCalls = toolCallsOf(message)
+	const toolResults = []
+	let hasMoreToolCalls = false
+	if (toolCalls.length > 0) {
+		const batch = await executeToolCalls(currentContext, message, config, signal, emit, pendingToolCallIds)
+		toolResults.push(...batch.messages)
+		hasMoreToolCalls = !batch.terminate
+		for (const result of toolResults) {
+			currentContext.messages.push(result)
+			newMessages.push(result)
+		}
+	}
+
+	await emit({ type: "turn_end", message, toolResults })
+
+	if (signal?.aborted === true) {
+		await exitAborted()
+		return { agentEnded: true, hasMoreToolCalls: false }
+	}
+
+	if (
+		await config.shouldStopAfterTurn?.({
+			message,
+			toolResults,
+			context: currentContext,
+			newMessages,
+		})
+	) {
+		await emit({ type: "agent_end", messages: newMessages })
+		return { agentEnded: true, hasMoreToolCalls: false }
+	}
+
+	return { agentEnded: false, hasMoreToolCalls }
+}
+
+function serviceTierForModel(model, serviceTier) {
+	return model?.provider === "openai-codex" && model?.id === "gpt-5.5" ? serviceTier : undefined
+}
+
+const ABORTED_STREAM = Symbol("aborted-stream")
+const EMPTY_USAGE = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+}
+
+function closeDetachedModelStream(response, finalMessage) {
+	try {
+		response?.end?.(finalMessage)
+	} catch {}
+}
+
+function cloneJson(value, fallback) {
+	if (value === undefined) return fallback
+	try {
+		return JSON.parse(JSON.stringify(value))
+	} catch {
+		return fallback
+	}
+}
+
+function abortedAssistantMessage(config, partialMessage) {
+	return {
+		role: "assistant",
+		content: cloneJson(partialMessage?.content, []),
+		provider: partialMessage?.provider ?? config.model?.provider,
+		model: partialMessage?.model ?? config.model?.id,
+		auth: cloneJson(partialMessage?.auth, partialMessage?.auth),
+		usage: cloneJson(partialMessage?.usage, EMPTY_USAGE),
+		stopReason: "aborted",
+		errorMessage: "Request was aborted",
+		timestamp: Date.now(),
+		modelRequestId: partialMessage?.modelRequestId,
+		responseId: partialMessage?.responseId,
+	}
+}
+
+async function abortable(promise, signal) {
+	if (!signal) return promise
+	if (signal.aborted) return ABORTED_STREAM
+	let removeAbortListener = () => {}
+	const aborted = new Promise((resolve) => {
+		const onAbort = () => resolve(ABORTED_STREAM)
+		signal.addEventListener("abort", onAbort, { once: true })
+		removeAbortListener = () => signal.removeEventListener("abort", onAbort)
+	})
+	try {
+		return await Promise.race([promise, aborted])
+	} finally {
+		removeAbortListener()
+	}
+}
+
+async function nextStreamEvent(iterator, signal) {
+	return abortable(iterator.next(), signal)
+}
+
+async function finishAbortedAssistantResponse(context, config, response, partialMessage, addedPartial, emit) {
+	const finalMessage = abortedAssistantMessage(config, partialMessage)
+	closeDetachedModelStream(response, finalMessage)
+	if (addedPartial) {
+		context.messages[context.messages.length - 1] = finalMessage
+	} else {
+		context.messages.push(finalMessage)
+		await emit({ type: "message_start", message: { ...finalMessage } })
+	}
+	await emit({ type: "message_end", message: finalMessage })
+	return finalMessage
 }
 
 async function streamAssistantResponse(context, config, signal, emit, streamFn) {
@@ -227,77 +380,120 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey
 
-	const response = await fn(config.model, llmContext, {
-		reasoning: config.reasoning,
-		sessionId: config.sessionId,
-		onPayload: config.onPayload,
-		onResponse: config.onResponse,
-		apiKey: resolvedApiKey,
-		signal,
-	})
+	const modelRequest = {
+		startedAt: new Date().toISOString(),
+		provider: config.model?.provider,
+		model: config.model?.id,
+		transport: config.model?.transport,
+	}
+	await emit({ type: "model_request_start", request: modelRequest })
 
 	let partialMessage = null
 	let addedPartial = false
+	let finalMessage
+	let response
 
-	for await (const event of response) {
-		switch (event.type) {
-			case "start":
-				partialMessage = event.partial
-				context.messages.push(partialMessage)
-				addedPartial = true
-				await emit({ type: "message_start", message: { ...partialMessage } })
-				break
+	try {
+		const streamResult = fn(config.model, llmContext, {
+			reasoning: config.reasoning,
+			serviceTier: serviceTierForModel(config.model, config.serviceTier),
+			sessionId: config.sessionId,
+			auth: config.auth,
+			onPayload: config.onPayload,
+			onResponse: config.onResponse,
+			apiKey: resolvedApiKey,
+			signal,
+		})
+		const streamPromise = Promise.resolve(streamResult)
+		response = signal?.aborted === true && typeof streamResult?.then !== "function"
+			? streamResult
+			: await abortable(streamPromise, signal)
+		if (response === ABORTED_STREAM) {
+			finalMessage = await finishAbortedAssistantResponse(context, config, undefined, partialMessage, addedPartial, emit)
+			streamPromise.then((lateResponse) => closeDetachedModelStream(lateResponse, finalMessage)).catch(() => {})
+			return finalMessage
+		}
+		if (signal?.aborted === true) {
+			finalMessage = await finishAbortedAssistantResponse(context, config, response, partialMessage, addedPartial, emit)
+			return finalMessage
+		}
 
-			case "text_start":
-			case "text_delta":
-			case "text_end":
-			case "thinking_start":
-			case "thinking_delta":
-			case "thinking_end":
-			case "toolcall_start":
-			case "toolcall_delta":
-			case "toolcall_end":
-				if (partialMessage) {
-					partialMessage = event.partial
-					context.messages[context.messages.length - 1] = partialMessage
-					await emit({
-						type: "message_update",
-						assistantMessageEvent: event,
-						message: { ...partialMessage },
-					})
-				}
-				break
-
-			case "done":
-			case "error": {
-				const finalMessage = await response.result()
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage
-				} else {
-					context.messages.push(finalMessage)
-				}
-				if (!addedPartial) {
-					await emit({ type: "message_start", message: { ...finalMessage } })
-				}
-				await emit({ type: "message_end", message: finalMessage })
+		const iterator = response[Symbol.asyncIterator]()
+		while (true) {
+			const next = await nextStreamEvent(iterator, signal)
+			if (next === ABORTED_STREAM) {
+				finalMessage = await finishAbortedAssistantResponse(context, config, response, partialMessage, addedPartial, emit)
 				return finalMessage
 			}
-		}
-	}
+			if (next.done) break
+			const event = next.value
+			switch (event.type) {
+				case "start":
+					partialMessage = event.partial
+					context.messages.push(partialMessage)
+					addedPartial = true
+					await emit({ type: "message_start", message: { ...partialMessage } })
+					break
 
-	const finalMessage = await response.result()
-	if (addedPartial) {
-		context.messages[context.messages.length - 1] = finalMessage
-	} else {
-		context.messages.push(finalMessage)
-		await emit({ type: "message_start", message: { ...finalMessage } })
+				case "text_start":
+				case "text_delta":
+				case "text_end":
+				case "thinking_start":
+				case "thinking_delta":
+				case "thinking_end":
+				case "toolcall_start":
+				case "toolcall_delta":
+				case "toolcall_end":
+					if (partialMessage) {
+						partialMessage = event.partial
+						context.messages[context.messages.length - 1] = partialMessage
+						await emit({
+							type: "message_update",
+							assistantMessageEvent: event,
+							message: { ...partialMessage },
+						})
+					}
+					break
+
+				case "done":
+				case "error": {
+					finalMessage = event.type === "done" ? event.message : event.error
+					if (!finalMessage) finalMessage = await response.result()
+					if (addedPartial) {
+						context.messages[context.messages.length - 1] = finalMessage
+					} else {
+						context.messages.push(finalMessage)
+					}
+					if (!addedPartial) {
+						await emit({ type: "message_start", message: { ...finalMessage } })
+					}
+					await emit({ type: "message_end", message: finalMessage })
+					return finalMessage
+				}
+			}
+		}
+
+		if (signal?.aborted === true) {
+			finalMessage = await finishAbortedAssistantResponse(context, config, response, partialMessage, addedPartial, emit)
+			return finalMessage
+		}
+		finalMessage = await response.result()
+		if (addedPartial) {
+			context.messages[context.messages.length - 1] = finalMessage
+		} else {
+			context.messages.push(finalMessage)
+			await emit({ type: "message_start", message: { ...finalMessage } })
+		}
+		await emit({ type: "message_end", message: finalMessage })
+		return finalMessage
+	} finally {
+		await emit({ type: "model_request_end", request: { ...modelRequest, modelRequestId: finalMessage?.modelRequestId } })
 	}
-	await emit({ type: "message_end", message: finalMessage })
-	return finalMessage
 }
 
-async function executeToolCalls(currentContext, assistantMessage, config, signal, emit) {
-	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall")
+async function executeToolCalls(currentContext, assistantMessage, config, signal, emit, pendingToolCallIds = undefined) {
+	const pending = pendingToolCallIds ? new Set(pendingToolCallIds) : undefined
+	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall" && (!pending || pending.has(c.id)))
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	)
@@ -316,7 +512,7 @@ async function executeToolCallsSequential(currentContext, assistantMessage, tool
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
-			args: toolCall.arguments,
+			args: displayToolCallArgs(toolCall),
 		})
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal)
 		let finalized
@@ -344,7 +540,7 @@ async function executeToolCallsParallel(currentContext, assistantMessage, toolCa
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
-			args: toolCall.arguments,
+			args: displayToolCallArgs(toolCall),
 		})
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal)
 		if (preparation.kind === "immediate") {
@@ -384,7 +580,12 @@ function shouldTerminateToolBatch(finalizedCalls) {
 	return finalizedCalls.length > 0 && finalizedCalls.every((f) => f.result.terminate === true)
 }
 
+function displayToolCallArgs(toolCall) {
+	return toolCall.input ?? toolCall.arguments
+}
+
 function prepareToolCallArguments(tool, toolCall) {
+	if (tool.kind === "custom") return toolCall
 	if (!tool.prepareArguments) return toolCall
 	const prepared = tool.prepareArguments(toolCall.arguments)
 	if (prepared === toolCall.arguments) return toolCall
@@ -428,28 +629,53 @@ async function prepareToolCall(currentContext, assistantMessage, toolCall, confi
 
 async function executePreparedToolCall(prepared, signal, emit) {
 	const updateEvents = []
-	try {
-		const result = await prepared.tool.execute(prepared.toolCall.id, prepared.args, signal, (partialResult) => {
-			updateEvents.push(
-				Promise.resolve(
-					emit({
-						type: "tool_execution_update",
-						toolCallId: prepared.toolCall.id,
-						toolName: prepared.toolCall.name,
-						args: prepared.toolCall.arguments,
-						partialResult,
-					}),
-				),
-			)
-		})
-		await Promise.all(updateEvents)
-		return { result, isError: false }
-	} catch (error) {
-		await Promise.all(updateEvents)
+	const realExecution = (async () => {
+		try {
+			const result = await prepared.tool.execute(prepared.toolCall.id, prepared.args, signal, (partialResult) => {
+				updateEvents.push(
+					Promise.resolve(
+						emit({
+							type: "tool_execution_update",
+							toolCallId: prepared.toolCall.id,
+							toolName: prepared.toolCall.name,
+							args: prepared.args,
+							partialResult,
+						}),
+					).catch(() => {}),
+				)
+			})
+			await Promise.all(updateEvents)
+			return { result, isError: false }
+		} catch (error) {
+			await Promise.all(updateEvents)
+			if (isUncertainToolExecutionError(error)) throw error
+			return {
+				result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+				isError: true,
+			}
+		}
+	})()
+	// Race against signal: tools that ignore the AbortSignal mid-execution (e.g. fs/promises
+	// readFile on a large file, or a bash process slow to die after SIGKILL) would otherwise
+	// hold the parallel batch open via Promise.all in the caller. On abort we synthesize an
+	// "Operation aborted" result and let the underlying execution finish in the background —
+	// its emits land in agent.processEvents which silently drops them once the run has ended.
+	if (signal?.aborted) {
+		realExecution.catch(() => {})
 		return {
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			result: createErrorToolResult("Operation aborted"),
 			isError: true,
 		}
+	}
+	const abortPromise = new Promise((resolve) => {
+		signal?.addEventListener("abort", () => resolve(null), { once: true })
+	})
+	const winner = await Promise.race([realExecution, abortPromise])
+	if (winner !== null) return winner
+	realExecution.catch(() => {})
+	return {
+		result: createErrorToolResult("Operation aborted"),
+		isError: true,
 	}
 }
 

@@ -2,8 +2,8 @@
 // pi-mono's `packages/ai/src/models.generated.ts` (commit 3d5cbe98) and are
 // kept in sync manually for the providers we actually care about:
 //
-//   - OpenAI cloud (API key)        — gpt-5.5 / gpt-5.4 / gpt-5.3+
-//   - Codex (ChatGPT subscription)  — gpt-5.x via OAuth
+//   - OpenAI cloud (API key)        — gpt-5.5 / gpt-5.4
+//   - Codex (ChatGPT subscription)  — gpt-5.5 / gpt-5.4 / gpt-5.4-mini via OAuth
 //   - Local llama.cpp / OpenAI-compat
 //   - Moonshot Kimi K2.x
 //   - DeepSeek V4
@@ -15,6 +15,7 @@
 // most OpenAI-compatible servers speak.
 
 import { resolveApiKey } from "./auth.js"
+import { APPLY_PATCH_TOOL_PROFILE, DEFAULT_TOOL_PROFILE, GPT_5_4_MINI_PINANO_INSTRUCTIONS_KEY, GPT_5_5_PINANO_INSTRUCTIONS_KEY } from "./model-instructions.js"
 
 /** @typedef {"openai" | "openai-codex" | "llamacpp" | "moonshot" | "deepseek"} ModelProvider */
 
@@ -31,8 +32,17 @@ import { resolveApiKey } from "./auth.js"
  * @property {number} contextWindow
  * @property {number} maxTokens
  * @property {{ input: number, output: number, cacheRead: number, cacheWrite: number }} cost
+ * @property {("text" | "image")[]} [input]
  * @property {Record<string, unknown>} [compat]
+ * @property {{ implicitResponses?: boolean }} [compaction]
  * @property {"chat" | "responses"} [transport]
+ * @property {boolean} [supportsTextVerbosity]
+ * @property {"low" | "medium" | "high"} [defaultTextVerbosity]
+ * @property {boolean} [supportsParallelToolCalls]
+ * @property {("none" | "minimal" | "low" | "medium" | "high" | "xhigh")[]} [supportedReasoningLevels]
+ * @property {"none" | "minimal" | "low" | "medium" | "high" | "xhigh"} [defaultReasoningLevel]
+ * @property {string} [baseInstructionsKey]
+ * @property {"default" | "apply_patch"} [toolProfile]
  * @property {string[]} [tags]
  */
 
@@ -40,6 +50,8 @@ const OPENAI_BASE = "https://api.openai.com/v1"
 const CODEX_BASE = "https://chatgpt.com/backend-api"
 const MOONSHOT_BASE = "https://api.moonshot.ai/v1"
 const DEEPSEEK_BASE = "https://api.deepseek.com"
+const TEXT_ONLY_INPUT = ["text"]
+const VISION_INPUT = ["text", "image"]
 
 const KIMI_COMPAT = {
 	supportsStore: false,
@@ -57,6 +69,23 @@ const DEEPSEEK_COMPAT = {
 	supportsPromptCacheKey: false,
 }
 
+const GPT_5_5_REASONING_LEVELS = ["low", "medium", "high", "xhigh"]
+
+const GPT_5_5_MODEL = {
+	reasoning: true,
+	transport: "responses",
+	toolProfile: APPLY_PATCH_TOOL_PROFILE,
+	compaction: { implicitResponses: true },
+	contextWindow: 272_000,
+	maxTokens: 128_000,
+	supportsTextVerbosity: true,
+	defaultTextVerbosity: "low",
+	supportsParallelToolCalls: true,
+	supportedReasoningLevels: GPT_5_5_REASONING_LEVELS,
+	defaultReasoningLevel: "medium",
+	baseInstructionsKey: GPT_5_5_PINANO_INSTRUCTIONS_KEY,
+}
+
 /** @type {ModelEntry[]} */
 export const MODEL_REGISTRY = [
 	// ─── OpenAI cloud (API key) ──────────────────────────────────────────────
@@ -66,10 +95,7 @@ export const MODEL_REGISTRY = [
 		provider: "openai",
 		authProvider: "openai",
 		baseUrl: OPENAI_BASE,
-		reasoning: true,
-		transport: "responses",
-		contextWindow: 272_000,
-		maxTokens: 128_000,
+		...GPT_5_5_MODEL,
 		cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
 		tags: ["frontier"],
 	},
@@ -81,6 +107,8 @@ export const MODEL_REGISTRY = [
 		baseUrl: OPENAI_BASE,
 		reasoning: true,
 		transport: "responses",
+		toolProfile: APPLY_PATCH_TOOL_PROFILE,
+		compaction: { implicitResponses: true },
 		contextWindow: 1_050_000,
 		maxTokens: 128_000,
 		cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
@@ -94,6 +122,8 @@ export const MODEL_REGISTRY = [
 		baseUrl: OPENAI_BASE,
 		reasoning: true,
 		transport: "responses",
+		toolProfile: APPLY_PATCH_TOOL_PROFILE,
+		compaction: { implicitResponses: true },
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
@@ -106,8 +136,11 @@ export const MODEL_REGISTRY = [
 		baseUrl: OPENAI_BASE,
 		reasoning: true,
 		transport: "responses",
+		toolProfile: APPLY_PATCH_TOOL_PROFILE,
+		compaction: { implicitResponses: true },
 		contextWindow: 272_000,
 		maxTokens: 128_000,
+		baseInstructionsKey: GPT_5_4_MINI_PINANO_INSTRUCTIONS_KEY,
 		cost: { input: 0.25, output: 2, cacheRead: 0.025, cacheWrite: 0 },
 	},
 	{
@@ -118,58 +151,51 @@ export const MODEL_REGISTRY = [
 		baseUrl: OPENAI_BASE,
 		reasoning: true,
 		transport: "responses",
+		toolProfile: APPLY_PATCH_TOOL_PROFILE,
+		compaction: { implicitResponses: true },
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		cost: { input: 0.05, output: 0.4, cacheRead: 0.005, cacheWrite: 0 },
 	},
-	{
-		id: "gpt-5.3-chat-latest",
-		displayName: "GPT-5.3 chat-latest",
-		provider: "openai",
-		authProvider: "openai",
-		baseUrl: OPENAI_BASE,
-		reasoning: false,
-		contextWindow: 128_000,
-		maxTokens: 16_384,
-		cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
-	},
 	// ─── Codex (ChatGPT subscription, OAuth) ────────────────────────────────
 	{
 		id: "gpt-5.5",
-		displayName: "GPT-5.5 (Codex)",
+		displayName: "GPT-5.5 (subscription)",
 		provider: "openai-codex",
 		authProvider: "openai-codex",
 		baseUrl: CODEX_BASE,
 		legacyIds: ["gpt-5.5-codex"],
-		reasoning: true,
-		contextWindow: 272_000,
-		maxTokens: 128_000,
+		...GPT_5_5_MODEL,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		tags: ["subscription"],
 	},
 	{
 		id: "gpt-5.4",
-		displayName: "GPT-5.4 (Codex)",
+		displayName: "GPT-5.4 (subscription)",
 		provider: "openai-codex",
 		authProvider: "openai-codex",
 		baseUrl: CODEX_BASE,
 		legacyIds: ["gpt-5.4-codex"],
 		reasoning: true,
+		toolProfile: APPLY_PATCH_TOOL_PROFILE,
+		compaction: { implicitResponses: true },
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		tags: ["subscription"],
 	},
 	{
-		id: "gpt-5.3",
-		displayName: "GPT-5.3 Codex",
+		id: "gpt-5.4-mini",
+		displayName: "GPT-5.4 mini (subscription)",
 		provider: "openai-codex",
 		authProvider: "openai-codex",
 		baseUrl: CODEX_BASE,
-		legacyIds: ["gpt-5.3-codex"],
 		reasoning: true,
+		toolProfile: APPLY_PATCH_TOOL_PROFILE,
+		compaction: { implicitResponses: true },
 		contextWindow: 272_000,
 		maxTokens: 128_000,
+		baseInstructionsKey: GPT_5_4_MINI_PINANO_INSTRUCTIONS_KEY,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		tags: ["subscription"],
 	},
@@ -266,6 +292,8 @@ export const MODEL_REGISTRY = [
 	},
 ]
 
+const MODEL_PROVIDERS = new Set(["openai", "openai-codex", "llamacpp", "moonshot", "deepseek"])
+
 /**
  * @param {string} ref
  * @returns {{ provider?: ModelProvider, id: string }}
@@ -292,7 +320,7 @@ export function modelRef(entry) {
  */
 export function modelEntryMatches(entry, id, provider) {
 	const parsed = parseModelRef(id)
-	const expectedProvider = provider ?? parsed.provider
+	const expectedProvider = provider ?? validProvider(parsed.provider)
 	if (expectedProvider && entry.provider !== expectedProvider) return false
 	return entry.id === parsed.id || (entry.legacyIds ?? []).includes(parsed.id)
 }
@@ -308,26 +336,159 @@ export function modelRefMatches(entry, id) {
 	return !id.includes("/") && entry.provider !== "openai-codex" && modelEntryMatches(entry, id)
 }
 
+/** @param {unknown} value */
+function plainObject(value) {
+	return value && typeof value === "object" && !Array.isArray(value) ? /** @type {Record<string, any>} */ (value) : {}
+}
+
+/** @param {unknown} value */
+function validProvider(value) {
+	return typeof value === "string" && MODEL_PROVIDERS.has(value) ? /** @type {ModelProvider} */ (value) : undefined
+}
+
+/** @param {unknown} value @param {number} fallback */
+function positiveNumber(value, fallback) {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+/** @param {unknown} value @param {number} fallback */
+function finiteNumber(value, fallback) {
+	return typeof value === "number" && Number.isFinite(value) ? value : fallback
+}
+
+function mergeCost(base, value) {
+	const cost = plainObject(value)
+	return {
+		input: finiteNumber(cost.input, base.input),
+		output: finiteNumber(cost.output, base.output),
+		cacheRead: finiteNumber(cost.cacheRead, base.cacheRead),
+		cacheWrite: finiteNumber(cost.cacheWrite, base.cacheWrite),
+	}
+}
+
+/** @param {unknown} value @param {ModelEntry["input"]} fallback */
+function modelInput(value, fallback) {
+	if (!Array.isArray(value)) return fallback
+	const input = value.filter((item) => item === "text" || item === "image")
+	return input.length > 0 ? input : fallback
+}
+
+/** @param {unknown} value @param {ModelEntry["transport"]} fallback */
+function modelTransport(value, fallback) {
+	return value === "chat" || value === "responses" ? value : fallback
+}
+
+/** @param {unknown} value @param {ModelEntry["toolProfile"]} fallback */
+function modelToolProfile(value, fallback) {
+	if (value === APPLY_PATCH_TOOL_PROFILE || value === DEFAULT_TOOL_PROFILE) return value
+	return fallback
+}
+
+/** @param {unknown} value @param {string[] | undefined} fallback */
+function stringArray(value, fallback) {
+	return Array.isArray(value) ? value.filter((item) => typeof item === "string") : fallback
+}
+
 /**
  * @param {string} id
  * @param {{ provider?: ModelProvider }} [options]
  * @returns {ModelEntry | undefined}
  */
-export function findModelEntry(id, options = {}) {
+function findRegistryModelEntry(id, options = {}) {
 	const parsed = parseModelRef(id)
-	const provider = options.provider ?? parsed.provider
+	const provider = options.provider ?? validProvider(parsed.provider)
 	return MODEL_REGISTRY.find((m) => modelEntryMatches(m, parsed.id, provider))
 }
 
+/** @param {string} ref @param {unknown} value */
+function configuredModelEntry(ref, value) {
+	const config = plainObject(value)
+	if (Object.keys(config).length === 0 && (!value || typeof value !== "object")) return undefined
+	const parsed = parseModelRef(ref)
+	const extended = typeof config.extends === "string" ? findRegistryModelEntry(config.extends) : undefined
+	const template = extended ?? findRegistryModelEntry(ref) ?? /** @type {ModelEntry} */ (findRegistryModelEntry("local"))
+	const provider = validProvider(config.provider) ?? validProvider(parsed.provider) ?? template.provider
+	const authProvider = validProvider(config.authProvider) ?? (provider !== template.provider ? provider : template.authProvider)
+	const sameTemplateModel = template.id === parsed.id && template.provider === provider
+	return {
+		...template,
+		id: parsed.id,
+		displayName: typeof config.displayName === "string" && config.displayName ? config.displayName : sameTemplateModel ? template.displayName : parsed.id,
+		provider,
+		authProvider,
+		baseUrl: typeof config.baseUrl === "string" && config.baseUrl ? config.baseUrl : template.baseUrl,
+		wireModel: typeof config.wireModel === "string" && config.wireModel ? config.wireModel : sameTemplateModel ? template.wireModel : parsed.id,
+		reasoning: typeof config.reasoning === "boolean" ? config.reasoning : template.reasoning,
+		contextWindow: positiveNumber(config.contextWindow, template.contextWindow),
+		maxTokens: positiveNumber(config.maxTokens, template.maxTokens),
+		cost: mergeCost(template.cost, config.cost),
+		input: modelInput(config.input, template.input),
+		compat: Object.keys(plainObject(config.compat)).length > 0 ? { ...(template.compat ?? {}), ...plainObject(config.compat) } : template.compat,
+		compaction: Object.keys(plainObject(config.compaction)).length > 0 ? { ...(template.compaction ?? {}), ...plainObject(config.compaction) } : template.compaction,
+		transport: modelTransport(config.transport, template.transport),
+		toolProfile: modelToolProfile(config.toolProfile, template.toolProfile),
+		tags: stringArray(config.tags, template.tags),
+	}
+}
+
 /**
+ * @param {Record<string, import("./settings.js").ModelSettings> | undefined} models
+ * @returns {ModelEntry[]}
+ */
+export function configuredModelEntries(models = {}) {
+	return Object.entries(plainObject(models))
+		.map(([ref, config]) => configuredModelEntry(ref, config))
+		.filter(Boolean)
+}
+
+/** @param {ModelEntry[]} entries */
+function dedupeModelEntries(entries) {
+	const seen = new Set()
+	const result = []
+	for (const entry of entries) {
+		const key = modelRef(entry)
+		if (seen.has(key)) continue
+		seen.add(key)
+		result.push(entry)
+	}
+	return result
+}
+
+/** @param {Record<string, import("./settings.js").ModelSettings> | undefined} models */
+function allModelEntries(models = {}) {
+	return dedupeModelEntries([...configuredModelEntries(models), ...MODEL_REGISTRY])
+}
+
+/**
+ * @param {Record<string, import("./settings.js").ModelSettings> | undefined} models
+ * @param {string} ref
+ */
+export function modelSettingsHasRef(models, ref) {
+	return configuredModelEntries(models).some((entry) => modelRefMatches(entry, ref))
+}
+
+/**
+ * @param {string} id
+ * @param {{ provider?: ModelProvider, models?: Record<string, import("./settings.js").ModelSettings> }} [options]
+ * @returns {ModelEntry | undefined}
+ */
+export function findModelEntry(id, options = {}) {
+	const parsed = parseModelRef(id)
+	const provider = options.provider ?? validProvider(parsed.provider)
+	return allModelEntries(options.models).find((m) => modelEntryMatches(m, parsed.id, provider))
+}
+
+/**
+ * @param {import("./settings.js").Settings | undefined} [settings]
  * @returns {Promise<ModelEntry[]>}
  */
-export async function availableModelEntries() {
-	const providers = Array.from(new Set(MODEL_REGISTRY.map((m) => m.authProvider)))
+export async function availableModelEntries(settings = undefined) {
+	const entries = allModelEntries(settings?.models)
+	const providers = Array.from(new Set(entries.map((m) => m.authProvider)))
 	const available = new Set(
 		/** @type {ModelProvider[]} */ ((await Promise.all(providers.map(async (p) => ((await resolveApiKey(p)) ? p : undefined)))).filter(Boolean)),
 	)
-	return MODEL_REGISTRY
+	return entries
 		.filter((m) => available.has(m.authProvider))
 		.sort((a, b) => {
 			if (a.authProvider === "openai-codex" && b.authProvider !== "openai-codex") return -1
@@ -337,8 +498,7 @@ export async function availableModelEntries() {
 }
 
 /**
- * Build the Model struct that ai-apis consumes from a registry entry plus
- * runtime overrides (e.g. `--baseurl` or a custom local model id).
+ * Build the Model struct that ai-apis consumes from a registry or settings model entry.
  *
  * @param {ModelEntry} entry
  * @param {{ baseUrl?: string, id?: string }} [overrides]
@@ -352,23 +512,55 @@ export function buildModel(entry, overrides = {}) {
 		baseUrl: overrides.baseUrl ?? entry.baseUrl,
 		reasoning: entry.reasoning,
 		transport: entry.transport,
-		input: ["text"],
+		input: [
+			...(entry.input ?? (entry.provider === "openai" || entry.provider === "openai-codex" ? VISION_INPUT : TEXT_ONLY_INPUT)),
+		],
 		cost: entry.cost,
 		contextWindow: entry.contextWindow,
 		maxTokens: entry.maxTokens,
 		compat: entry.compat,
+		compaction: entry.compaction ? { ...entry.compaction } : undefined,
+		supportsTextVerbosity: entry.supportsTextVerbosity,
+		defaultTextVerbosity: entry.defaultTextVerbosity,
+		supportsParallelToolCalls: entry.supportsParallelToolCalls,
+		supportedReasoningLevels: entry.supportedReasoningLevels ? [...entry.supportedReasoningLevels] : undefined,
+		defaultReasoningLevel: entry.defaultReasoningLevel,
+		baseInstructionsKey: entry.baseInstructionsKey,
+		toolProfile: entry.toolProfile,
 	}
 }
 
 /**
- * Resolve a model from id + optional overrides. Unknown ids fall back to the
- * local-llamacpp template — useful for local models like `qwen2.5-coder`.
+ * Refresh a persisted model object with current registry metadata while keeping
+ * the session-selected id/provider/baseUrl. This preserves model locking but
+ * lets old sessions pick up new capabilities such as implicit compaction.
+ *
+ * @param {any} model
+ * @param {string | undefined} [ref]
+ * @returns {any}
+ */
+export function refreshModelFromRegistry(model, ref = undefined) {
+	if (!model?.id && !ref) return model
+	const entry =
+		(model?.id && model?.provider ? findRegistryModelEntry(model.id, { provider: model.provider }) : undefined)
+		?? (ref ? findRegistryModelEntry(ref) : undefined)
+		?? (model?.id ? findRegistryModelEntry(model.id) : undefined)
+	if (!entry) return model
+	const refreshed = buildModel(entry, { id: model?.id ?? entry.id, baseUrl: model?.baseUrl })
+	const next = { ...model, ...refreshed }
+	delete next.baseInstructions
+	return next
+}
+
+/**
+ * Resolve a model from the curated registry plus declarative settings.models.
+ * Unknown ids fall back to the local-llamacpp template.
  *
  * @param {string} id
- * @param {{ baseUrl?: string }} [overrides]
+ * @param {{ models?: Record<string, import("./settings.js").ModelSettings> }} [options]
  */
-export function resolveModel(id, overrides = {}) {
-	const entry = findModelEntry(id)
-	if (entry) return buildModel(entry, { baseUrl: overrides.baseUrl })
-	return buildModel(/** @type {ModelEntry} */ (findModelEntry("local")), { id, baseUrl: overrides.baseUrl })
+export function resolveModel(id, options = {}) {
+	const entry = findModelEntry(id, { models: options.models })
+	if (entry) return buildModel(entry)
+	return buildModel(/** @type {ModelEntry} */ (findRegistryModelEntry("local")), { id })
 }

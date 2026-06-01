@@ -1,11 +1,12 @@
 import { constants } from "node:fs"
 import { access, readFile } from "node:fs/promises"
 
+import { createPromptImageContent } from "./image-prompt.js"
 import { detectImageMime } from "./mime.js"
 import { resolveToCwd } from "./path-utils.js"
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "./truncate.js"
 
-const TEXT_DESC = `Read the contents of a file. Supports text and images (png, jpg, gif, webp); images are returned as attachments. Text output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large text files; continue with offset to read the rest.`
+const TEXT_DESC = `Read the contents of a file. Supports text and images (png, jpg, gif, webp); images are returned as attachments. Use detail=original to preserve image resolution when supported. Text output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large text files; continue with offset to read the rest.`
 
 const readSchema = {
 	type: "object",
@@ -13,6 +14,12 @@ const readSchema = {
 		path: { type: "string", description: "Path to the file to read (relative or absolute)" },
 		offset: { type: "number", description: "Line number to start reading from (1-indexed)" },
 		limit: { type: "number", description: "Maximum number of lines to read" },
+		detail: {
+			type: "string",
+			enum: ["high", "original"],
+			description:
+				"Image detail to request when reading an image. Use high by default. original preserves source resolution when the target model supports it.",
+		},
 	},
 	required: ["path"],
 	additionalProperties: false,
@@ -28,7 +35,7 @@ export function createReadTool(cwd) {
 		label: "read",
 		description: TEXT_DESC,
 		parameters: readSchema,
-		async execute(_id, { path, offset, limit }, signal) {
+		async execute(_id, { path, offset, limit, detail }, signal) {
 			const abs = resolveToCwd(path, cwd)
 			if (signal?.aborted) throw new Error("Operation aborted")
 			await access(abs, constants.R_OK)
@@ -36,12 +43,13 @@ export function createReadTool(cwd) {
 
 			const mimeType = detectImageMime(buffer)
 			if (mimeType) {
+				const image = createPromptImageContent(buffer, { path, detail })
 				return {
 					content: [
-						{ type: "text", text: `Read image file [${mimeType}]` },
-						{ type: "image", data: buffer.toString("base64"), mimeType },
+						{ type: "text", text: `Read image file [${image.mimeType}, ${image.widthPx}×${image.heightPx}px, detail=${image.detail}]` },
+						image,
 					],
-					details: {},
+					details: { mimeType: image.mimeType, widthPx: image.widthPx, heightPx: image.heightPx, detail: image.detail },
 				}
 			}
 

@@ -4,19 +4,51 @@
 //
 // Works against both Node and qn: we keep a byte buffer and only decode
 // complete events (delimited by ASCII `\n\n` / `\r\n\r\n`) so split
-// multi-byte UTF-8 sequences never straddle a decode call. qn's TextDecoder
-// rejects `{ stream: true }`, hence the byte-level boundary search.
+// multi-byte UTF-8 sequences never straddle a decode call.
 
 const DECODER = new TextDecoder("utf-8")
 const LF = 0x0a
 const CR = 0x0d
 
-export async function* parseSSE(stream) {
+export class StreamInactivityTimeoutError extends Error {
+	constructor(timeoutMs) {
+		super(`No SSE data received within ${timeoutMs}ms`)
+		this.name = "StreamInactivityTimeoutError"
+		this.timeoutMs = timeoutMs
+	}
+}
+
+async function readWithInactivityTimeout(reader, timeoutMs) {
+	if (!timeoutMs) return reader.read()
+	let timer
+	try {
+		return await Promise.race([
+			reader.read(),
+			new Promise((_, reject) => {
+				timer = setTimeout(() => reject(new StreamInactivityTimeoutError(timeoutMs)), timeoutMs)
+			}),
+		])
+	} finally {
+		if (timer) clearTimeout(timer)
+	}
+}
+
+export async function* parseSSE(stream, options = {}) {
 	const reader = stream.getReader()
+	const inactivityTimeoutMs = Number(options.inactivityTimeoutMs ?? 0)
 	let buffer = new Uint8Array(0)
 	try {
 		while (true) {
-			const { value, done } = await reader.read()
+			let chunk
+			try {
+				chunk = await readWithInactivityTimeout(reader, inactivityTimeoutMs > 0 ? inactivityTimeoutMs : 0)
+			} catch (error) {
+				if (error?.name === "StreamInactivityTimeoutError") {
+					try { await reader.cancel(error) } catch {}
+				}
+				throw error
+			}
+			const { value, done } = chunk
 			if (done) break
 			buffer = appendBytes(buffer, value)
 
@@ -27,10 +59,16 @@ export async function* parseSSE(stream) {
 				buffer = buffer.subarray(sep.index + sep.length)
 				const rawEvent = DECODER.decode(eventBytes)
 				const data = extractData(rawEvent)
-				if (data === null || data === "[DONE]") continue
+				if (data === null || data === "[DONE]") {
+					options.onEvent?.({ rawEvent, data })
+					continue
+				}
 				try {
-					yield JSON.parse(data)
+					const parsed = JSON.parse(data)
+					options.onEvent?.({ rawEvent, data, parsed })
+					yield parsed
 				} catch {
+					options.onEvent?.({ rawEvent, data })
 					// Some servers emit non-JSON heartbeat data; ignore it.
 				}
 			}
@@ -41,10 +79,16 @@ export async function* parseSSE(stream) {
 			const tail = DECODER.decode(buffer)
 			if (tail.trim().length > 0) {
 				const data = extractData(tail)
-				if (data && data !== "[DONE]") {
+				if (data === "[DONE]") {
+					options.onEvent?.({ rawEvent: tail, data })
+				} else if (data) {
 					try {
-						yield JSON.parse(data)
-					} catch {}
+						const parsed = JSON.parse(data)
+						options.onEvent?.({ rawEvent: tail, data, parsed })
+						yield parsed
+					} catch {
+						options.onEvent?.({ rawEvent: tail, data })
+					}
 				}
 			}
 		}

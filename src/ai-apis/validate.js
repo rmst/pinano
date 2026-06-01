@@ -149,6 +149,11 @@ export function validateToolCall(tools, toolCall) {
 }
 
 export function validateToolArguments(tool, toolCall) {
+	if (tool.kind === "custom") {
+		if (typeof toolCall.input === "string") return toolCall.input
+		if (typeof toolCall.arguments === "string") return toolCall.arguments
+		throw new Error(`Validation failed for tool "${toolCall.name}": custom tool input must be a string`)
+	}
 	const result = validateValue(toolCall.arguments, tool.parameters)
 	if (result.ok) return toolCall.arguments
 	const summary = result.errors.map((e) => `  - ${e.path || "root"}: ${e.message}`).join("\n")

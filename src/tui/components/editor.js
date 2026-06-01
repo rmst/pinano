@@ -1,7 +1,7 @@
 import { getKeybindings } from "../keybindings.js";
 import { decodePrintableKey, matchesKey } from "../keys.js";
 import { KillRing } from "../kill-ring.js";
-import { CURSOR_MARKER } from "../tui.js";
+import { CURSOR_MARKER, RetainedComponent } from "../tui.js";
 import { UndoStack } from "../undo-stack.js";
 import { getSegmenter, isPunctuationChar, isWhitespaceChar, truncateToWidth, visibleWidth } from "../utils.js";
 import { SelectList } from "./select-list.js";
@@ -215,11 +215,14 @@ export function wordWrapLine(line, maxWidth, preSegmented) {
  * @property {string} text
  * @property {boolean} hasCursor
  * @property {number} [cursorPos]
+ * @property {boolean} [placeholder]
  */
 
 /**
  * @typedef {object} EditorTheme
  * @property {(str: string) => string} borderColor
+ * @property {(str: string) => string} [textColor]
+ * @property {(str: string) => string} [placeholderColor]
  * @property {SelectListTheme} selectList
  */
 
@@ -227,6 +230,7 @@ export function wordWrapLine(line, maxWidth, preSegmented) {
  * @typedef {object} EditorOptions
  * @property {number} [paddingX]
  * @property {number} [autocompleteMaxVisible]
+ * @property {string | (() => string)} [placeholder]
  */
 
 /** @type {SelectListLayoutOptions} */
@@ -241,7 +245,7 @@ const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS = 20;
  * @implements {Component}
  * @implements {Focusable}
  */
-export class Editor {
+export class Editor extends RetainedComponent {
 	/** @type {EditorState} */
 	state = {
 		lines: [""],
@@ -270,6 +274,8 @@ export class Editor {
 	// Border color (can be changed dynamically)
 	/** @type {(str: string) => string} */
 	borderColor;
+	/** @type {(str: string) => string} */
+	textColor;
 
 	// Autocomplete support
 	/** @type {AutocompleteProvider | undefined} */
@@ -342,6 +348,8 @@ export class Editor {
 	onChange;
 	/** @type {boolean} */
 	disableSubmit = false;
+	/** @type {string | (() => string)} */
+	placeholder = "";
 
 	/**
 	 * @param {TUI} tui
@@ -349,9 +357,13 @@ export class Editor {
 	 * @param {EditorOptions} [options]
 	 */
 	constructor(tui, theme, options = {}) {
+		super();
 		this.tui = tui;
 		this.theme = theme;
 		this.borderColor = theme.borderColor;
+		this.textColor = theme.textColor ?? ((s) => s);
+		this.placeholderColor = theme.placeholderColor ?? ((s) => s);
+		this.placeholder = options.placeholder ?? "";
 		const paddingX = options.paddingX ?? 0;
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
 		const maxVisible = options.autocompleteMaxVisible ?? 5;
@@ -385,6 +397,7 @@ export class Editor {
 		const newPadding = Number.isFinite(padding) ? Math.max(0, Math.floor(padding)) : 0;
 		if (this.paddingX !== newPadding) {
 			this.paddingX = newPadding;
+			this.markDirty();
 			this.tui.requestRender();
 		}
 	}
@@ -394,11 +407,25 @@ export class Editor {
 		return this.autocompleteMaxVisible;
 	}
 
+	/** @returns {string} */
+	placeholderText() {
+		const value = typeof this.placeholder === "function" ? this.placeholder() : this.placeholder;
+		return typeof value === "string" ? value : "";
+	}
+
+	/** @param {string | (() => string)} placeholder */
+	setPlaceholder(placeholder) {
+		this.placeholder = placeholder;
+		this.markDirty();
+		this.tui.requestRender();
+	}
+
 	/** @param {number} maxVisible */
 	setAutocompleteMaxVisible(maxVisible) {
 		const newMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
 		if (this.autocompleteMaxVisible !== newMaxVisible) {
 			this.autocompleteMaxVisible = newMaxVisible;
+			this.markDirty();
 			this.tui.requestRender();
 		}
 	}
@@ -486,7 +513,7 @@ export class Editor {
 	}
 
 	invalidate() {
-		// No cached state to invalidate currently
+		this.markDirty();
 	}
 
 	/**
@@ -558,9 +585,15 @@ export class Editor {
 			let displayText = layoutLine.text;
 			let lineVisibleWidth = visibleWidth(layoutLine.text);
 			let cursorInPadding = false;
+			let colorText = true;
 
-			// Add cursor if this line has it
-			if (layoutLine.hasCursor && layoutLine.cursorPos !== undefined) {
+			if (layoutLine.placeholder) {
+				const marker = emitCursorMarker ? CURSOR_MARKER : "";
+				const cursor = "\x1b[7m \x1b[27m";
+				displayText = marker + cursor + this.placeholderColor(layoutLine.text);
+				lineVisibleWidth = 1 + visibleWidth(layoutLine.text);
+				colorText = false;
+			} else if (layoutLine.hasCursor && layoutLine.cursorPos !== undefined) {
 				const before = displayText.slice(0, layoutLine.cursorPos);
 				const after = displayText.slice(layoutLine.cursorPos);
 
@@ -573,12 +606,12 @@ export class Editor {
 					const afterGraphemes = [...this.segment(after)];
 					const firstGrapheme = afterGraphemes[0]?.segment || "";
 					const restAfter = after.slice(firstGrapheme.length);
-					const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
+					const cursor = `\x1b[7m${firstGrapheme}\x1b[27m`;
 					displayText = before + marker + cursor + restAfter;
 					// lineVisibleWidth stays the same - we're replacing, not adding
 				} else {
 					// Cursor is at the end - add highlighted space
-					const cursor = "\x1b[7m \x1b[0m";
+					const cursor = "\x1b[7m \x1b[27m";
 					displayText = before + marker + cursor;
 					lineVisibleWidth = lineVisibleWidth + 1;
 					// If cursor overflows content width into the padding, flag it
@@ -591,9 +624,10 @@ export class Editor {
 			// Calculate padding based on actual visible width
 			const padding = " ".repeat(Math.max(0, contentWidth - lineVisibleWidth));
 			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
+			const renderedText = colorText ? this.textColor(displayText) : displayText;
 
 			// Render the line (no side borders, just horizontal lines above and below)
-			result.push(`${leftPadding}${displayText}${padding}${lineRightPadding}`);
+			result.push(`${leftPadding}${renderedText}${padding}${lineRightPadding}`);
 		}
 
 		// Render bottom border (with scroll indicator if more content below)
@@ -670,7 +704,7 @@ export class Editor {
 			return;
 		}
 
-		// Ctrl+C - let parent handle (exit/clear)
+		// Ctrl+C - let parent handle exit/detach.
 		if (kb.matches(data, "tui.input.copy")) {
 			return;
 		}
@@ -919,6 +953,16 @@ export class Editor {
 
 		if (this.state.lines.length === 0 || (this.state.lines.length === 1 && this.state.lines[0] === "")) {
 			// Empty editor
+			const placeholder = this.placeholderText();
+			if (placeholder) {
+				layoutLines.push({
+					text: truncateToWidth(placeholder, Math.max(0, contentWidth - 1), ""),
+					hasCursor: true,
+					cursorPos: 0,
+					placeholder: true,
+				});
+				return layoutLines;
+			}
 			layoutLines.push({
 				text: "",
 				hasCursor: true,
@@ -1002,6 +1046,27 @@ export class Editor {
 		return layoutLines;
 	}
 
+	/**
+	 * Return the number of terminal lines render(width) would emit, without
+	 * mutating scroll/cursor state or adding hardware cursor markers.
+	 * @param {number} width
+	 * @returns {number}
+	 */
+	getRenderedLineCount(width) {
+		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
+		const paddingX = Math.min(this.paddingX, maxPadding);
+		const contentWidth = Math.max(1, width - paddingX * 2);
+		const layoutWidth = Math.max(1, contentWidth - (paddingX ? 0 : 1));
+		const layoutLines = this.layoutText(layoutWidth);
+		const terminalRows = this.tui.terminal.rows;
+		const maxVisibleLines = Math.max(5, Math.floor(terminalRows * 0.3));
+		let count = Math.min(layoutLines.length, maxVisibleLines) + 2;
+		if (this.autocompleteState && this.autocompleteList) {
+			count += this.autocompleteList.render(contentWidth).length;
+		}
+		return count;
+	}
+
 	/** @returns {string} */
 	getText() {
 		return this.state.lines.join("\n");
@@ -1041,6 +1106,7 @@ export class Editor {
 
 	/** @param {string} text */
 	setText(text) {
+		this.markDirty();
 		this.cancelAutocomplete();
 		this.lastAction = null;
 		this.historyIndex = -1; // Exit history browsing mode
@@ -1060,6 +1126,7 @@ export class Editor {
 	 */
 	insertTextAtCursor(text) {
 		if (!text) return;
+		this.markDirty();
 		this.cancelAutocomplete();
 		this.pushUndoSnapshot();
 		this.lastAction = null;
@@ -1086,6 +1153,7 @@ export class Editor {
 	 */
 	insertTextAtCursorInternal(text) {
 		if (!text) return;
+		this.markDirty();
 
 		// Normalize line endings and tabs
 		const normalized = this.normalizeText(text);
@@ -1133,6 +1201,7 @@ export class Editor {
 	 * @param {boolean} [skipUndoCoalescing]
 	 */
 	insertCharacter(char, skipUndoCoalescing) {
+		this.markDirty();
 		this.historyIndex = -1; // Exit history browsing mode
 
 		// Undo coalescing (fish-style):
@@ -2409,6 +2478,7 @@ export class Editor {
 	 * @param {"regular" | "force"} state
 	 */
 	applyAutocompleteSuggestions(suggestions, state) {
+		this.markDirty();
 		this.autocompletePrefix = suggestions.prefix;
 		this.autocompleteList = this.createAutocompleteList(suggestions.prefix, suggestions.items);
 
@@ -2431,6 +2501,7 @@ export class Editor {
 	}
 
 	clearAutocompleteUi() {
+		this.markDirty();
 		this.autocompleteState = null;
 		this.autocompleteList = undefined;
 		this.autocompletePrefix = "";

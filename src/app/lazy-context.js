@@ -1,39 +1,35 @@
 // Lazy AGENTS.md/CLAUDE.md loading for paths under cwd.
 //
 // Startup loading (`context-files.ts`) walks cwd → root, so ancestor files
-// always show up in the system prompt. Subdir files don't — they'd require
-// knowing in advance which subdirs the agent will visit. Instead we load them
+// are captured at session start. Subdir files don't — they'd require knowing
+// in advance which subdirs the agent will visit. Instead we load them
 // on-demand: when a tool touches a path under cwd, we walk from that path up
-// to (but not past) cwd, picking up any context file we haven't yet seen, and
-// inject it into the tool's result so the model sees it inline.
+// to (but not past) cwd, picking up any context file we haven't yet seen. In
+// normal sessions the file is stored as a context-load snapshot and injected
+// through prompt assembly; no-session compatibility falls back to the legacy
+// inline tool-result notice.
 //
 // This matches Claude Code's behavior
-// (https://code.claude.com/docs/en/memory.md). Pi/upstream does not lazy-load,
-// so this is a deliberate divergence — see COMPARISON.md.
+// (https://code.claude.com/docs/en/memory.md). Pi/upstream does not lazy-load.
 //
-// Resume semantics: the previously-loaded subdir files live inside replayed
-// `tool_result` messages (we appended them there originally). On resume we
-// recognise our own marker in those messages and seed the loaded-paths set
-// from them — so a resumed session never re-injects a file the original
-// session already saw, and consequently doesn't refresh stale subdir content
-// from disk. Codex CLI takes the same "freeze on resume" stance for its
-// (non-lazy) AGENTS.md (`rollout_reconstruction.rs`); pinano matches that
-// stance for the lazy case. To pick up on-disk edits, start a new session.
+// Resume semantics: context-load snapshots are replayed verbatim, so a
+// resumed session never refreshes stale subdir content from disk. Legacy
+// sessions that still have lazy context inside tool_result messages keep their
+// previous conversation-history behavior; they are not migrated.
 
 import { isAbsolute, relative, resolve, dirname } from "node:path"
 
 import { loadContextFileFromDir } from "./context-files.js"
+import { LAZY_NOTICE_HEADING, PROJECT_CONTEXT_HEADING } from "./context-format.js"
 
 /** @typedef {import("./context-files.js").ContextFile} ContextFile */
 
-/** Heading emitted by `formatLazyContextNotice`. Used as the marker we look
- * for when hydrating the loaded-paths set from replayed history. */
-export const LAZY_NOTICE_HEADING = "# Additional project context (loaded on demand)"
+export { LAZY_NOTICE_HEADING }
 
 /** Heading used by `project-context.ts` for the startup user message. We
  * recognise it here so that paths announced in that message also count as
  * "already loaded" and the lazy loader won't re-emit them. */
-const STARTUP_CONTEXT_HEADING = "# AGENTS.md / CLAUDE.md context"
+const STARTUP_CONTEXT_HEADING = PROJECT_CONTEXT_HEADING
 
 export class LazyContextLoader {
 	/** @type {string} */
@@ -54,6 +50,11 @@ export class LazyContextLoader {
 		return this.loaded
 	}
 
+	/** @param {Iterable<string>} paths */
+	markLoaded(paths) {
+		for (const path of paths) this.loaded.add(path)
+	}
+
 	/**
 	 * Add to the loaded-paths set every absolute path mentioned under one of
 	 * our context-block headings in replayed history. We scan two slots:
@@ -64,8 +65,8 @@ export class LazyContextLoader {
 	 * Idempotent: safe to call before every `loadForPath`, including after a
 	 * mid-session resume that swapped in different history.
 	 *
-	 * Path lines are matched against `^## (/\S+)$` — we always emit absolute
-	 * paths in the notice, so this is unambiguous in practice. (False positives
+	 * Path lines are matched as absolute-path markdown headings — we always
+	 * emit absolute paths in the notice, so this is unambiguous in practice. (False positives
 	 * would require an actual AGENTS.md file to contain a literal `## /...`
 	 * line at column 0, which is exotic enough to ignore.)
 	 *
@@ -85,7 +86,7 @@ export class LazyContextLoader {
 				const idx = block.text.indexOf(heading)
 				if (idx === -1) continue
 				const after = block.text.slice(idx)
-				const re = /^##\s+(\/\S+)\s*$/gm
+				const re = /^##\s+(\/.+?)\s*$/gm
 				/** @type {RegExpExecArray | null} */
 				let match
 				while ((match = re.exec(after))) {
@@ -166,6 +167,11 @@ const PATH_TOOLS = new Set(["read", "write", "edit", "ls", "grep", "find"])
  * @returns {string | null}
  */
 export function extractToolPath(toolName, args) {
+	if (toolName === "apply_patch") {
+		if (typeof args !== "string") return null
+		const match = /^\*\*\* (?:Add File|Update File|Delete File): (.+)$/m.exec(args)
+		return match?.[1] ?? null
+	}
 	if (!PATH_TOOLS.has(toolName)) return null
 	if (args && typeof args.path === "string") return args.path
 	// ls/grep/find default to cwd when path is omitted — nothing new to load.

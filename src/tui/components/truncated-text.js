@@ -1,3 +1,4 @@
+import { RetainedComponent } from "../tui.js";
 import { truncateToWidth, visibleWidth } from "../utils.js";
 
 /** @typedef {import("../tui.js").Component} Component */
@@ -7,7 +8,7 @@ import { truncateToWidth, visibleWidth } from "../utils.js";
  *
  * @implements {Component}
  */
-export class TruncatedText {
+export class TruncatedText extends RetainedComponent {
 	/** @type {string} */
 	text;
 	/** @type {number} */
@@ -21,13 +22,14 @@ export class TruncatedText {
 	 * @param {number} [paddingY]
 	 */
 	constructor(text, paddingX = 0, paddingY = 0) {
+		super();
 		this.text = text;
 		this.paddingX = paddingX;
 		this.paddingY = paddingY;
 	}
 
 	invalidate() {
-		// No cached state to invalidate currently
+		this.markDirty();
 	}
 
 	/**

@@ -14,6 +14,8 @@
 import { parseStreamingJson } from "../json-parse.js"
 import { sanitizeSurrogates } from "../sanitize-unicode.js"
 import { transformMessages } from "../transform-messages.js"
+import { normalizeResponsesUsage } from "../usage.js"
+import { isResponsesCompactionItem, isResponsesNativeItemBlock, responsesNativeItemBlock } from "../../responses-compaction.js"
 
 // Fast deterministic hash to shorten long IDs to <=64 chars.
 export function shortHash(str) {
@@ -51,10 +53,29 @@ function parseTextSignature(signature) {
 	return { id: signature }
 }
 
+/** @param {any} msg */
+function fallbackAssistantPhase(msg) {
+	return msg.content?.some?.((block) => block?.type === "toolCall") ? "commentary" : "final_answer"
+}
+
 function normalizeIdPart(part) {
 	const sanitized = part.replace(/[^a-zA-Z0-9_-]/g, "_")
 	const trimmed = sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized
 	return trimmed.replace(/_+$/, "")
+}
+
+function imageDetailForResponses(block, model) {
+	const detail = block.detail ?? "high"
+	if (detail === "original" && model.provider !== "openai-codex") return "high"
+	return detail
+}
+
+function responseInputImage(block, model) {
+	return {
+		type: "input_image",
+		detail: imageDetailForResponses(block, model),
+		image_url: `data:${block.mimeType};base64,${block.data}`,
+	}
 }
 
 // ============================================================================
@@ -81,6 +102,8 @@ export function convertResponsesMessages(model, context, options = {}) {
 	}
 
 	let msgIndex = 0
+	const customToolNames = new Set((context.tools ?? []).filter((tool) => tool.kind === "custom").map((tool) => tool.name))
+	const customCallIds = new Set()
 	for (const msg of transformedMessages) {
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
@@ -93,18 +116,19 @@ export function convertResponsesMessages(model, context, options = {}) {
 					.map((item) =>
 						item.type === "text"
 							? { type: "input_text", text: sanitizeSurrogates(item.text) }
-							: {
-									type: "input_image",
-									detail: "auto",
-									image_url: `data:${item.mimeType};base64,${item.data}`,
-								},
+							: responseInputImage(item, model),
 					)
 				if (content.length === 0) continue
 				messages.push({ role: "user", content })
 			}
 		} else if (msg.role === "assistant") {
 			const output = []
+			const fallbackPhase = fallbackAssistantPhase(msg)
 			for (const block of msg.content) {
+				if (isResponsesNativeItemBlock(block)) {
+					output.push(block.item)
+					continue
+				}
 				if (block.type === "thinking") {
 					if (block.thinkingSignature) {
 						try {
@@ -125,20 +149,30 @@ export function convertResponsesMessages(model, context, options = {}) {
 						status: "completed",
 						id: msgId,
 					}
-					if (parsedSig?.phase) item.phase = parsedSig.phase
+					item.phase = parsedSig?.phase ?? fallbackPhase
 					output.push(item)
 				} else if (block.type === "toolCall") {
 					const [callIdRaw, itemIdRaw] = block.id.split("|")
 					const callId = normalizeIdPart(callIdRaw)
-					let itemId = itemIdRaw ? normalizeIdPart(itemIdRaw) : undefined
-					if (itemId && !itemId.startsWith("fc_")) itemId = normalizeIdPart(`fc_${itemId}`)
-					output.push({
-						type: "function_call",
-						id: itemId,
-						call_id: callId,
-						name: block.name,
-						arguments: JSON.stringify(block.arguments),
-					})
+					if (typeof block.input === "string" || customToolNames.has(block.name)) {
+						customCallIds.add(callId)
+						output.push({
+							type: "custom_tool_call",
+							call_id: callId,
+							name: block.name,
+							input: sanitizeSurrogates(block.input ?? String(block.arguments ?? "")),
+						})
+					} else {
+						let itemId = itemIdRaw ? normalizeIdPart(itemIdRaw) : undefined
+						if (itemId && !itemId.startsWith("fc_")) itemId = normalizeIdPart(`fc_${itemId}`)
+						output.push({
+							type: "function_call",
+							id: itemId,
+							call_id: callId,
+							name: block.name,
+							arguments: JSON.stringify(block.arguments),
+						})
+					}
 				}
 			}
 			if (output.length === 0) continue
@@ -160,18 +194,17 @@ export function convertResponsesMessages(model, context, options = {}) {
 				if (hasText) output.push({ type: "input_text", text: sanitizeSurrogates(textResult) })
 				for (const block of msg.content) {
 					if (block.type === "image") {
-						output.push({
-							type: "input_image",
-							detail: "auto",
-							image_url: `data:${block.mimeType};base64,${block.data}`,
-						})
+						output.push(responseInputImage(block, model))
 					}
 				}
 			} else {
 				output = sanitizeSurrogates(hasText ? textResult : "(see attached image)")
 			}
 
-			messages.push({ type: "function_call_output", call_id: callId, output })
+			const outputType = customCallIds.has(callId) || customToolNames.has(msg.toolName)
+				? "custom_tool_call_output"
+				: "function_call_output"
+			messages.push({ type: outputType, call_id: callId, output })
 		}
 		msgIndex++
 	}
@@ -183,29 +216,36 @@ export function convertResponsesMessages(model, context, options = {}) {
 // Tools
 // ============================================================================
 
+function responsesVisibleTools(tools) {
+	const hasApplyPatch = tools.some((tool) => tool.kind === "custom" && tool.name === "apply_patch")
+	return tools.filter((tool) => !(hasApplyPatch && tool.name === "edit" && tool.kind !== "custom"))
+}
+
 export function convertResponsesTools(tools, options = {}) {
 	const strict = options.strict === undefined ? false : options.strict
-	return tools.map((tool) => ({
-		type: "function",
-		name: tool.name,
-		description: tool.description,
-		parameters: tool.parameters,
-		strict,
-	}))
+	return responsesVisibleTools(tools).map((tool) => {
+		if (tool.kind === "custom") {
+			const def = {
+				type: "custom",
+				name: tool.name,
+				description: tool.description,
+			}
+			if (tool.format) def.format = tool.format
+			return def
+		}
+		return {
+			type: "function",
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters,
+			strict,
+		}
+	})
 }
 
 // ============================================================================
 // Stream processing: Responses SSE events -> AssistantMessageEvent stream
 // ============================================================================
-
-function calculateCost(model, usage) {
-	const cost = model.cost ?? {}
-	usage.cost.input = ((cost.input ?? 0) / 1_000_000) * usage.input
-	usage.cost.output = ((cost.output ?? 0) / 1_000_000) * usage.output
-	usage.cost.cacheRead = ((cost.cacheRead ?? 0) / 1_000_000) * usage.cacheRead
-	usage.cost.cacheWrite = ((cost.cacheWrite ?? 0) / 1_000_000) * usage.cacheWrite
-	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite
-}
 
 function mapStopReason(status) {
 	if (!status) return "stop"
@@ -244,7 +284,10 @@ export async function processResponsesStream(events, output, stream, model) {
 
 		if (event.type === "response.output_item.added") {
 			const item = event.item
-			if (item.type === "reasoning") {
+			if (isResponsesCompactionItem(item)) {
+				currentItem = item
+				currentBlock = null
+			} else if (item.type === "reasoning") {
 				currentItem = item
 				currentBlock = { type: "thinking", thinking: "" }
 				blocks.push(currentBlock)
@@ -262,6 +305,16 @@ export async function processResponsesStream(events, output, stream, model) {
 					name: item.name,
 					arguments: {},
 					partialJson: item.arguments || "",
+				}
+				blocks.push(currentBlock)
+				stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output })
+			} else if (item.type === "custom_tool_call") {
+				currentItem = item
+				currentBlock = {
+					type: "toolCall",
+					id: item.call_id,
+					name: item.name,
+					input: item.input || "",
 				}
 				blocks.push(currentBlock)
 				stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output })
@@ -373,6 +426,20 @@ export async function processResponsesStream(events, output, stream, model) {
 			continue
 		}
 
+		if (event.type === "response.custom_tool_call_input.delta") {
+			if (currentItem?.type === "custom_tool_call" && currentBlock?.type === "toolCall") {
+				currentBlock.input = (currentBlock.input ?? "") + event.delta
+				currentItem.input = (currentItem.input ?? "") + event.delta
+				stream.push({
+					type: "toolcall_delta",
+					contentIndex: blockIndex(),
+					delta: event.delta,
+					partial: output,
+				})
+			}
+			continue
+		}
+
 		if (event.type === "response.function_call_arguments.done") {
 			if (currentItem?.type === "function_call" && currentBlock?.type === "toolCall") {
 				const previous = currentBlock.partialJson
@@ -395,7 +462,11 @@ export async function processResponsesStream(events, output, stream, model) {
 
 		if (event.type === "response.output_item.done") {
 			const item = event.item
-			if (item.type === "reasoning" && currentBlock?.type === "thinking") {
+			if (isResponsesCompactionItem(item)) {
+				blocks.push(responsesNativeItemBlock(item))
+				currentItem = null
+				currentBlock = null
+			} else if (item.type === "reasoning" && currentBlock?.type === "thinking") {
 				currentBlock.thinking = item.summary?.map((s) => s.text).join("\n\n") || ""
 				currentBlock.thinkingSignature = JSON.stringify(item)
 				stream.push({
@@ -422,10 +493,12 @@ export async function processResponsesStream(events, output, stream, model) {
 						? parseStreamingJson(currentBlock.partialJson)
 						: parseStreamingJson(item.arguments || "{}")
 				let toolCall
+				let contentIndex
 				if (currentBlock?.type === "toolCall") {
 					currentBlock.arguments = args
 					delete currentBlock.partialJson
 					toolCall = currentBlock
+					contentIndex = blockIndex()
 				} else {
 					toolCall = {
 						type: "toolCall",
@@ -433,9 +506,34 @@ export async function processResponsesStream(events, output, stream, model) {
 						name: item.name,
 						arguments: args,
 					}
+					blocks.push(toolCall)
+					contentIndex = blockIndex()
+					stream.push({ type: "toolcall_start", contentIndex, partial: output })
 				}
 				currentBlock = null
-				stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output })
+				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output })
+			} else if (item.type === "custom_tool_call") {
+				let toolCall
+				let contentIndex
+				if (currentBlock?.type === "toolCall") {
+					currentBlock.input = typeof item.input === "string" && item.input.length > 0
+						? item.input
+						: currentBlock.input ?? ""
+					toolCall = currentBlock
+					contentIndex = blockIndex()
+				} else {
+					toolCall = {
+						type: "toolCall",
+						id: item.call_id,
+						name: item.name,
+						input: item.input ?? "",
+					}
+					blocks.push(toolCall)
+					contentIndex = blockIndex()
+					stream.push({ type: "toolcall_start", contentIndex, partial: output })
+				}
+				currentBlock = null
+				stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output })
 			}
 			continue
 		}
@@ -443,18 +541,8 @@ export async function processResponsesStream(events, output, stream, model) {
 		if (event.type === "response.completed") {
 			const response = event.response
 			if (response?.id) output.responseId = response.id
-			if (response?.usage) {
-				const cached = response.usage.input_tokens_details?.cached_tokens || 0
-				output.usage = {
-					input: (response.usage.input_tokens || 0) - cached,
-					output: response.usage.output_tokens || 0,
-					cacheRead: cached,
-					cacheWrite: 0,
-					totalTokens: response.usage.total_tokens || 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				}
-			}
-			calculateCost(model, output.usage)
+			if (response?.model && response.model !== model.id) output.responseModel = response.model
+			if (response?.usage) output.usage = normalizeResponsesUsage(response.usage, model)
 			output.stopReason = mapStopReason(response?.status)
 			if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 				output.stopReason = "toolUse"

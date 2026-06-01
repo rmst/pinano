@@ -9,11 +9,13 @@ export { Editor } from "./components/editor.js";
 export { Image } from "./components/image.js";
 export { Input } from "./components/input.js";
 export { Loader } from "./components/loader.js";
+export { Markdown } from "./components/markdown.js";
 export { SelectList } from "./components/select-list.js";
 export { SettingsList } from "./components/settings-list.js";
 export { Spacer } from "./components/spacer.js";
 export { Text } from "./components/text.js";
 export { TruncatedText } from "./components/truncated-text.js";
+export { clipLinesToViewport } from "./components/viewport.js";
 // Fuzzy matching
 export { fuzzyFilter, fuzzyMatch } from "./fuzzy.js";
 // Keybindings
@@ -61,6 +63,6 @@ export {
 	setCapabilities,
 	setCellDimensions,
 } from "./terminal-image.js";
-export { Container, CURSOR_MARKER, isFocusable, TUI } from "./tui.js";
+export { Container, CURSOR_MARKER, isFocusable, markComponentDirty, RetainedComponent, RetainedContainer, setComponentParent, setTerminalBaseStyle, TUI } from "./tui.js";
 // Utilities
 export { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "./utils.js";

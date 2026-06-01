@@ -1,4 +1,5 @@
 import { getKeybindings } from "../keybindings.js";
+import { RetainedComponent } from "../tui.js";
 import { truncateToWidth, visibleWidth } from "../utils.js";
 
 const DEFAULT_PRIMARY_COLUMN_WIDTH = 32;
@@ -51,7 +52,7 @@ const clamp = (value, min, max) => Math.max(min, Math.min(value, max));
  */
 
 /** @implements {import("../tui.js").Component} */
-export class SelectList {
+export class SelectList extends RetainedComponent {
 	/** @type {SelectItem[]} */
 	items = [];
 	/** @type {SelectItem[]} */
@@ -79,6 +80,7 @@ export class SelectList {
 	 * @param {SelectListLayoutOptions} [layout]
 	 */
 	constructor(items, maxVisible, theme, layout = {}) {
+		super();
 		this.items = items;
 		this.filteredItems = items;
 		this.maxVisible = maxVisible;
@@ -91,15 +93,17 @@ export class SelectList {
 		this.filteredItems = this.items.filter((item) => item.value.toLowerCase().startsWith(filter.toLowerCase()));
 		// Reset selection when filter changes
 		this.selectedIndex = 0;
+		this.markDirty();
 	}
 
 	/** @param {number} index */
 	setSelectedIndex(index) {
 		this.selectedIndex = Math.max(0, Math.min(index, this.filteredItems.length - 1));
+		this.markDirty();
 	}
 
 	invalidate() {
-		// No cached state to invalidate currently
+		this.markDirty();
 	}
 
 	/**
@@ -151,11 +155,13 @@ export class SelectList {
 		// Up arrow - wrap to bottom when at top
 		if (kb.matches(keyData, "tui.select.up")) {
 			this.selectedIndex = this.selectedIndex === 0 ? this.filteredItems.length - 1 : this.selectedIndex - 1;
+			this.markDirty();
 			this.notifySelectionChange();
 		}
 		// Down arrow - wrap to top when at bottom
 		else if (kb.matches(keyData, "tui.select.down")) {
 			this.selectedIndex = this.selectedIndex === this.filteredItems.length - 1 ? 0 : this.selectedIndex + 1;
+			this.markDirty();
 			this.notifySelectionChange();
 		}
 		// Enter

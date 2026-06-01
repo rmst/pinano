@@ -8,9 +8,21 @@
 // SSE only — the WebSocket transport in pi-mono is for connection-cached
 // session continuation, which we skip in this port.
 
+import { randomUUID } from "node:crypto"
+
 import { AssistantMessageEventStream } from "../event-stream.js"
+import { validateMessageHistory } from "../message-history.js"
+import { RetryableModelError, classifyModelError, retryableModelErrorDetails } from "../model-errors.js"
+import { beginModelRequest, finishModelRequest } from "../model-io-log.js"
 import { executeResponsesRequest } from "../responses-transport.js"
+import { buildAssistantAuth, emptyUsage } from "../usage.js"
 import { convertResponsesMessages, convertResponsesTools } from "./responses-shared.js"
+import {
+	disableImplicitResponsesCompaction,
+	isUnsupportedImplicitResponsesCompactionError,
+	responsesCompactThreshold,
+	supportsImplicitResponsesCompaction,
+} from "../../responses-compaction.js"
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
 const JWT_CLAIM_PATH = "https://api.openai.com/auth"
@@ -44,7 +56,7 @@ function resolveCodexUrl(baseUrl) {
 	return `${normalized}/codex/responses`
 }
 
-function buildHeaders(model, accountId, token, sessionId, optionsHeaders) {
+function buildHeaders(model, accountId, token, sessionId, clientRequestId, optionsHeaders) {
 	const headers = new Headers(model.headers ?? {})
 	if (optionsHeaders) {
 		for (const [k, v] of Object.entries(optionsHeaders)) headers.set(k, v)
@@ -57,7 +69,7 @@ function buildHeaders(model, accountId, token, sessionId, optionsHeaders) {
 	headers.set("content-type", "application/json")
 	if (sessionId) {
 		headers.set("session_id", sessionId)
-		headers.set("x-client-request-id", sessionId)
+		headers.set("x-client-request-id", clientRequestId || randomUUID())
 	}
 	return headers
 }
@@ -73,14 +85,10 @@ function buildBody(model, context, options) {
 		include: ["reasoning.encrypted_content"],
 		prompt_cache_key: options?.sessionId,
 		tool_choice: "auto",
-		parallel_tool_calls: true,
 	}
-	// Pi defaults this to "low"; we suspect it biases Codex models toward
-	// short text replies over emitting tool calls, so leave it unset (use the
-	// API's server-side default) unless the caller explicitly requests one.
-	if (options?.textVerbosity !== undefined) {
-		body.text = { verbosity: options.textVerbosity }
-	}
+	if (model.supportsParallelToolCalls ?? true) body.parallel_tool_calls = true
+	const textVerbosity = model.supportsTextVerbosity === false ? undefined : options?.textVerbosity ?? model.defaultTextVerbosity
+	if (textVerbosity !== undefined) body.text = { verbosity: textVerbosity }
 	if (options?.temperature !== undefined) body.temperature = options.temperature
 	if (options?.serviceTier !== undefined) body.service_tier = options.serviceTier
 	if (context.tools && context.tools.length > 0) {
@@ -92,6 +100,10 @@ function buildBody(model, context, options) {
 			effort,
 			summary: options.reasoningSummary ?? "auto",
 		}
+	}
+	if (!options?.disableImplicitResponsesCompaction && supportsImplicitResponsesCompaction(model)) {
+		const compactThreshold = responsesCompactThreshold(model, options?.autocompactThreshold)
+		if (compactThreshold) body.context_management = [{ type: "compaction", compact_threshold: compactThreshold }]
 	}
 	return body
 }
@@ -118,6 +130,21 @@ async function parseErrorResponse(rawText, status) {
 	return { message, friendly }
 }
 
+function codexErrorInfo(event) {
+	const err = event.error && typeof event.error === "object" ? event.error : undefined
+	return {
+		code: String(err?.code ?? event.code ?? ""),
+		type: String(err?.type ?? ""),
+		message: String(err?.message ?? event.message ?? ""),
+		raw: event,
+	}
+}
+
+function retryableCodexStreamError(info) {
+	return /server_is_overloaded|service_unavailable_error|rate_limit_exceeded/i.test(`${info.type} ${info.code}`)
+		|| classifyModelError(info.message).retryable
+}
+
 // Map raw Codex SSE events into the shape processResponsesStream expects.
 // Codex emits `response.done` and `response.incomplete` where the standard
 // Responses API would emit `response.completed`; rename for uniformity.
@@ -127,13 +154,28 @@ async function* mapCodexEvents(events) {
 		if (!type) continue
 
 		if (type === "error") {
-			const code = event.code || ""
-			const message = event.message || ""
-			throw new Error(`Codex error: ${message || code || JSON.stringify(event)}`)
+			const info = codexErrorInfo(event)
+			const message = info.message || info.code || JSON.stringify(event)
+			if (retryableCodexStreamError(info)) {
+				throw new RetryableModelError(`Codex temporarily unavailable: ${message}`, {
+					code: info.code || undefined,
+					type: info.type || undefined,
+					cause: info.raw,
+				})
+			}
+			throw new Error(`Codex error: ${message}`)
 		}
 		if (type === "response.failed") {
-			const msg = event.response?.error?.message
-			throw new Error(msg || "Codex response failed")
+			const info = codexErrorInfo(event.response ?? event)
+			const msg = info.message || event.response?.error?.message || "Codex response failed"
+			if (retryableCodexStreamError(info)) {
+				throw new RetryableModelError(`Codex temporarily unavailable: ${msg}`, {
+					code: info.code || undefined,
+					type: info.type || undefined,
+					cause: event,
+				})
+			}
+			throw new Error(msg)
 		}
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
 			yield { ...event, type: "response.completed" }
@@ -160,33 +202,34 @@ export function streamCodex(model, context, options) {
 			content: [],
 			provider: model.provider ?? "openai-codex",
 			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
+			auth: buildAssistantAuth(model, options),
+			usage: emptyUsage(model),
 			stopReason: "stop",
 			timestamp: Date.now(),
 		}
 
+		let modelLog = null
 		try {
+			validateMessageHistory(context.messages)
 			const apiKey = options?.apiKey
 			if (!apiKey) throw new Error("Codex requires an OAuth access token via options.apiKey")
 
 			const accountId = extractAccountId(apiKey)
+			output.auth = buildAssistantAuth(model, options, { accountId })
 			let body = buildBody(model, context, options)
 			if (options?.onPayload) {
 				const next = await options.onPayload(body, model)
 				if (next !== undefined) body = next
 			}
 
-			await executeResponsesRequest({
+			const bodyJson = JSON.stringify(body)
+			modelLog = beginModelRequest({ model, transport: "codex", requestJson: bodyJson, options })
+			if (modelLog?.id) output.modelRequestId = modelLog.id
+
+			const execute = (requestBodyJson) => executeResponsesRequest({
 				url: resolveCodexUrl(model.baseUrl),
-				headers: buildHeaders(model, accountId, apiKey, options?.sessionId, options?.headers),
-				bodyJson: JSON.stringify(body),
+				headers: buildHeaders(model, accountId, apiKey, options?.sessionId, modelLog?.id, options?.headers),
+				bodyJson: requestBodyJson,
 				output,
 				stream,
 				model,
@@ -194,19 +237,39 @@ export function streamCodex(model, context, options) {
 				onResponse: options?.onResponse,
 				mapEvents: mapCodexEvents,
 				parseError: parseErrorResponse,
+				modelLog,
+				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,
+				streamInactivityTimeoutMs: options?.streamInactivityTimeoutMs,
 			})
+			try {
+				await execute(bodyJson)
+			} catch (error) {
+				const canRetryWithoutCompaction = output.content.length === 0
+					&& !output.responseId
+					&& body.context_management
+					&& isUnsupportedImplicitResponsesCompactionError(error)
+				if (!canRetryWithoutCompaction) throw error
+				disableImplicitResponsesCompaction(model)
+				const fallbackBody = { ...body }
+				delete fallbackBody.context_management
+				await execute(JSON.stringify(fallbackBody))
+			}
 
 			if (options?.signal?.aborted) throw new Error("Request was aborted")
 			if (output.stopReason === "error") {
 				throw new Error(output.errorMessage || "Codex returned an error stop reason")
 			}
 
+			finishModelRequest(modelLog, { status: "completed", finalMessage: output })
 			stream.push({ type: "done", reason: output.stopReason, message: output })
 			stream.end()
 		} catch (error) {
 			for (const block of output.content) delete block.partialJson
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error"
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error)
+			const errorDetails = retryableModelErrorDetails(error)
+			if (errorDetails) output.errorDetails = errorDetails
+			finishModelRequest(modelLog, { status: output.stopReason, finalMessage: output, error: output.errorMessage })
 			stream.push({ type: "error", reason: output.stopReason, error: output })
 			stream.end()
 		}

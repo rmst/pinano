@@ -16,9 +16,10 @@ const writeSchema = {
 
 /**
  * @param {string} cwd
+ * @param {{ beforeFileMutation?: (info: { absolutePath: string, path: string }) => Promise<void> | void }} [options]
  * @returns {import("../agent-core/types.js").AgentTool}
  */
-export function createWriteTool(cwd) {
+export function createWriteTool(cwd, options = {}) {
 	return {
 		name: "write",
 		label: "write",
@@ -30,6 +31,8 @@ export function createWriteTool(cwd) {
 			return withFileMutationQueue(abs, async () => {
 				if (signal?.aborted) throw new Error("Operation aborted")
 				await mkdir(dirname(abs), { recursive: true })
+				if (signal?.aborted) throw new Error("Operation aborted")
+				await options.beforeFileMutation?.({ absolutePath: abs, path })
 				if (signal?.aborted) throw new Error("Operation aborted")
 				await writeFile(abs, content, "utf-8")
 				return {

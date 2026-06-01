@@ -1,5 +1,6 @@
 import { fuzzyFilter } from "../fuzzy.js";
 import { getKeybindings } from "../keybindings.js";
+import { RetainedComponent, setComponentParent } from "../tui.js";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 import { Input } from "./input.js";
 
@@ -28,7 +29,7 @@ import { Input } from "./input.js";
  */
 
 /** @implements {import("../tui.js").Component} */
-export class SettingsList {
+export class SettingsList extends RetainedComponent {
 	/** @type {SettingItem[]} */
 	items;
 	/** @type {SettingItem[]} */
@@ -63,6 +64,7 @@ export class SettingsList {
 	 * @param {SettingsListOptions} [options]
 	 */
 	constructor(items, maxVisible, theme, onChange, onCancel, options = {}) {
+		super();
 		this.items = items;
 		this.filteredItems = items;
 		this.maxVisible = maxVisible;
@@ -72,6 +74,7 @@ export class SettingsList {
 		this.searchEnabled = options.enableSearch ?? false;
 		if (this.searchEnabled) {
 			this.searchInput = new Input();
+			setComponentParent(this.searchInput, this);
 		}
 	}
 
@@ -84,10 +87,12 @@ export class SettingsList {
 		const item = this.items.find((i) => i.id === id);
 		if (item) {
 			item.currentValue = newValue;
+			this.markDirty();
 		}
 	}
 
 	invalidate() {
+		this.markDirty();
 		this.submenuComponent?.invalidate?.();
 	}
 
@@ -202,9 +207,11 @@ export class SettingsList {
 		if (kb.matches(data, "tui.select.up")) {
 			if (displayItems.length === 0) return;
 			this.selectedIndex = this.selectedIndex === 0 ? displayItems.length - 1 : this.selectedIndex - 1;
+			this.markDirty();
 		} else if (kb.matches(data, "tui.select.down")) {
 			if (displayItems.length === 0) return;
 			this.selectedIndex = this.selectedIndex === displayItems.length - 1 ? 0 : this.selectedIndex + 1;
+			this.markDirty();
 		} else if (kb.matches(data, "tui.select.confirm") || data === " ") {
 			this.activateItem();
 		} else if (kb.matches(data, "tui.select.cancel")) {
@@ -233,29 +240,35 @@ export class SettingsList {
 				}
 				this.closeSubmenu();
 			});
+			setComponentParent(this.submenuComponent, this);
+			this.markDirty();
 		} else if (item.values && item.values.length > 0) {
 			// Cycle through values
 			const currentIndex = item.values.indexOf(item.currentValue);
 			const nextIndex = (currentIndex + 1) % item.values.length;
 			const newValue = item.values[nextIndex];
 			item.currentValue = newValue;
+			this.markDirty();
 			this.onChange(item.id, newValue);
 		}
 	}
 
 	closeSubmenu() {
+		if (this.submenuComponent) setComponentParent(this.submenuComponent, null);
 		this.submenuComponent = null;
 		// Restore selection to the item that opened the submenu
 		if (this.submenuItemIndex !== null) {
 			this.selectedIndex = this.submenuItemIndex;
 			this.submenuItemIndex = null;
 		}
+		this.markDirty();
 	}
 
 	/** @param {string} query */
 	applyFilter(query) {
 		this.filteredItems = fuzzyFilter(this.items, query, (item) => item.label);
 		this.selectedIndex = 0;
+		this.markDirty();
 	}
 
 	/**

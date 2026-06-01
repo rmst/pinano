@@ -7,10 +7,13 @@
 //   - Token-based palette (`theme.fg("accent", s)`, `theme.bg("userMessageBg", s)`)
 //     used by the message components ported from pi.
 //
-// Hex colors are emitted as truecolor (24-bit) by default; falling back to
-// 256-color when the terminal advertises lower fidelity (TERM=screen, dumb,
-// linux, Apple Terminal). This matches pi's behaviour exactly so messages
-// look identical when running pinano in iTerm2, kitty, etc.
+// Hex colors are emitted as truecolor (24-bit) only when the terminal gives a
+// reliable truecolor signal. Other terminals (including Apple Terminal) get a
+// tuned 256-color approximation. Pinano also sets an explicit base foreground
+// so terminals with non-standard default text colors still look like the
+// intended dark theme.
+
+import { setTerminalBaseStyle } from "../tui/index.js"
 
 const ESC = "\x1b["
 
@@ -18,14 +21,31 @@ const ESC = "\x1b["
 
 /** @returns {ColorMode} */
 function detectColorMode() {
-	const colorterm = process.env.COLORTERM
+	const forced = process.env.PINANO_COLOR_MODE?.toLowerCase()
+	if (forced === "truecolor" || forced === "24bit") return "truecolor"
+	if (forced === "256color" || forced === "256") return "256color"
+
+	const termProgram = process.env.TERM_PROGRAM?.toLowerCase() ?? ""
+	const term = process.env.TERM?.toLowerCase() ?? ""
+	if (term === "dumb" || term === "" || term === "linux") return "256color"
+
+	// Terminal.app still commonly behaves badly with truecolor SGR sequences;
+	// prefer the stable 256-color path unless the user explicitly overrides it.
+	if (termProgram === "apple_terminal") return "256color"
+
+	const colorterm = process.env.COLORTERM?.toLowerCase()
 	if (colorterm === "truecolor" || colorterm === "24bit") return "truecolor"
 	if (process.env.WT_SESSION) return "truecolor"
-	const term = process.env.TERM ?? ""
-	if (term === "dumb" || term === "" || term === "linux") return "256color"
-	if (process.env.TERM_PROGRAM === "Apple_Terminal") return "256color"
-	if (term === "screen" || term.startsWith("screen-") || term.startsWith("screen.")) return "256color"
-	return "truecolor"
+	if (
+		termProgram === "vscode" ||
+		termProgram === "iterm.app" ||
+		termProgram === "kitty" ||
+		termProgram === "ghostty" ||
+		termProgram === "wezterm" ||
+		termProgram === "alacritty"
+	) return "truecolor"
+	if (term.includes("kitty") || term.includes("ghostty") || term.includes("wezterm")) return "truecolor"
+	return "256color"
 }
 
 /**
@@ -90,7 +110,11 @@ function rgbTo256(r, g, b) {
 		(g - grayV) * (g - grayV) * 0.587 +
 		(b - grayV) * (b - grayV) * 0.114
 	const spread = Math.max(r, g, b) - Math.min(r, g, b)
-	if (spread < 10 && grayDist < cubeDist) return 232 + grayI
+	// The xterm color cube jumps quickly from near-black to saturated colors.
+	// For low-saturation dark UI backgrounds, the grayscale ramp is a much
+	// closer visual match and avoids surprising green/red blocks in terminals
+	// with conservative 256-color rendering.
+	if (spread <= 24 && grayDist <= cubeDist * 1.25) return 232 + grayI
 	return cubeIdx
 }
 
@@ -126,9 +150,8 @@ function bgAnsi(value, mode) {
 	throw new Error(`Invalid color: ${value}`)
 }
 
-// Foreground tokens — picked from pi's dark.json. We dropped tokens we don't
-// use (markdown colors, syntax highlighting, thinking-level borders, bash mode)
-// to keep the surface small. Add back as needed.
+// Foreground tokens — picked from pi's dark.json. Syntax highlighting,
+// thinking-level borders, and bash mode tokens stay out until we need them.
 /** @type {Record<string, string | number>} */
 const FG = {
 	accent: "#8abeb7",
@@ -139,13 +162,27 @@ const FG = {
 	warning: "#ffff00",
 	muted: "#808080",
 	dim: "#666666",
-	text: "",
+	text: "#c5c8c6",
 	thinkingText: "#808080",
-	userMessageText: "",
-	customMessageText: "",
+	userMessageText: "#c5c8c6",
+	customMessageText: "#c5c8c6",
 	customMessageLabel: "#9575cd",
-	toolTitle: "",
-	toolOutput: "#808080",
+	toolText: "#737373",
+	toolTitle: "#737373",
+	toolTitleSuccess: "#6f8065",
+	toolTitleError: "#806262",
+	toolArg: "#7d827e",
+	toolOutput: "#737373",
+	mdHeading: "#f0c674",
+	mdLink: "#81a2be",
+	mdLinkUrl: "#666666",
+	mdCode: "#8abeb7",
+	mdCodeBlock: "#b5bd68",
+	mdCodeBlockBorder: "#808080",
+	mdQuote: "#808080",
+	mdQuoteBorder: "#808080",
+	mdHr: "#808080",
+	mdListBullet: "#8abeb7",
 }
 
 /** @type {Record<string, string | number>} */
@@ -153,15 +190,17 @@ const BG = {
 	selectedBg: "#3a3a4a",
 	userMessageBg: "#343541",
 	customMessageBg: "#2d2838",
-	toolPendingBg: "#282832",
-	toolSuccessBg: "#283228",
-	toolErrorBg: "#3c2828",
+	toolPendingBg: "#202020",
+	toolSuccessBg: "#202020",
+	toolErrorBg: "#202020",
 }
 
 /** @typedef {keyof typeof FG} FgToken */
 /** @typedef {keyof typeof BG} BgToken */
 
 const mode = detectColorMode()
+const baseFgAnsi = fgAnsi(FG.text, mode)
+setTerminalBaseStyle(baseFgAnsi)
 /** @type {Map<string, string>} */
 const fgCache = new Map()
 /** @type {Map<string, string>} */
@@ -177,8 +216,10 @@ for (const [k, v] of Object.entries(BG)) bgCache.set(k, bgAnsi(v, mode))
 function fg(token, text) {
 	const ansi = fgCache.get(/** @type {string} */ (token))
 	if (!ansi) throw new Error(`Unknown fg token: ${token}`)
-	// Reset only foreground so this nests safely inside backgrounds.
-	return `${ansi}${text}${ESC}39m`
+	// Reset only foreground so this nests safely inside backgrounds. We reset
+	// to Pinano's base text color instead of the terminal profile default; some
+	// terminals are configured with a non-neutral default foreground.
+	return `${ansi}${text}${baseFgAnsi}`
 }
 
 /**
@@ -226,7 +267,8 @@ export const theme = {
 	bold: ansiAttr(1, 22),
 	italic: ansiAttr(3, 23),
 	underline: ansiAttr(4, 24),
-	dim: ansiAttr(2, 22),
+	strikethrough: ansiAttr(9, 29),
+	dim: (s) => fg("dim", s),
 
 	// Legacy named-color helpers — same shape as before so existing call-sites
 	// don't break. Map onto the new tokens where the meaning matches.
@@ -251,6 +293,39 @@ export const theme = {
 	bgYellow: ansiCode(43),
 }
 
+export function getMarkdownTheme() {
+	return {
+		/** @param {string} s */
+		heading: (s) => theme.fg("mdHeading", s),
+		/** @param {string} s */
+		link: (s) => theme.fg("mdLink", s),
+		/** @param {string} s */
+		linkUrl: (s) => theme.fg("mdLinkUrl", s),
+		/** @param {string} s */
+		code: (s) => theme.fg("mdCode", s),
+		/** @param {string} s */
+		codeBlock: (s) => theme.fg("mdCodeBlock", s),
+		/** @param {string} s */
+		codeBlockBorder: (s) => theme.fg("mdCodeBlockBorder", s),
+		/** @param {string} s */
+		quote: (s) => theme.fg("mdQuote", s),
+		/** @param {string} s */
+		quoteBorder: (s) => theme.fg("mdQuoteBorder", s),
+		/** @param {string} s */
+		hr: (s) => theme.fg("mdHr", s),
+		/** @param {string} s */
+		listBullet: (s) => theme.fg("mdListBullet", s),
+		/** @param {string} s */
+		bold: (s) => theme.bold(s),
+		/** @param {string} s */
+		italic: (s) => theme.italic(s),
+		/** @param {string} s */
+		underline: (s) => theme.underline(s),
+		/** @param {string} s */
+		strikethrough: (s) => theme.strikethrough(s),
+	}
+}
+
 export const selectListTheme = {
 	selectedPrefix: theme.cyan,
 	/** @param {string} s */
@@ -266,5 +341,9 @@ export const selectListTheme = {
 export const editorTheme = {
 	/** @param {string} s */
 	borderColor: (s) => theme.fg("borderMuted", s),
+	/** @param {string} s */
+	textColor: (s) => theme.fg("text", s),
+	/** @param {string} s */
+	placeholderColor: (s) => theme.fg("dim", s),
 	selectList: selectListTheme,
 }

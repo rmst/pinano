@@ -20,6 +20,9 @@
  * @property {"image"} type
  * @property {string} data Base64-encoded bytes
  * @property {string} mimeType
+ * @property {"high" | "original" | "auto" | "low"} [detail]
+ * @property {number} [widthPx]
+ * @property {number} [heightPx]
  */
 
 /**
@@ -27,7 +30,8 @@
  * @property {"toolCall"} type
  * @property {string} id
  * @property {string} name
- * @property {Record<string, any>} arguments
+ * @property {Record<string, any>} [arguments] JSON/function tool arguments.
+ * @property {string} [input] Custom/freeform tool input.
  */
 
 /**
@@ -37,15 +41,30 @@
  * @property {number} cacheRead
  * @property {number} cacheWrite
  * @property {number} total
+ * @property {"USD" | string} [currency]
+ * @property {string} [pricingVersion]
+ */
+
+/**
+ * Provider/account context used for usage accounting. `credentialId` is the
+ * local credential slot, not a secret.
+ * @typedef {object} AssistantAuth
+ * @property {string} [provider]
+ * @property {string} [credentialId]
+ * @property {string} [accountId]
+ * @property {string} [subscriptionId]
  */
 
 /**
  * @typedef {object} Usage
- * @property {number} input
- * @property {number} output
+ * @property {number} input Non-cached, non-cache-write input tokens.
+ * @property {number} output Provider/billing output tokens; reasoning output is a subset when reported.
+ * @property {number} [reasoningOutput]
  * @property {number} cacheRead
  * @property {number} cacheWrite
- * @property {number} totalTokens
+ * @property {number} totalTokens Provider total when reported; otherwise normalized sum.
+ * @property {number} [providerTotalTokens]
+ * @property {any} [raw] Raw provider usage payload, for future accounting/backfills.
  * @property {Cost} cost
  */
 
@@ -66,8 +85,10 @@
  * @property {(TextContent | ThinkingContent | ToolCall)[]} content
  * @property {string} provider
  * @property {string} model
+ * @property {AssistantAuth} [auth]
  * @property {string} [responseModel]
  * @property {string} [responseId]
+ * @property {string} [modelRequestId] ID in model I/O log when enabled.
  * @property {Usage} usage
  * @property {StopReason} stopReason
  * @property {string} [errorMessage]
@@ -89,11 +110,21 @@
  */
 
 /**
- * A tool definition. `parameters` is a plain JSON Schema object.
- * @typedef {object} Tool
+ * A JSON/function tool definition. `parameters` is a plain JSON Schema object.
+ *
+ * @typedef {object} FunctionTool
+ * @property {"function"} [kind]
  * @property {string} name
  * @property {string} description
  * @property {Record<string, any>} parameters JSON Schema for the tool arguments
+ *
+ * @typedef {object} CustomTool
+ * @property {"custom"} kind
+ * @property {string} name
+ * @property {string} description
+ * @property {{ type: "grammar", syntax: "lark", definition: string }} [format]
+ *
+ * @typedef {FunctionTool | CustomTool} Tool
  */
 
 /**
@@ -136,24 +167,39 @@
  * @property {boolean} [reasoning] Whether the model supports reasoning_effort
  * @property {("text" | "image")[]} [input] Modalities the model accepts. Default: ["text"]
  * @property {ModelCost} [cost]
+ * @property {string} [costVersion]
  * @property {number} [contextWindow]
  * @property {number} [maxTokens]
+ * @property {number|false|null} [responseHeaderTimeoutMs] Override Responses transport timeout before response headers.
+ * @property {number|false|null} [streamInactivityTimeoutMs] Override timeout while waiting for SSE stream data after response headers.
  * @property {Record<string, string>} [headers] Extra HTTP headers
  * @property {OpenAICompat} [compat]
+ * @property {boolean} [supportsTextVerbosity]
+ * @property {"low" | "medium" | "high"} [defaultTextVerbosity]
+ * @property {boolean} [supportsParallelToolCalls]
+ * @property {("none" | "minimal" | "low" | "medium" | "high" | "xhigh")[]} [supportedReasoningLevels]
+ * @property {"none" | "minimal" | "low" | "medium" | "high" | "xhigh"} [defaultReasoningLevel]
+ * @property {string} [baseInstructionsKey]
+ * @property {"default" | "apply_patch"} [toolProfile]
  */
 
 /**
  * @typedef {object} StreamOptions
  * @property {string} [apiKey]
+ * @property {AssistantAuth} [auth]
  * @property {number} [temperature]
  * @property {number} [maxTokens]
  * @property {AbortSignal} [signal]
  * @property {string} [sessionId] Sent as prompt_cache_key when supported
+ * @property {number|false|null} [responseHeaderTimeoutMs] Override Responses transport timeout before response headers.
+ * @property {number|false|null} [streamInactivityTimeoutMs] Override timeout while waiting for SSE stream data after response headers.
+ * @property {string} [serviceTier]
  * @property {Record<string, string>} [headers]
  * @property {(payload: any, model: Model) => any} [onPayload]
  * @property {(response: { status: number, headers: Record<string, string> }, model: Model) => void | Promise<void>} [onResponse]
  * @property {"auto" | "none" | "required" | { type: "function", function: { name: string } }} [toolChoice]
- * @property {"minimal" | "low" | "medium" | "high"} [reasoningEffort]
+ * @property {"none" | "minimal" | "low" | "medium" | "high" | "xhigh"} [reasoningEffort]
+ * @property {"low" | "medium" | "high"} [textVerbosity]
  */
 
 /**

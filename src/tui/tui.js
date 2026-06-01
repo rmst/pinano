@@ -46,6 +46,89 @@ export function isFocusable(component) {
 	return component !== null && "focused" in component;
 }
 
+
+const RETAINED = Symbol("pinano.tui.retained");
+const DIRTY_PARENT = Symbol("pinano.tui.dirtyParent");
+const DIRTY = Symbol("pinano.tui.dirty");
+const RENDER_CACHE = Symbol("pinano.tui.renderCache");
+const CHILDREN_CACHE = Symbol("pinano.tui.childrenCache");
+const VOLATILE_CHILDREN = Symbol("pinano.tui.volatileChildren");
+const STRUCTURE_DIRTY = Symbol("pinano.tui.structureDirty");
+const STRUCTURE_DIRTY_START = Symbol("pinano.tui.structureDirtyStart");
+
+/** @typedef {{ lines: string[], dirtyStart: number }} IncrementalRenderResult */
+/** @typedef {{ component: Component, start: number, length: number }} ChildRenderRecord */
+
+/** @param {Component} component @param {Component | null} parent */
+export function setComponentParent(component, parent) {
+	component[DIRTY_PARENT] = parent;
+	if (parent && component[DIRTY]) markComponentDirty(parent);
+}
+
+/** @param {Component | null | undefined} component @returns {void} */
+export function markComponentDirty(component) {
+	if (!component) return;
+	const wasDirty = !!component[DIRTY];
+	component[DIRTY] = true;
+	const parent = component[DIRTY_PARENT];
+	if (parent && (!wasDirty || !parent[DIRTY])) {
+		markComponentDirty(parent);
+	}
+}
+
+/** @param {Component | null | undefined} component @param {number} [childIndex] @returns {void} */
+function markComponentStructureDirty(component, childIndex = 0) {
+	if (!component) return;
+	component[STRUCTURE_DIRTY] = true;
+	component[STRUCTURE_DIRTY_START] = Math.min(component[STRUCTURE_DIRTY_START] ?? childIndex, childIndex);
+	markComponentDirty(component);
+}
+
+/** @param {Component | null | undefined} component @returns {boolean} */
+function isRetainedComponent(component) {
+	return !!component?.[RETAINED];
+}
+
+/** @param {Component | null | undefined} component @returns {boolean} */
+function componentHasVolatileRender(component) {
+	return !isRetainedComponent(component) || !!component?.[VOLATILE_CHILDREN];
+}
+
+/** @param {Component | null | undefined} component @returns {boolean} */
+function isComponentDirty(component) {
+	return !!component?.[DIRTY];
+}
+
+/** @param {Component | null | undefined} component @returns {void} */
+function clearComponentDirty(component) {
+	if (!component) return;
+	component[DIRTY] = false;
+	component[STRUCTURE_DIRTY] = false;
+	component[STRUCTURE_DIRTY_START] = undefined;
+}
+
+/** @param {Component} component @param {number} width @returns {IncrementalRenderResult} */
+function renderComponentIncremental(component, width) {
+	if (!isRetainedComponent(component)) {
+		return { lines: component.render(width), dirtyStart: 0 };
+	}
+
+	if (typeof component.renderIncremental === "function") {
+		return component.renderIncremental(width);
+	}
+
+	const cache = component[RENDER_CACHE];
+	if (!isComponentDirty(component) && cache?.width === width) {
+		return { lines: cache.lines, dirtyStart: Infinity };
+	}
+
+	const lines = component.render(width);
+	component[RENDER_CACHE] = { width, lines };
+	clearComponentDirty(component);
+	return { lines, dirtyStart: 0 };
+}
+
+
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 
 /**
@@ -79,6 +162,19 @@ function extractKittyImageIds(line) {
  * TUI finds and strips this marker, then positions the hardware cursor there.
  */
 export const CURSOR_MARKER = "\x1b_pi:c\x07";
+
+let terminalBaseStyle = "";
+
+/**
+ * Set an ANSI prefix that should be active for otherwise-unstyled TUI text.
+ * App-level themes use this to avoid inheriting a user's terminal profile
+ * foreground color (for example bright green in Terminal.app).
+ *
+ * @param {string} style
+ */
+export function setTerminalBaseStyle(style) {
+	terminalBaseStyle = style;
+}
 
 export { visibleWidth };
 
@@ -138,6 +234,7 @@ function isTermuxSession() {
  * @property {OverlayMargin | number} [margin] Margin from terminal edges. Number applies to all sides.
  * @property {(termWidth: number, termHeight: number) => boolean} [visible] Control overlay visibility based on terminal dimensions. If provided, overlay is only rendered when this returns true. Called each render cycle with current terminal dimensions.
  * @property {boolean} [nonCapturing] If true, don't capture keyboard focus when shown
+ * @property {boolean} [backdrop] If true, hide the base UI behind the overlay
  */
 
 /**
@@ -161,10 +258,43 @@ function isTermuxSession() {
  */
 
 /**
- * Container - a component that contains other components
- * @implements {Component}
+ * Base for retained TUI components.
+ *
+ * Components render raw terminal rows with `render(width) -> string[]`. Plain
+ * components are deliberately safe-by-default: they are rendered every frame and
+ * never cached, so old ad-hoc mutable widgets keep the old immediate-mode
+ * behavior. Components that extend `RetainedComponent` opt into caching by
+ * identity. Any method on a retained component that mutates render-affecting
+ * state must call `this.markDirty()` before the next `requestRender()`.
+ * Containers do this automatically for child add/remove operations and propagate
+ * child dirtiness through parent links.
  */
-export class Container {
+export class RetainedComponent {
+	constructor() {
+		this[RETAINED] = true;
+		this.markDirty();
+	}
+
+	markDirty() {
+		markComponentDirty(this);
+	}
+
+	invalidate() {
+		this.markDirty();
+	}
+
+	clearDirty() {
+		clearComponentDirty(this);
+	}
+}
+
+/**
+ * Shared child-management and child-layout cache for components that own children.
+ * Subclasses can either use the plain concatenating `Container` render, or call
+ * `renderChildrenIncremental()` from a custom `renderIncremental()` implementation
+ * (e.g. `Box`, which pads and backgrounds its children).
+ */
+export class RetainedContainer extends RetainedComponent {
 	/** @type {Component[]} */
 	children = [];
 
@@ -173,7 +303,10 @@ export class Container {
 	 * @returns {void}
 	 */
 	addChild(component) {
+		const index = this.children.length;
 		this.children.push(component);
+		setComponentParent(component, this);
+		markComponentStructureDirty(this, index);
 	}
 
 	/**
@@ -184,17 +317,89 @@ export class Container {
 		const index = this.children.indexOf(component);
 		if (index !== -1) {
 			this.children.splice(index, 1);
+			setComponentParent(component, null);
+			markComponentStructureDirty(this, index);
 		}
 	}
 
 	clear() {
+		for (const child of this.children) setComponentParent(child, null);
 		this.children = [];
+		markComponentStructureDirty(this);
 	}
 
 	invalidate() {
+		markComponentStructureDirty(this);
 		for (const child of this.children) {
 			child.invalidate?.();
+			markComponentDirty(child);
 		}
+	}
+
+	/**
+	 * @param {number} width
+	 * @returns {IncrementalRenderResult & { childRecords: ChildRenderRecord[] }}
+	 */
+	renderChildrenIncremental(width) {
+		const cache = this[CHILDREN_CACHE];
+		const widthChanged = cache?.width !== width;
+		/** @type {string[]} */
+		const lines = [];
+		/** @type {ChildRenderRecord[]} */
+		const childRecords = [];
+		let dirtyStart = Infinity;
+		let offset = 0;
+		const structureDirty = this[STRUCTURE_DIRTY] || !cache || widthChanged;
+
+		if (structureDirty) {
+			if (!cache || widthChanged) {
+				dirtyStart = 0;
+			} else {
+				const childIndex = Math.max(0, this[STRUCTURE_DIRTY_START] ?? 0);
+				const previousRecords = cache.childRecords ?? [];
+				const previousRecord = previousRecords[Math.min(childIndex, previousRecords.length - 1)];
+				dirtyStart = childIndex >= previousRecords.length ? cache.lines.length : (previousRecord?.start ?? 0);
+			}
+		}
+
+		let hasVolatileChildren = false;
+		for (const child of this.children) {
+			const childResult = renderComponentIncremental(child, width);
+			if (componentHasVolatileRender(child)) hasVolatileChildren = true;
+			if (childResult.dirtyStart !== Infinity) {
+				dirtyStart = Math.min(dirtyStart, offset + childResult.dirtyStart);
+			}
+			for (const line of childResult.lines) lines.push(line);
+			childRecords.push({ component: child, start: offset, length: childResult.lines.length });
+			offset += childResult.lines.length;
+		}
+		this[VOLATILE_CHILDREN] = hasVolatileChildren;
+
+		this[CHILDREN_CACHE] = { width, lines, childRecords };
+		return { lines, dirtyStart, childRecords };
+	}
+}
+
+/**
+ * Container - a component that concatenates child render output.
+ * @implements {Component}
+ */
+export class Container extends RetainedContainer {
+	/**
+	 * @param {number} width
+	 * @returns {IncrementalRenderResult}
+	 */
+	renderIncremental(width) {
+		const cache = this[RENDER_CACHE];
+		const widthChanged = cache?.width !== width;
+		if (!isComponentDirty(this) && !widthChanged && cache && !this[VOLATILE_CHILDREN]) {
+			return { lines: cache.lines, dirtyStart: Infinity };
+		}
+
+		const result = this.renderChildrenIncremental(width);
+		this[RENDER_CACHE] = { width, lines: result.lines };
+		this.clearDirty();
+		return { lines: result.lines, dirtyStart: result.dirtyStart };
 	}
 
 	/**
@@ -202,15 +407,7 @@ export class Container {
 	 * @returns {string[]}
 	 */
 	render(width) {
-		/** @type {string[]} */
-		const lines = [];
-		for (const child of this.children) {
-			const childLines = child.render(width);
-			for (const line of childLines) {
-				lines.push(line);
-			}
-		}
-		return lines;
+		return this.renderIncremental(width).lines;
 	}
 }
 
@@ -246,6 +443,7 @@ export class TUI extends Container {
 	clearOnShrink = process.env.PI_CLEAR_ON_SHRINK === "1"; // Clear empty rows when content shrinks (default: off)
 	maxLinesRendered = 0; // Track terminal's working area (max lines ever rendered)
 	previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
+	previousOverlayActive = false; // Track whether previous materialized lines included overlay compositing
 	fullRedrawCount = 0;
 	stopped = false;
 
@@ -310,9 +508,11 @@ export class TUI extends Container {
 	 * @returns {void}
 	 */
 	setFocus(component) {
+		const previous = this.focusedComponent;
 		// Clear focused flag on old component
-		if (isFocusable(this.focusedComponent)) {
-			this.focusedComponent.focused = false;
+		if (isFocusable(previous)) {
+			previous.focused = false;
+			markComponentDirty(previous);
 		}
 
 		this.focusedComponent = component;
@@ -320,6 +520,7 @@ export class TUI extends Container {
 		// Set focused flag on new component
 		if (isFocusable(component)) {
 			component.focused = true;
+			markComponentDirty(component);
 		}
 	}
 
@@ -507,6 +708,7 @@ export class TUI extends Container {
 			this.terminal.write("\r\n");
 		}
 
+		this.terminal.write(TUI.SEGMENT_RESET);
 		this.terminal.showCursor();
 		this.terminal.stop();
 	}
@@ -517,6 +719,7 @@ export class TUI extends Container {
 	 */
 	requestRender(force = false) {
 		if (force) {
+			this.invalidate();
 			this.previousLines = [];
 			this.previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
 			this.previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
@@ -524,6 +727,7 @@ export class TUI extends Container {
 			this.hardwareCursorRow = 0;
 			this.maxLinesRendered = 0;
 			this.previousViewportTop = 0;
+			this.previousOverlayActive = false;
 			if (this.renderTimer) {
 				clearTimeout(this.renderTimer);
 				this.renderTimer = undefined;
@@ -619,6 +823,7 @@ export class TUI extends Container {
 				return;
 			}
 			this.focusedComponent.handleInput(data);
+			markComponentDirty(this.focusedComponent);
 			this.requestRender();
 		}
 	}
@@ -809,14 +1014,16 @@ export class TUI extends Container {
 	 */
 	compositeOverlays(lines, termWidth, termHeight) {
 		if (this.overlayStack.length === 0) return lines;
-		const result = [...lines];
+		const visibleEntries = this.overlayStack.filter((e) => this.isOverlayVisible(e));
+		if (visibleEntries.length === 0) return lines;
+		const hasBackdrop = visibleEntries.some((e) => e.options?.backdrop);
+		const result = hasBackdrop ? [] : [...lines];
 
 		// Pre-render all visible overlays and calculate positions
 		/** @type {{ overlayLines: string[]; row: number; col: number; w: number }[]} */
 		const rendered = [];
 		let minLinesNeeded = result.length;
 
-		const visibleEntries = this.overlayStack.filter((e) => this.isOverlayVisible(e));
 		visibleEntries.sort((a, b) => a.focusOrder - b.focusOrder);
 		for (const entry of visibleEntries) {
 			const { component, options } = entry;
@@ -871,34 +1078,150 @@ export class TUI extends Container {
 
 	static SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
 
+	static segmentResetWithBaseStyle() {
+		return TUI.SEGMENT_RESET + terminalBaseStyle;
+	}
+
 	/**
 	 * @param {string[]} lines
+	 * @param {number} [start]
 	 * @returns {string[]}
 	 */
-	applyLineResets(lines) {
-		const reset = TUI.SEGMENT_RESET;
-		for (let i = 0; i < lines.length; i++) {
+	applyLineResets(lines, start = 0) {
+		const reset = TUI.segmentResetWithBaseStyle();
+		for (let i = Math.max(0, start); i < lines.length; i++) {
 			const line = lines[i];
 			if (!isImageLine(line)) {
-				lines[i] = normalizeTerminalOutput(line) + reset;
+				lines[i] = terminalBaseStyle + normalizeTerminalOutput(line) + reset;
 			}
 		}
 		return lines;
 	}
 
 	/**
+	 * Convert raw component lines into terminal-ready lines while reusing the
+	 * already-materialized unchanged prefix. Component render caches deliberately
+	 * store raw lines; terminal resets and cursor-marker stripping are TUI-level
+	 * concerns and must not mutate those caches.
+	 * @param {string[]} rawLines
+	 * @param {number} dirtyStart
+	 * @param {{ row: number; col: number } | null} cursorPos
+	 * @returns {string[]}
+	 */
+	materializeTerminalLines(rawLines, dirtyStart, cursorPos) {
+		if (dirtyStart === Infinity && this.previousLines.length === rawLines.length) {
+			return this.previousLines;
+		}
+
+		const start = Math.max(0, Math.min(rawLines.length, dirtyStart === Infinity ? 0 : dirtyStart));
+		const lines = start > 0 && this.previousLines.length >= start
+			? this.previousLines.slice(0, start)
+			: [];
+		for (let i = start; i < rawLines.length; i++) {
+			let line = rawLines[i];
+			if (cursorPos && i === cursorPos.row) {
+				line = line.replace(CURSOR_MARKER, "");
+			}
+			lines.push(line);
+		}
+		return this.applyLineResets(lines, lines.length - (rawLines.length - start));
+	}
+
+	/**
 	 * @param {string[]} lines
+	 * @param {number} [start]
 	 * @returns {Set<number>}
 	 */
-	collectKittyImageIds(lines) {
+	collectKittyImageIds(lines, start = 0) {
 		/** @type {Set<number>} */
 		const ids = new Set();
-		for (const line of lines) {
-			for (const id of extractKittyImageIds(line)) {
+		for (let i = Math.max(0, start); i < lines.length; i++) {
+			for (const id of extractKittyImageIds(lines[i])) {
 				ids.add(id);
 			}
 		}
 		return ids;
+	}
+
+	/**
+	 * @param {string[]} newLines
+	 * @param {number} dirtyStart
+	 * @returns {Set<number>}
+	 */
+	collectNextKittyImageIds(newLines, dirtyStart) {
+		if (dirtyStart === Infinity) return this.previousKittyImageIds;
+		if (dirtyStart <= 0 || this.previousKittyImageIds.size > 0) return this.collectKittyImageIds(newLines);
+		return this.collectKittyImageIds(newLines, dirtyStart);
+	}
+
+	/**
+	 * @param {string[]} lines
+	 * @param {number} width
+	 * @param {{ start?: number; end?: number; checkLineBreaks?: boolean; checkWidth?: boolean }} [options]
+	 * @returns {void}
+	 */
+	assertRenderableLines(lines, width, options = {}) {
+		const start = Math.max(0, options.start ?? 0);
+		const end = Math.min(lines.length - 1, options.end ?? lines.length - 1);
+		const checkLineBreaks = options.checkLineBreaks ?? true;
+		const checkWidth = options.checkWidth ?? true;
+		for (let i = start; i <= end; i++) {
+			const line = lines[i];
+			if (isImageLine(line)) continue;
+			if (checkLineBreaks && (line.includes("\n") || line.includes("\r"))) {
+				this.throwRenderInvariantError({
+					lineIndex: i,
+					width,
+					lineWidth: visibleWidth(line),
+					reason: "contains a raw line break",
+					lines,
+				});
+			}
+			if (checkWidth) {
+				const lineWidth = visibleWidth(line);
+				if (lineWidth > width) {
+					this.throwRenderInvariantError({
+						lineIndex: i,
+						width,
+						lineWidth,
+						reason: `exceeds terminal width (${lineWidth} > ${width})`,
+						lines,
+					});
+				}
+			}
+		}
+	}
+
+	/**
+	 * @param {{ lineIndex: number; width: number; lineWidth: number; reason: string; lines: string[] }} info
+	 * @returns {never}
+	 */
+	throwRenderInvariantError(info) {
+		const crashLogPath = path.join(os.homedir(), ".pi", "agent", "pi-crash.log");
+		const crashData = [
+			`Crash at ${new Date().toISOString()}`,
+			`Terminal width: ${info.width}`,
+			`Line ${info.lineIndex} ${info.reason}`,
+			`Line ${info.lineIndex} visible width: ${info.lineWidth}`,
+			"",
+			"=== All rendered lines ===",
+			...info.lines.map((line, idx) => `[${idx}] (w=${visibleWidth(line)}) ${JSON.stringify(line)}`),
+			"",
+		].join("\n");
+		fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+		fs.writeFileSync(crashLogPath, crashData);
+
+		this.stop();
+
+		const errorMsg = [
+			`Rendered line ${info.lineIndex} ${info.reason}.`,
+			"",
+			"Each component render() entry must be exactly one terminal row: no raw line breaks and no visible width overflow.",
+			"Split or wrap multiline content into separate returned lines, and use visibleWidth()/truncateToWidth() for width control.",
+			"",
+			`Debug log written to: ${crashLogPath}`,
+		].join("\n");
+		throw new Error(errorMsg);
 	}
 
 	/**
@@ -975,7 +1298,7 @@ export class TUI extends Container {
 		const afterPad = Math.max(0, afterTarget - base.afterWidth);
 
 		// Compose result
-		const r = TUI.SEGMENT_RESET;
+		const r = TUI.segmentResetWithBaseStyle();
 		const result =
 			base.before +
 			" ".repeat(beforePad) +
@@ -1001,8 +1324,9 @@ export class TUI extends Container {
 	}
 
 	/**
-	 * Find and extract cursor position from rendered lines.
-	 * Searches for CURSOR_MARKER, calculates its position, and strips it from the output.
+	 * Find cursor position from rendered raw lines.
+	 * Searches for CURSOR_MARKER and calculates its position without mutating
+	 * the line array, because raw lines may be shared with retained render caches.
 	 * Only scans the bottom terminal height lines (visible viewport).
 	 * @param {string[]} lines - Rendered lines to search
 	 * @param {number} height - Terminal height (visible viewport size)
@@ -1018,10 +1342,6 @@ export class TUI extends Container {
 				// Calculate visual column (width of text before marker)
 				const beforeMarker = line.slice(0, markerIndex);
 				const col = visibleWidth(beforeMarker);
-
-				// Strip marker from the line
-				lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
-
 				return { row, col };
 			}
 		}
@@ -1045,22 +1365,41 @@ export class TUI extends Container {
 			return targetScreenRow - currentScreenRow;
 		};
 
-		// Render all components to get new lines
-		let newLines = this.render(width);
+		// Render all components. Retained components can reuse cached subtrees and
+		// report the first raw line whose output may have changed.
+		const renderResult = this.renderIncremental(width);
+		let rawNewLines = renderResult.lines;
+		let dirtyStart = renderResult.dirtyStart;
 
-		// Composite overlays into the rendered lines (before differential compare)
-		if (this.overlayStack.length > 0) {
-			newLines = this.compositeOverlays(newLines, width, height);
+		// Composite overlays into the rendered lines (before differential compare).
+		// Overlay compositing is screen-position dependent and deliberately kept as
+		// a conservative full-diff path; normal typing has no overlays. When the
+		// last overlay closes, the retained base tree may be clean, but previousLines
+		// still contain the composited overlay rows, so force re-materialization.
+		const overlayActive = this.overlayStack.length > 0;
+		if (overlayActive) {
+			rawNewLines = this.compositeOverlays(rawNewLines, width, height);
+			dirtyStart = 0;
+		} else if (this.previousOverlayActive) {
+			dirtyStart = 0;
 		}
 
 		// Extract cursor position before applying line resets (marker must be found first)
-		const cursorPos = this.extractCursorPosition(newLines, height);
+		const cursorPos = this.extractCursorPosition(rawNewLines, height);
 
-		newLines = this.applyLineResets(newLines);
+		const materializeStart = this.previousLines.length === 0 || widthChanged || (heightChanged && !isTermuxSession())
+			? 0
+			: dirtyStart;
+		this.assertRenderableLines(rawNewLines, width, {
+			start: materializeStart === Infinity ? rawNewLines.length : materializeStart,
+			checkWidth: false,
+		});
+		let newLines = this.materializeTerminalLines(rawNewLines, materializeStart, cursorPos);
 
 		// Helper to clear scrollback and viewport and render all new lines
 		/** @param {boolean} clear @returns {void} */
 		const fullRender = (clear) => {
+			this.assertRenderableLines(newLines, width, { checkLineBreaks: false });
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
 			if (clear) {
@@ -1088,6 +1427,7 @@ export class TUI extends Container {
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
+			this.previousOverlayActive = overlayActive;
 		};
 
 		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
@@ -1135,7 +1475,8 @@ export class TUI extends Container {
 		let firstChanged = -1;
 		let lastChanged = -1;
 		const maxLines = Math.max(newLines.length, this.previousLines.length);
-		for (let i = 0; i < maxLines; i++) {
+		const diffStart = dirtyStart === Infinity ? maxLines : Math.max(0, Math.min(dirtyStart, maxLines));
+		for (let i = diffStart; i < maxLines; i++) {
 			const oldLine = i < this.previousLines.length ? this.previousLines[i] : "";
 			const newLine = i < newLines.length ? newLines[i] : "";
 
@@ -1163,6 +1504,7 @@ export class TUI extends Container {
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousViewportTop = prevViewportTop;
 			this.previousHeight = height;
+			this.previousOverlayActive = overlayActive;
 			return;
 		}
 
@@ -1206,10 +1548,11 @@ export class TUI extends Container {
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousKittyImageIds = this.collectNextKittyImageIds(newLines, materializeStart);
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
+			this.previousOverlayActive = overlayActive;
 			return;
 		}
 
@@ -1253,39 +1596,11 @@ export class TUI extends Container {
 		// Only render changed lines (firstChanged to lastChanged), not all lines to end
 		// This reduces flicker when only a single line changes (e.g., spinner animation)
 		const renderEnd = Math.min(lastChanged, newLines.length - 1);
+		this.assertRenderableLines(newLines, width, { start: firstChanged, end: renderEnd, checkLineBreaks: false });
 		for (let i = firstChanged; i <= renderEnd; i++) {
 			if (i > firstChanged) buffer += "\r\n";
 			buffer += "\x1b[2K"; // Clear current line
 			const line = newLines[i];
-			const isImage = isImageLine(line);
-			if (!isImage && visibleWidth(line) > width) {
-				// Log all lines to crash file for debugging
-				const crashLogPath = path.join(os.homedir(), ".pi", "agent", "pi-crash.log");
-				const crashData = [
-					`Crash at ${new Date().toISOString()}`,
-					`Terminal width: ${width}`,
-					`Line ${i} visible width: ${visibleWidth(line)}`,
-					"",
-					"=== All rendered lines ===",
-					...newLines.map((l, idx) => `[${idx}] (w=${visibleWidth(l)}) ${l}`),
-					"",
-				].join("\n");
-				fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
-				fs.writeFileSync(crashLogPath, crashData);
-
-				// Clean up terminal state before throwing
-				this.stop();
-
-				const errorMsg = [
-					`Rendered line ${i} exceeds terminal width (${visibleWidth(line)} > ${width}).`,
-					"",
-					"This is likely caused by a custom TUI component not truncating its output.",
-					"Use visibleWidth() to measure and truncateToWidth() to truncate lines.",
-					"",
-					`Debug log written to: ${crashLogPath}`,
-				].join("\n");
-				throw new Error(errorMsg);
-			}
 			buffer += line;
 		}
 
@@ -1355,9 +1670,10 @@ export class TUI extends Container {
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = newLines;
-		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+		this.previousKittyImageIds = this.collectNextKittyImageIds(newLines, materializeStart);
 		this.previousWidth = width;
 		this.previousHeight = height;
+		this.previousOverlayActive = overlayActive;
 	}
 
 	/**

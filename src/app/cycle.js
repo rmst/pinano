@@ -1,15 +1,16 @@
-// Helpers for cycling through model ids / thinking levels. Used by RPC mode
+// Helpers for cycling through model ids / reasoning levels. Used by RPC mode
 // (cycle_model / cycle_thinking_level) and earmarked for the future Ctrl+P
 // keybind in the TUI.
 
-import { MODEL_REGISTRY, modelEntryMatches, modelRef, modelRefMatches } from "./models.js"
+import { REASONING_LEVELS, normalizeReasoningLevel } from "../reasoning.js"
+import { MODEL_REGISTRY, modelRef, modelRefMatches } from "./models.js"
 
 /** @typedef {import("./settings.js").Settings} Settings */
 /** @typedef {import("./models.js").ModelEntry} ModelEntry */
 
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"]
+export const THINKING_LEVELS = REASONING_LEVELS
 
-/** @typedef {"off" | "minimal" | "low" | "medium" | "high"} ThinkingLevel */
+/** @typedef {import("../reasoning.js").ReasoningLevel} ThinkingLevel */
 
 /**
  * Return the next model id after `currentId` from the scoped subset, wrapping
@@ -29,18 +30,19 @@ export function cycleModelId(currentId, scopedIds, models = MODEL_REGISTRY) {
 		? models.filter((m) => scopedIds.some((id) => modelRefMatches(m, id)))
 		: models
 	if (scoped.length === 0) return null
-	const idx = scoped.findIndex((m) => modelEntryMatches(m, currentId))
+	const idx = scoped.findIndex((m) => modelRefMatches(m, currentId))
 	const next = scoped[(idx + 1) % scoped.length]
 	return { id: modelRef(next), isScoped: scopedIds.length > 0 }
 }
 
 /**
- * Cycle through the five thinking levels in fixed order.
+ * Cycle through reasoning levels in fixed order.
  * @param {ThinkingLevel} current
  * @returns {ThinkingLevel}
  */
 export function cycleThinkingLevel(current) {
-	const idx = THINKING_LEVELS.indexOf(current)
+	const normalized = normalizeReasoningLevel(current) ?? "default"
+	const idx = THINKING_LEVELS.indexOf(normalized)
 	return /** @type {ThinkingLevel} */ (THINKING_LEVELS[(idx + 1) % THINKING_LEVELS.length])
 }
 

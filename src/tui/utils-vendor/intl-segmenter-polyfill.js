@@ -1,4 +1,4 @@
-// Minimal `Intl.Segmenter` polyfill for runtimes that lack `Intl` (qn).
+// Minimal `Intl.Segmenter` polyfill for older/minimal runtimes.
 //
 // Splits text into approximate grapheme clusters: each base code point starts
 // a new cluster, and following combining marks (`\p{Mark}`), variation

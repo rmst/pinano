@@ -4,13 +4,16 @@
 
 import { streamOpenAI, completeOpenAI } from "./openai.js"
 import { streamOpenAIResponses, completeOpenAIResponses } from "./openai-responses.js"
+import { streamCodex, completeCodex } from "./codex/index.js"
 
 export function stream(model, context, options) {
+	if (model?.provider === "openai-codex") return streamCodex(model, context, options)
 	if (model?.transport === "responses") return streamOpenAIResponses(model, context, options)
 	return streamOpenAI(model, context, options)
 }
 
 export async function complete(model, context, options) {
+	if (model?.provider === "openai-codex") return completeCodex(model, context, options)
 	if (model?.transport === "responses") return completeOpenAIResponses(model, context, options)
 	return completeOpenAI(model, context, options)
 }

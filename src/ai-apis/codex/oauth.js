@@ -72,6 +72,8 @@ function getAccountId(accessToken) {
 	return typeof id === "string" && id.length > 0 ? id : null
 }
 
+const MANUAL_AUTH_MESSAGE = "Paste the authorization code or full redirect URL:"
+
 function parseAuthorizationInput(input) {
 	const value = input.trim()
 	if (!value) return {}
@@ -91,6 +93,51 @@ function parseAuthorizationInput(input) {
 		return { code: params.get("code") ?? undefined, state: params.get("state") ?? undefined }
 	}
 	return { code: value }
+}
+
+function authorizationCodeFromInput(input, expectedState) {
+	if (input == null) throw new Error("Manual code entry cancelled")
+	const parsed = parseAuthorizationInput(String(input))
+	if (parsed.state && parsed.state !== expectedState) throw new Error("State mismatch")
+	if (!parsed.code) throw new Error("Missing authorization code")
+	return parsed.code
+}
+
+async function promptForAuthorizationCode(onPrompt, state) {
+	return authorizationCodeFromInput(await onPrompt({ message: MANUAL_AUTH_MESSAGE }), state)
+}
+
+function createManualCodeEntry(onPrompt, state) {
+	if (typeof onPrompt !== "function") return null
+	let resolveCode
+	const codePromise = new Promise((resolve) => {
+		resolveCode = resolve
+	})
+	let active = false
+	let submitted = false
+	return {
+		waitForCode: () => codePromise,
+		request: async () => {
+			if (submitted) return { status: "submitted" }
+			if (active) return { status: "busy" }
+			active = true
+			try {
+				const code = await promptForAuthorizationCode(onPrompt, state)
+				submitted = true
+				resolveCode(code)
+				return { status: "submitted" }
+			} catch (err) {
+				if (err?.message === "Manual code entry cancelled") return { status: "cancelled" }
+				return { status: "error", error: err }
+			} finally {
+				active = false
+			}
+		},
+	}
+}
+
+function localCallbackDisabled() {
+	return process.env.PINANO_OAUTH_DISABLE_LOCALHOST_CALLBACK === "1"
 }
 
 async function exchangeAuthorizationCode(code, verifier) {
@@ -231,9 +278,10 @@ function startCallbackServer(state) {
  *     just printing it).
  *
  * Optional:
- *   onPrompt({ message }): if the local callback server can't bind
- *     (port in use), we fall back to asking the user to paste the code
- *     or full redirect URL by hand.
+ *   onPrompt({ message }): allows the caller to ask the user to paste the
+ *     code or full redirect URL by hand. Used automatically when the local
+ *     callback server can't bind, and exposed to onAuth as requestManualCode
+ *     while the callback server is waiting.
  *   originator: identifier sent in the authorize URL. Default "pi".
  *   signal: AbortSignal — aborts the flow.
  *
@@ -245,6 +293,7 @@ export async function loginCodex({ onAuth, onPrompt, originator, signal } = {}) 
 	const { url, verifier, state } = await buildAuthorizationUrl({ originator })
 	let server
 	try {
+		if (localCallbackDisabled()) throw new Error("disabled by PINANO_OAUTH_DISABLE_LOCALHOST_CALLBACK")
 		server = await startCallbackServer(state)
 	} catch (err) {
 		// Port unavailable — fall back to manual paste.
@@ -255,29 +304,28 @@ export async function loginCodex({ onAuth, onPrompt, originator, signal } = {}) 
 			)
 		}
 		onAuth({ url, instructions: "Open this URL, complete login, and paste the redirect URL or code below." })
-		const input = await onPrompt({ message: "Paste the authorization code or full redirect URL:" })
-		const parsed = parseAuthorizationInput(input)
-		if (parsed.state && parsed.state !== state) throw new Error("State mismatch")
-		if (!parsed.code) throw new Error("Missing authorization code")
-		const tokens = await exchangeAuthorizationCode(parsed.code, verifier)
+		const code = await promptForAuthorizationCode(onPrompt, state)
+		const tokens = await exchangeAuthorizationCode(code, verifier)
 		const accountId = getAccountId(tokens.access)
 		if (!accountId) throw new Error("Failed to extract accountId from token")
 		return { ...tokens, accountId }
 	}
 
 	try {
-		onAuth({ url, instructions: "A browser window should open. Complete login to finish." })
+		const manualCode = createManualCodeEntry(onPrompt, state)
+		onAuth({
+			url,
+			instructions: "A browser window should open. Complete login to finish. If the browser cannot return to Pinano, paste the code or full redirect URL here.",
+			requestManualCode: manualCode?.request,
+		})
 
-		const codePromise = server.waitForCode()
-		const code = signal
-			? await Promise.race([
-					codePromise,
-					new Promise((_, reject) => {
-						if (signal.aborted) reject(new Error("Aborted"))
-						signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true })
-					}),
-				])
-			: await codePromise
+		const codePromises = [server.waitForCode()]
+		if (manualCode) codePromises.push(manualCode.waitForCode())
+		if (signal) codePromises.push(new Promise((_, reject) => {
+			if (signal.aborted) reject(new Error("Aborted"))
+			signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true })
+		}))
+		const code = await Promise.race(codePromises)
 
 		const tokens = await exchangeAuthorizationCode(code, verifier)
 		const accountId = getAccountId(tokens.access)
@@ -302,6 +350,7 @@ export async function refreshCodex(refreshToken) {
 // Internal exports for tests.
 export const _internal = {
 	parseAuthorizationInput,
+	authorizationCodeFromInput,
 	decodeJwt,
 	getAccountId,
 	exchangeAuthorizationCode,

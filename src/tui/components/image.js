@@ -1,3 +1,4 @@
+import { RetainedComponent } from "../tui.js";
 import {
 	allocateImageId,
 	getCapabilities,
@@ -20,7 +21,7 @@ import {
  */
 
 /** @implements {import("../tui.js").Component} */
-export class Image {
+export class Image extends RetainedComponent {
 	/** @type {string} */
 	base64Data;
 	/** @type {string} */
@@ -47,6 +48,7 @@ export class Image {
 	 * @param {import("../terminal-image.js").ImageDimensions} [dimensions]
 	 */
 	constructor(base64Data, mimeType, theme, options = {}, dimensions) {
+		super();
 		this.base64Data = base64Data;
 		this.mimeType = mimeType;
 		this.theme = theme;
@@ -66,6 +68,7 @@ export class Image {
 	invalidate() {
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
+		this.markDirty();
 	}
 
 	/**

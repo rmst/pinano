@@ -7,8 +7,19 @@
 // reasoning_effort — those are no longer supported on /v1/chat/completions.
 
 import { AssistantMessageEventStream } from "./event-stream.js"
+import { missingApiKeyMessage, providerConfiguredApiKey } from "./api-key.js"
+import { validateMessageHistory } from "./message-history.js"
 import { convertResponsesMessages, convertResponsesTools } from "./codex/responses-shared.js"
+import { beginModelRequest, finishModelRequest } from "./model-io-log.js"
 import { executeResponsesRequest } from "./responses-transport.js"
+import { retryableModelErrorDetails } from "./model-errors.js"
+import { buildAssistantAuth, emptyUsage } from "./usage.js"
+import {
+	disableImplicitResponsesCompaction,
+	isUnsupportedImplicitResponsesCompactionError,
+	responsesCompactThreshold,
+	supportsImplicitResponsesCompaction,
+} from "../responses-compaction.js"
 
 function buildUrl(baseUrl) {
 	const trimmed = (baseUrl ?? "").replace(/\/+$/, "")
@@ -33,8 +44,8 @@ function buildBody(model, context, options) {
 		store: false,
 		stream: true,
 		input: messages,
-		parallel_tool_calls: true,
 	}
+	if (model.supportsParallelToolCalls ?? true) body.parallel_tool_calls = true
 	if (context.systemPrompt) body.instructions = context.systemPrompt
 	if (options?.maxTokens != null) body.max_output_tokens = options.maxTokens
 	if (options?.temperature !== undefined) body.temperature = options.temperature
@@ -51,8 +62,13 @@ function buildBody(model, context, options) {
 		// us the encrypted reasoning blob needed for replay across turns.
 		body.include = ["reasoning.encrypted_content"]
 	}
-	if (options?.textVerbosity) body.text = { verbosity: options.textVerbosity }
+	const textVerbosity = model.supportsTextVerbosity === false ? undefined : options?.textVerbosity ?? model.defaultTextVerbosity
+	if (textVerbosity !== undefined) body.text = { verbosity: textVerbosity }
 	if (options?.sessionId) body.prompt_cache_key = options.sessionId
+	if (!options?.disableImplicitResponsesCompaction && supportsImplicitResponsesCompaction(model)) {
+		const compactThreshold = responsesCompactThreshold(model, options?.autocompactThreshold)
+		if (compactThreshold) body.context_management = [{ type: "compaction", compact_threshold: compactThreshold }]
+	}
 	return body
 }
 
@@ -65,22 +81,6 @@ async function parseErrorResponse(rawText, status) {
 		else if (parsed?.message) message = parsed.message
 	} catch {}
 	return { message }
-}
-
-function envApiKey() {
-	if (typeof process === "undefined") return undefined
-	return process.env?.OPENAI_API_KEY
-}
-
-function emptyUsage() {
-	return {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	}
 }
 
 /**
@@ -97,18 +97,17 @@ export function streamOpenAIResponses(model, context, options) {
 			content: [],
 			provider: model.provider ?? "openai",
 			model: model.id,
-			usage: emptyUsage(),
+			auth: buildAssistantAuth(model, options),
+			usage: emptyUsage(model),
 			stopReason: "stop",
 			timestamp: Date.now(),
 		}
 
+		let modelLog = null
 		try {
-			const apiKey = options?.apiKey ?? envApiKey() ?? ""
-			if (!apiKey) {
-				throw new Error(
-					"OpenAI API key is required. Pass options.apiKey or set the OPENAI_API_KEY environment variable.",
-				)
-			}
+			validateMessageHistory(context.messages)
+			const apiKey = options?.apiKey ?? providerConfiguredApiKey(model) ?? ""
+			if (!apiKey) throw new Error(missingApiKeyMessage(model))
 
 			let body = buildBody(model, context, options)
 			if (options?.onPayload) {
@@ -116,29 +115,53 @@ export function streamOpenAIResponses(model, context, options) {
 				if (next !== undefined) body = next
 			}
 
-			await executeResponsesRequest({
+			const bodyJson = JSON.stringify(body)
+			modelLog = beginModelRequest({ model, transport: "responses", requestJson: bodyJson, options })
+			if (modelLog?.id) output.modelRequestId = modelLog.id
+
+			const execute = (requestBodyJson) => executeResponsesRequest({
 				url: buildUrl(model.baseUrl),
 				headers: buildHeaders(model, apiKey, options?.headers),
-				bodyJson: JSON.stringify(body),
+				bodyJson: requestBodyJson,
 				output,
 				stream,
 				model,
 				signal: options?.signal,
 				onResponse: options?.onResponse,
 				parseError: parseErrorResponse,
+				modelLog,
+				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,
+				streamInactivityTimeoutMs: options?.streamInactivityTimeoutMs,
 			})
+			try {
+				await execute(bodyJson)
+			} catch (error) {
+				const canRetryWithoutCompaction = output.content.length === 0
+					&& !output.responseId
+					&& body.context_management
+					&& isUnsupportedImplicitResponsesCompactionError(error)
+				if (!canRetryWithoutCompaction) throw error
+				disableImplicitResponsesCompaction(model)
+				const fallbackBody = { ...body }
+				delete fallbackBody.context_management
+				await execute(JSON.stringify(fallbackBody))
+			}
 
 			if (options?.signal?.aborted) throw new Error("Request was aborted")
 			if (output.stopReason === "error") {
 				throw new Error(output.errorMessage || "Provider returned an error stop reason")
 			}
 
+			finishModelRequest(modelLog, { status: "completed", finalMessage: output })
 			stream.push({ type: "done", reason: output.stopReason, message: output })
 			stream.end()
 		} catch (error) {
 			for (const block of output.content) delete block.partialJson
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error"
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error)
+			const errorDetails = retryableModelErrorDetails(error)
+			if (errorDetails) output.errorDetails = errorDetails
+			finishModelRequest(modelLog, { status: output.stopReason, finalMessage: output, error: output.errorMessage })
 			stream.push({ type: "error", reason: output.stopReason, error: output })
 			stream.end()
 		}

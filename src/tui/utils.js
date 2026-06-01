@@ -158,15 +158,19 @@ function finalizeTruncatedResult(
 	maxWidth,
 	pad,
 ) {
-	const reset = "\x1b[0m";
+	// Reset foreground and common text attributes after the ellipsis without
+	// clearing the background. TruncatedText is often rendered inside a Box
+	// background; a full SGR reset here would punch a visible hole behind the
+	// ellipsis and right-padding.
+	const styleReset = "\x1b[22;23;24;25;27;28;29;39m";
 	const visibleWidth = prefixWidth + ellipsisWidth;
 	/** @type {string} */
 	let result;
 
 	if (ellipsis.length > 0) {
-		result = `${prefix}${reset}${ellipsis}${reset}`;
+		result = `${prefix}${ellipsis}${styleReset}`;
 	} else {
-		result = `${prefix}${reset}`;
+		result = `${prefix}${styleReset}`;
 	}
 
 	return pad ? result + " ".repeat(Math.max(0, maxWidth - visibleWidth)) : result;

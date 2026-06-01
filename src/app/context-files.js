@@ -5,8 +5,8 @@
 // the order: AGENTS.md, AGENTS.MD, CLAUDE.md, CLAUDE.MD (first hit per dir).
 //
 // pinano checks two global locations: `configRoot()` (i.e.
-// `$PINANO_HOME/config/AGENTS.md` or `$XDG_CONFIG_HOME/pinano/AGENTS.md`) and
-// the flat `~/.pinano/AGENTS.md`, mirroring pi's `~/.pi/agent/` convenience.
+// `$PINANO_HOME/config/AGENTS.md`, defaulting to `~/.pinano/config/AGENTS.md`)
+// and the flat `~/.pinano/AGENTS.md`, mirroring pi's `~/.pi/agent/` convenience.
 
 import { existsSync, readFileSync } from "node:fs"
 import { join, resolve } from "node:path"
@@ -23,7 +23,7 @@ const CANDIDATES = ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]
 
 /**
  * Read the first AGENTS.md/CLAUDE.md found in `dir` (priority: AGENTS.md,
- * AGENTS.MD, CLAUDE.md, CLAUDE.MD). `@<path>` import lines are recursively
+ * AGENTS.MD, CLAUDE.md, CLAUDE.MD). `@<path>` imports are recursively
  * expanded — see `context-imports.ts`. Returns null if no candidate exists.
  *
  * Exported so the lazy loader can reuse exactly the same loading semantics

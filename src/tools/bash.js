@@ -2,6 +2,7 @@ import { spawn } from "node:child_process"
 import { existsSync } from "node:fs"
 
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "./truncate.js"
+import { envWithFallbackTools } from "./fallback-tools.js"
 
 // /bin/bash if available, else sh. We deliberately ignore $SHELL so macOS-zsh
 // (or any user-customized shell) doesn't change behavior. Non-login (-c) so we
@@ -59,12 +60,13 @@ export function createBashTool(cwd) {
 			if (!existsSync(cwd)) {
 				throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`)
 			}
+			const env = envWithFallbackTools(process.env)
 			return new Promise((resolve, reject) => {
 				if (signal?.aborted) {
 					reject(new Error("Operation aborted"))
 					return
 				}
-				const child = spawnInGroup(command, cwd, process.env)
+				const child = spawnInGroup(command, cwd, env)
 				let buffer = ""
 				let exited = false
 				let timedOut = false

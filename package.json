@@ -1,7 +1,7 @@
 {
 	"name": "pinano",
 	"version": "0.0.1",
-	"description": "Interactive AI assistant TUI — a slim port of pi.",
+	"description": "AI coding assistant TUI",
 	"type": "module",
 	"bin": {
 		"pinano": "./bin/pinano.js"

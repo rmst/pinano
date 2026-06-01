@@ -1,7 +1,7 @@
 import { getKeybindings } from "../keybindings.js";
 import { decodeKittyPrintable } from "../keys.js";
 import { KillRing } from "../kill-ring.js";
-import { CURSOR_MARKER } from "../tui.js";
+import { CURSOR_MARKER, RetainedComponent } from "../tui.js";
 import { UndoStack } from "../undo-stack.js";
 import { getSegmenter, isPunctuationChar, isWhitespaceChar, sliceByColumn, visibleWidth } from "../utils.js";
 
@@ -21,7 +21,7 @@ const segmenter = getSegmenter();
  * @implements {Component}
  * @implements {Focusable}
  */
-export class Input {
+export class Input extends RetainedComponent {
 	/** @type {string} */
 	value = "";
 	/** @type {number} Cursor position in the value */
@@ -30,6 +30,8 @@ export class Input {
 	onSubmit;
 	/** @type {(() => void) | undefined} */
 	onEscape;
+	/** @type {boolean} */
+	secret = false;
 
 	/** Focusable interface - set by TUI when focus changes */
 	focused = false;
@@ -61,6 +63,7 @@ export class Input {
 	setValue(value) {
 		this.value = value;
 		this.cursor = Math.min(this.cursor, value.length);
+		this.markDirty();
 	}
 
 	/**
@@ -237,6 +240,7 @@ export class Input {
 	 * @returns {void}
 	 */
 	insertCharacter(char) {
+		this.markDirty();
 		// Undo coalescing: consecutive word chars coalesce into one undo unit
 		if (isWhitespaceChar(char) || this.lastAction !== "type-word") {
 			this.pushUndo();
@@ -459,7 +463,7 @@ export class Input {
 	}
 
 	invalidate() {
-		// No cached state to invalidate currently
+		this.markDirty();
 	}
 
 	/**
@@ -477,16 +481,17 @@ export class Input {
 
 		let visibleText = "";
 		let cursorDisplay = this.cursor;
-		const totalWidth = visibleWidth(this.value);
+		const displayValue = this.secret ? "•".repeat(this.value.length) : this.value;
+		const totalWidth = visibleWidth(displayValue);
 
 		if (totalWidth < availableWidth) {
 			// Everything fits (leave room for cursor at end)
-			visibleText = this.value;
+			visibleText = displayValue;
 		} else {
 			// Need horizontal scrolling
 			// Reserve one column for cursor if it's at the end
 			const scrollWidth = this.cursor === this.value.length ? availableWidth - 1 : availableWidth;
-			const cursorCol = visibleWidth(this.value.slice(0, this.cursor));
+			const cursorCol = visibleWidth(displayValue.slice(0, this.cursor));
 
 			if (scrollWidth > 0) {
 				const halfWidth = Math.floor(scrollWidth / 2);
@@ -503,8 +508,8 @@ export class Input {
 					startCol = Math.max(0, cursorCol - halfWidth);
 				}
 
-				visibleText = sliceByColumn(this.value, startCol, scrollWidth, true);
-				const beforeCursor = sliceByColumn(this.value, startCol, Math.max(0, cursorCol - startCol), true);
+				visibleText = sliceByColumn(displayValue, startCol, scrollWidth, true);
+				const beforeCursor = sliceByColumn(displayValue, startCol, Math.max(0, cursorCol - startCol), true);
 				cursorDisplay = beforeCursor.length;
 			} else {
 				visibleText = "";

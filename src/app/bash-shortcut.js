@@ -93,7 +93,8 @@ export async function recordBashShortcut(agent, session, result) {
 	}
 	agent.state.messages = [.../** @type {any[]} */ (agent.state.messages), message]
 	try {
-		await session.appendMessage(message)
+		const id = await session.appendMessage(message)
+		if (id) agent.msgToEntryId?.set(message, id)
 	} catch {
 		// Best-effort — session save errors are non-fatal for shortcut UX.
 	}

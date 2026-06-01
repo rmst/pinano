@@ -1,4 +1,4 @@
-// Component classes for chat-mode messages, ported (and slimmed) from
+// Component classes for transcript messages, ported (and slimmed) from
 // pi-coding-agent's interactive components.
 //
 // Each class is a thin Container that renders one logical message into the
@@ -6,18 +6,47 @@
 // so the streaming view shows partial content without re-creating widgets.
 //
 // Differences from upstream pi:
-//   - No Markdown rendering — we use Text with raw text. Pinano deliberately
-//     drops markdown/syntax highlighting (see COMPARISON.md).
+//   - Markdown structure is rendered, but syntax highlighting remains omitted.
 //   - No image rendering, no kitty/iTerm2 image hand-off.
-//   - No per-tool render widgets — tool-call args show as JSON, results as text.
+//   - No per-tool render widgets — tool-call args show as JSON, result bodies are hidden by default.
 //   - No OSC 133 zone markers — those are nice for shell integration but
 //     adding them inside our diff renderer hasn't been needed.
 
-import { Box, Container, Spacer, Text } from "../../tui/index.js"
-import { theme } from "../theme.js"
+import { Box, Container, Markdown, Spacer, Text, TruncatedText } from "../../tui/index.js"
+import { isResponsesCompactionBlock } from "../../responses-compaction.js"
+import { getMarkdownTheme, theme } from "../theme.js"
 import { formatToolCall } from "./tool-format.js"
 
 /** @typedef {any} AnyMessage */
+/**
+ * @typedef {object} MessageRenderOptions
+ * @property {boolean} [showThinkingOutput]
+ * @property {boolean} [showToolOutput]
+ */
+
+/** @type {Required<MessageRenderOptions>} */
+export const DEFAULT_MESSAGE_RENDER_OPTIONS = {
+	showThinkingOutput: false,
+	showToolOutput: false,
+}
+
+/**
+ * @param {MessageRenderOptions | undefined} options
+ * @returns {Required<MessageRenderOptions>}
+ */
+export function normalizeMessageRenderOptions(options) {
+	return { ...DEFAULT_MESSAGE_RENDER_OPTIONS, ...(options ?? {}) }
+}
+
+/**
+ * @param {any} block
+ * @param {Required<MessageRenderOptions>} options
+ */
+function isVisibleAssistantBlock(block, options) {
+	return (block.type === "text" && block.text?.trim())
+		|| isResponsesCompactionBlock(block)
+		|| (options.showThinkingOutput && block.type === "thinking" && block.thinking?.trim())
+}
 
 // =============================================================================
 // User message
@@ -42,17 +71,19 @@ function userText(message) {
  * User message: a colored box containing the prompt text. The bg helps the
  * user-supplied content stand apart from the assistant's output even when
  * the transcript is long. Same paddingX=1, paddingY=1 as pi so the box has
- * breathing room above and below the text.
+ * breathing room above and below the text inside the box.
  */
 export class UserMessageComponent extends Container {
 	/** @param {AnyMessage | string} message */
 	constructor(message) {
 		super()
 		const text = typeof message === "string" ? message : userText(message)
-		// Spacer above so adjacent user messages don't visually fuse together.
-		this.addChild(new Spacer(1))
 		const box = new Box(1, 1, (s) => theme.bg("userMessageBg", s))
-		box.addChild(new Text(theme.fg("userMessageText", text), 0, 0))
+		box.addChild(
+			new Markdown(text, 0, 0, getMarkdownTheme(), {
+				color: (s) => theme.fg("userMessageText", s),
+			}),
+		)
 		this.addChild(box)
 	}
 }
@@ -62,7 +93,7 @@ export class UserMessageComponent extends Container {
 // =============================================================================
 
 /**
- * Assistant message: text + thinking blocks. Updated in-place as the agent
+ * Assistant message: text + optionally visible thinking blocks. Updated in-place as the agent
  * streams partial content. Tool-call blocks are NOT rendered here — the
  * agent loop creates a separate ToolExecutionComponent right after, so we
  * skip them to avoid duplicating the call.
@@ -72,11 +103,17 @@ export class AssistantMessageComponent extends Container {
 	content
 	/** @type {AnyMessage | undefined} */
 	message
+	/** @type {Required<MessageRenderOptions>} */
+	options
 	hasToolCalls = false
 
-	/** @param {AnyMessage} [message] */
-	constructor(message) {
+	/**
+	 * @param {AnyMessage} [message]
+	 * @param {MessageRenderOptions} [options]
+	 */
+	constructor(message, options) {
 		super()
+		this.options = normalizeMessageRenderOptions(options)
 		this.content = new Container()
 		this.addChild(this.content)
 		if (message) this.update(message)
@@ -87,51 +124,83 @@ export class AssistantMessageComponent extends Container {
 		this.message = message
 		this.content.clear()
 
+		// Compaction marker: render as a dim divider with metadata + the
+		// summary text. Distinct visual treatment so the user can scan the
+		// transcript and see where context was compacted, instead of the
+		// marker looking like a regular model turn.
+		if (message.compaction === true) {
+			this.hasToolCalls = false
+			this.renderCompactionMarker(message)
+			return
+		}
+
 		const blocks = Array.isArray(message.content) ? message.content : []
-		const visible = blocks.filter(
-			(/** @type {any} */ b) =>
-				(b.type === "text" && b.text?.trim()) ||
-				(b.type === "thinking" && b.thinking?.trim()),
-		)
 		const hasToolCalls = blocks.some((/** @type {any} */ b) => b.type === "toolCall")
 		this.hasToolCalls = hasToolCalls
-
-		if (visible.length > 0) this.content.addChild(new Spacer(1))
 
 		for (let i = 0; i < blocks.length; i++) {
 			const b = blocks[i]
 			if (b.type === "text" && b.text?.trim()) {
-				this.content.addChild(new Text(b.text.trim(), 1, 0))
-			} else if (b.type === "thinking" && b.thinking?.trim()) {
-				const trimmed = b.thinking.trim()
-				const colored = theme.italic(theme.fg("thinkingText", trimmed))
-				this.content.addChild(new Text(colored, 1, 0))
-				const remaining = blocks.slice(i + 1)
-				const moreVisible = remaining.some(
-					(/** @type {any} */ c) =>
-						(c.type === "text" && c.text?.trim()) ||
-						(c.type === "thinking" && c.thinking?.trim()),
+				this.content.addChild(
+					new Markdown(b.text.trim(), 1, 0, getMarkdownTheme(), {
+						color: (s) => theme.fg("text", s),
+					}),
 				)
+			} else if (isResponsesCompactionBlock(b)) {
+				this.content.addChild(new Text(theme.dim("─── earlier context compacted by provider ───"), 1, 0))
+				const remaining = blocks.slice(i + 1)
+				if (remaining.some((/** @type {any} */ c) => isVisibleAssistantBlock(c, this.options))) {
+					this.content.addChild(new Spacer(1))
+				}
+			} else if (this.options.showThinkingOutput && b.type === "thinking" && b.thinking?.trim()) {
+				const trimmed = b.thinking.trim()
+				this.content.addChild(
+					new Markdown(trimmed, 1, 0, getMarkdownTheme(), {
+						color: (s) => theme.fg("thinkingText", s),
+						italic: true,
+					}),
+				)
+				const remaining = blocks.slice(i + 1)
+				const moreVisible = remaining.some((/** @type {any} */ c) => isVisibleAssistantBlock(c, this.options))
 				if (moreVisible) this.content.addChild(new Spacer(1))
 			}
 		}
 
-		// Stop reasons. We hide error/abort messaging when there are tool calls
-		// because the tool component already shows the failure state.
-		if (!hasToolCalls) {
-			if (message.stopReason === "aborted") {
-				const msg =
-					message.errorMessage && message.errorMessage !== "Request was aborted"
-						? message.errorMessage
-						: "Operation aborted"
-				this.content.addChild(new Spacer(1))
-				this.content.addChild(new Text(theme.fg("error", msg), 1, 0))
-			} else if (message.stopReason === "error") {
-				this.content.addChild(new Spacer(1))
-				this.content.addChild(
-					new Text(theme.fg("error", `Error: ${message.errorMessage ?? "Unknown error"}`), 1, 0),
-				)
-			}
+		// Stop reasons. Aborts are intentional user/session state and are surfaced
+		// by the surrounding UI; only real errors get an inline assistant note.
+		// Tool-call assistants delegate error display to the tool component.
+		if (!hasToolCalls && message.stopReason === "error") {
+			if (this.content.children.length > 0) this.content.addChild(new Spacer(1))
+			this.content.addChild(
+				new Text(theme.fg("error", `Error: ${message.errorMessage ?? "Unknown error"}`), 1, 0),
+			)
+			this.content.addChild(new Text(theme.dim("press Esc Esc to rewind"), 1, 0))
+		}
+	}
+
+	/** @param {AnyMessage} message */
+	renderCompactionMarker(message) {
+		const removed = message.removedCount ?? 0
+		const kept = message.keptCount ?? 0
+		const tokens = message.tokensBefore ?? 0
+		// Build the metadata fragment only if the numbers exist (a marker
+		// loaded from an older session may not have them).
+		const meta = removed > 0
+			? ` (${removed} message${removed === 1 ? "" : "s"} → ${kept} kept, ~${tokens} tok)`
+			: ""
+		this.content.addChild(new Text(theme.dim(`─── earlier context compacted${meta} ───`), 1, 0))
+		const blocks = Array.isArray(message.content) ? message.content : []
+		const body = blocks
+			.filter((/** @type {any} */ b) => b.type === "text" && b.text?.trim())
+			.map((/** @type {any} */ b) => b.text.replace(/^\[earlier context compacted\]\n?/, "").trim())
+			.filter(Boolean)
+			.join("\n")
+		if (body) {
+			this.content.addChild(
+				new Markdown(body, 1, 0, getMarkdownTheme(), {
+					color: (s) => theme.fg("dim", s),
+				}),
+			)
 		}
 	}
 
@@ -145,22 +214,8 @@ export class AssistantMessageComponent extends Container {
 // Tool execution
 // =============================================================================
 
-/**
- * @param {any} args
- * @returns {string}
- */
-function formatArgsJson(args) {
-	if (args === undefined || args === null) return ""
-	try {
-		const json = JSON.stringify(args, null, 2)
-		// JSON.stringify({}) → "{}"; collapse to nothing for the empty case.
-		return json === "{}" ? "" : json
-	} catch {
-		return String(args)
-	}
-}
-
 const TOOL_RESULT_MAX_LINES = 12
+const TOOL_ERROR_INDENT = 1
 
 /**
  * @param {string} text
@@ -175,16 +230,19 @@ function truncateOutput(text) {
 }
 
 /**
- * Tool execution: pending box (gray bg) while the call is in-flight; flips
- * to a green-ish "success" or red-ish "error" bg once a result lands.
+ * Tool execution: pending box while the call is in-flight; flips to the
+ * completed-call background once a result lands. Failures intentionally use
+ * the same background so ordinary failed tool calls don't dominate the turn.
  *
  * Header line is rendered with a per-tool concise formatter (`read /etc/hosts`,
- * `$ npm test`, etc.) — same look as pi. Unknown tools fall back to a JSON
- * arg dump like pi's `formatToolExecution`.
+ * `$ npm test`, etc.) and truncated instead of wrapping, so ordinary tool-call
+ * rows stay compact. Session metadata updates are wrapped across lines because
+ * they often describe several changes. Unknown tools include a compact inline
+ * JSON arg dump.
  *
- * Long results get truncated to TOOL_RESULT_MAX_LINES — pi has expandable
- * results behind a hotkey; we just clip statically. Removes the "tool result
- * spans 50 rows and pushes the editor off-screen" footgun.
+ * Successful result bodies are hidden by default; when enabled, long results
+ * get truncated to TOOL_RESULT_MAX_LINES. Errors stay visible so failures are
+ * actionable without changing settings.
  */
 export class ToolExecutionComponent extends Container {
 	/** @type {Box} */
@@ -199,19 +257,22 @@ export class ToolExecutionComponent extends Container {
 	args
 	/** @type {string | null} */
 	resultText = null
+	/** @type {Required<MessageRenderOptions>} */
+	options
 
 	/**
 	 * @param {string} toolName
 	 * @param {any} args
+	 * @param {MessageRenderOptions} [options]
 	 */
-	constructor(toolName, args) {
+	constructor(toolName, args, options) {
 		super()
+		this.options = normalizeMessageRenderOptions(options)
 		this.toolName = toolName
 		this.args = args
 		this.box = new Box(1, 0, (s) => theme.bg("toolPendingBg", s))
 		this.inner = new Container()
 		this.box.addChild(this.inner)
-		this.addChild(new Spacer(1))
 		this.addChild(this.box)
 		this.rebuild()
 	}
@@ -236,19 +297,18 @@ export class ToolExecutionComponent extends Container {
 
 	rebuild() {
 		this.inner.clear()
-		const { line, jsonFallback } = formatToolCall(this.toolName, this.args)
-		this.inner.addChild(new Text(line, 0, 0))
-		if (jsonFallback) {
-			const json = formatArgsJson(this.args)
-			if (json) this.inner.addChild(new Text(theme.fg("toolOutput", json), 0, 0))
-		}
-		if (this.resultText !== null) {
+		const { line } = formatToolCall(this.toolName, this.args, { state: this.state })
+		const header = theme.fg("toolText", line)
+		this.inner.addChild(this.toolName === "sessionWrite" ? new Text(header, 0, 0) : new TruncatedText(header, 0, 0))
+		if (this.resultText !== null && (this.options.showToolOutput || this.state === "error")) {
 			const trimmed = this.resultText.trim()
+			const isError = this.state === "error"
+			const paddingX = isError ? TOOL_ERROR_INDENT : 0
 			if (trimmed) {
-				this.inner.addChild(new Spacer(1))
-				this.inner.addChild(new Text(theme.fg("toolOutput", truncateOutput(trimmed)), 0, 0))
+				if (!isError) this.inner.addChild(new Spacer(1))
+				this.inner.addChild(new Text(theme.fg("toolOutput", truncateOutput(trimmed)), paddingX, 0))
 			} else {
-				this.inner.addChild(new Text(theme.fg("toolOutput", "(no output)"), 0, 0))
+				this.inner.addChild(new Text(theme.fg("toolOutput", "(no output)"), paddingX, 0))
 			}
 		}
 	}
@@ -281,7 +341,7 @@ export class CustomMessageComponent extends Container {
 		const labelText = opts.label
 			? theme.bold(theme.fg(labelColor, `[${opts.label}]`)) + " "
 			: ""
-		this.addChild(new Text(labelText + text, 0, 0))
+		this.addChild(new Text(labelText + theme.fg("customMessageText", text), 0, 0))
 	}
 }
 
@@ -293,6 +353,6 @@ export class TextLine extends Container {
 	/** @param {string} text */
 	constructor(text) {
 		super()
-		this.addChild(new Text(text, 0, 0))
+		this.addChild(new Text(theme.fg("text", text), 0, 0))
 	}
 }

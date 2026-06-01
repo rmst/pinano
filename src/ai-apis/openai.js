@@ -4,10 +4,16 @@
 // (Ollama, vLLM, LM Studio, etc) via the `compat` field on Model.
 
 import { AssistantMessageEventStream } from "./event-stream.js"
+import { missingApiKeyMessage, providerConfiguredApiKey } from "./api-key.js"
+import { validateMessageHistory } from "./message-history.js"
 import { parseStreamingJson } from "./json-parse.js"
+import { beginModelRequest, finishHttpAttempt, finishModelRequest, recordStreamEvent } from "./model-io-log.js"
+import { retryableModelErrorDetails, retryableModelErrorFrom } from "./model-errors.js"
+import { fetchStreamingResponseWithRetries, streamInactivityTimeoutMs } from "./responses-transport.js"
 import { sanitizeSurrogates } from "./sanitize-unicode.js"
 import { parseSSE } from "./sse.js"
 import { transformMessages } from "./transform-messages.js"
+import { buildAssistantAuth, emptyUsage, normalizeChatUsage } from "./usage.js"
 
 const DEFAULT_COMPAT = {
 	supportsStore: true,
@@ -30,46 +36,6 @@ function resolveCompat(model) {
 	return merged
 }
 
-function emptyUsage() {
-	return {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	}
-}
-
-function calculateCost(model, usage) {
-	const cost = model.cost ?? {}
-	usage.cost.input = ((cost.input ?? 0) / 1_000_000) * usage.input
-	usage.cost.output = ((cost.output ?? 0) / 1_000_000) * usage.output
-	usage.cost.cacheRead = ((cost.cacheRead ?? 0) / 1_000_000) * usage.cacheRead
-	usage.cost.cacheWrite = ((cost.cacheWrite ?? 0) / 1_000_000) * usage.cacheWrite
-	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite
-}
-
-function parseUsage(rawUsage, model) {
-	const promptTokens = rawUsage.prompt_tokens || 0
-	const reportedCached = rawUsage.prompt_tokens_details?.cached_tokens ?? rawUsage.prompt_cache_hit_tokens ?? 0
-	const cacheWrite = rawUsage.prompt_tokens_details?.cache_write_tokens || 0
-	// Some providers double-count: cached_tokens = prior hits + current writes. Subtract.
-	const cacheRead = cacheWrite > 0 ? Math.max(0, reportedCached - cacheWrite) : reportedCached
-	const input = Math.max(0, promptTokens - cacheRead - cacheWrite)
-	const output = rawUsage.completion_tokens || 0
-	const usage = {
-		input,
-		output,
-		cacheRead,
-		cacheWrite,
-		totalTokens: input + output + cacheRead + cacheWrite,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	}
-	calculateCost(model, usage)
-	return usage
-}
-
 function mapStopReason(reason) {
 	if (reason == null) return { stopReason: "stop" }
 	switch (reason) {
@@ -88,18 +54,40 @@ function mapStopReason(reason) {
 	}
 }
 
-function hasToolHistory(messages) {
+function baseToolCallId(id) {
+	return String(id ?? "").split("|")[0]
+}
+
+function functionToolCallIds(messages) {
+	const ids = new Set()
 	for (const msg of messages) {
-		if (msg.role === "toolResult") return true
-		if (msg.role === "assistant" && msg.content.some((b) => b.type === "toolCall")) return true
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue
+		for (const block of msg.content) {
+			if (block?.type === "toolCall" && block.input === undefined) ids.add(baseToolCallId(block.id))
+		}
 	}
-	return false
+	return ids
+}
+
+function hasToolHistory(messages) {
+	const callIds = functionToolCallIds(messages)
+	if (callIds.size > 0) return true
+	return messages.some((msg) => msg.role === "toolResult" && callIds.has(baseToolCallId(msg.toolCallId)))
+}
+
+function imageUrlPart(block) {
+	const detail = block.detail === "original" ? "high" : (block.detail ?? "high")
+	return {
+		type: "image_url",
+		image_url: { url: `data:${block.mimeType};base64,${block.data}`, detail },
+	}
 }
 
 function convertMessages(model, context, compat) {
 	const params = []
 	const transformed = transformMessages(context.messages, model)
 	const inputs = model.input ?? ["text"]
+	const functionCallIds = functionToolCallIds(transformed)
 
 	if (context.systemPrompt) {
 		const role = model.reasoning && compat.supportsDeveloperRole ? "developer" : "system"
@@ -120,9 +108,7 @@ function convertMessages(model, context, compat) {
 				params.push({ role: "user", content: sanitizeSurrogates(msg.content) })
 			} else {
 				const parts = msg.content.map((item) =>
-					item.type === "text"
-						? { type: "text", text: sanitizeSurrogates(item.text) }
-						: { type: "image_url", image_url: { url: `data:${item.mimeType};base64,${item.data}` } },
+					item.type === "text" ? { type: "text", text: sanitizeSurrogates(item.text) } : imageUrlPart(item),
 				)
 				if (parts.length > 0) params.push({ role: "user", content: parts })
 			}
@@ -137,7 +123,7 @@ function convertMessages(model, context, compat) {
 			const text = textBlocks.map((b) => sanitizeSurrogates(b.text)).join("")
 			if (text.length > 0) assistantMsg.content = text
 
-			const toolCalls = msg.content.filter((b) => b.type === "toolCall")
+			const toolCalls = msg.content.filter((b) => b.type === "toolCall" && b.input === undefined)
 			if (toolCalls.length > 0) {
 				assistantMsg.tool_calls = toolCalls.map((tc) => ({
 					id: tc.id,
@@ -159,9 +145,12 @@ function convertMessages(model, context, compat) {
 
 		if (msg.role === "toolResult") {
 			const imageBlocks = []
+			let pushedToolResult = false
 			let j = i
 			for (; j < transformed.length && transformed[j].role === "toolResult"; j++) {
 				const tr = transformed[j]
+				if (!functionCallIds.has(baseToolCallId(tr.toolCallId))) continue
+				pushedToolResult = true
 				const text = tr.content
 					.filter((b) => b.type === "text")
 					.map((b) => b.text)
@@ -178,15 +167,13 @@ function convertMessages(model, context, compat) {
 				if (hasImages && inputs.includes("image")) {
 					for (const block of tr.content) {
 						if (block.type === "image") {
-							imageBlocks.push({
-								type: "image_url",
-								image_url: { url: `data:${block.mimeType};base64,${block.data}` },
-							})
+							imageBlocks.push(imageUrlPart(block))
 						}
 					}
 				}
 			}
 			i = j - 1
+			if (!pushedToolResult) continue
 
 			if (imageBlocks.length > 0) {
 				if (compat.requiresAssistantAfterToolResult) {
@@ -208,7 +195,7 @@ function convertMessages(model, context, compat) {
 }
 
 function convertTools(tools, compat) {
-	return tools.map((tool) => {
+	return tools.filter((tool) => tool.kind !== "custom").map((tool) => {
 		const def = {
 			type: "function",
 			function: {
@@ -272,17 +259,6 @@ function buildUrl(baseUrl) {
 	return `${trimmed}/chat/completions`
 }
 
-function envApiKey() {
-	if (typeof process === "undefined") return undefined
-	return process.env?.OPENAI_API_KEY
-}
-
-function headersToRecord(headers) {
-	const out = {}
-	for (const [k, v] of headers.entries()) out[k] = v
-	return out
-}
-
 /**
  * Open a streaming chat completion. Returns an AssistantMessageEventStream.
  * Errors are emitted as `error` events and reflected in the final message,
@@ -297,18 +273,19 @@ export function streamOpenAI(model, context, options) {
 			content: [],
 			provider: model.provider ?? "openai",
 			model: model.id,
-			usage: emptyUsage(),
+			auth: buildAssistantAuth(model, options),
+			usage: emptyUsage(model),
 			stopReason: "stop",
 			timestamp: Date.now(),
 		}
 
+		let modelLog = null
+		let attemptLog = null
+		let attemptFinished = false
 		try {
-			const apiKey = options?.apiKey ?? envApiKey() ?? ""
-			if (!apiKey) {
-				throw new Error(
-					"OpenAI API key is required. Pass options.apiKey or set the OPENAI_API_KEY environment variable.",
-				)
-			}
+			validateMessageHistory(context.messages)
+			const apiKey = options?.apiKey ?? providerConfiguredApiKey(model) ?? ""
+			if (!apiKey) throw new Error(missingApiKeyMessage(model))
 			const compat = resolveCompat(model)
 			let payload = buildPayload(model, context, options, compat)
 			if (options?.onPayload) {
@@ -316,27 +293,31 @@ export function streamOpenAI(model, context, options) {
 				if (next !== undefined) payload = next
 			}
 
-			const response = await fetch(buildUrl(model.baseUrl), {
-				method: "POST",
-				headers: buildHeaders(model, apiKey, options?.headers),
-				body: JSON.stringify(payload),
+			const url = buildUrl(model.baseUrl)
+			const headers = buildHeaders(model, apiKey, options?.headers)
+			const bodyJson = JSON.stringify(payload)
+			modelLog = beginModelRequest({ model, transport: "chat", requestJson: bodyJson, options })
+			if (modelLog?.id) output.modelRequestId = modelLog.id
+
+			const { response, attemptLog: successAttemptLog } = await fetchStreamingResponseWithRetries({
+				url,
+				headers,
+				bodyJson,
 				signal: options?.signal,
+				model,
+				modelLog,
+				onResponse: options?.onResponse,
+				parseError: async (text, status) => {
+					let detail = text
+					try {
+						const json = JSON.parse(text)
+						detail = json.error?.message || json.message || text
+					} catch {}
+					return { message: `HTTP ${status}: ${detail}` }
+				},
+				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,
 			})
-
-			if (options?.onResponse) {
-				await options.onResponse({ status: response.status, headers: headersToRecord(response.headers) }, model)
-			}
-
-			if (!response.ok) {
-				const text = await response.text().catch(() => "")
-				let detail = text
-				try {
-					const json = JSON.parse(text)
-					detail = json.error?.message || json.message || text
-				} catch {}
-				throw new Error(`HTTP ${response.status} ${response.statusText}: ${detail}`)
-			}
-			if (!response.body) throw new Error("Response has no body")
+			attemptLog = successAttemptLog
 
 			stream.push({ type: "start", partial: output })
 
@@ -359,19 +340,22 @@ export function streamOpenAI(model, context, options) {
 				}
 			}
 
-			for await (const chunk of parseSSE(response.body)) {
+			for await (const chunk of parseSSE(response.body, {
+				inactivityTimeoutMs: streamInactivityTimeoutMs(model, options?.streamInactivityTimeoutMs),
+				onEvent: (event) => recordStreamEvent(modelLog, attemptLog, event),
+			})) {
 				if (!chunk || typeof chunk !== "object") continue
 
 				if (typeof chunk.id === "string" && !output.responseId) output.responseId = chunk.id
 				if (typeof chunk.model === "string" && chunk.model.length > 0 && chunk.model !== model.id) {
 					if (!output.responseModel) output.responseModel = chunk.model
 				}
-				if (chunk.usage) output.usage = parseUsage(chunk.usage, model)
+				if (chunk.usage) output.usage = normalizeChatUsage(chunk.usage, model)
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined
 				if (!choice) continue
 
-				if (!chunk.usage && choice.usage) output.usage = parseUsage(choice.usage, model)
+				if (!chunk.usage && choice.usage) output.usage = normalizeChatUsage(choice.usage, model)
 
 				if (choice.finish_reason) {
 					const result = mapStopReason(choice.finish_reason)
@@ -469,21 +453,37 @@ export function streamOpenAI(model, context, options) {
 			}
 
 			finishCurrentBlock(currentBlock)
+			finishHttpAttempt(attemptLog, { status: "completed" })
+			attemptFinished = true
 
 			if (options?.signal?.aborted) throw new Error("Request was aborted")
 			if (output.stopReason === "error") {
 				throw new Error(output.errorMessage || "Provider returned an error stop reason")
 			}
 
+			finishModelRequest(modelLog, { status: "completed", finalMessage: output })
 			stream.push({ type: "done", reason: output.stopReason, message: output })
 			stream.end()
 		} catch (error) {
+			const retryableError = options?.signal?.aborted
+				? undefined
+				: retryableModelErrorFrom(error, { phase: attemptLog && !attemptFinished ? "stream" : undefined })
+			const finalError = retryableError ?? error
+			if (attemptLog && !attemptFinished) {
+				finishHttpAttempt(attemptLog, {
+					status: options?.signal?.aborted ? "aborted" : "stream_error",
+					error: finalError instanceof Error ? finalError.message : JSON.stringify(finalError),
+				})
+			}
 			for (const block of output.content) {
 				delete block.partialArgs
 				delete block.streamIndex
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error"
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error)
+			output.errorMessage = finalError instanceof Error ? finalError.message : JSON.stringify(finalError)
+			const errorDetails = retryableModelErrorDetails(finalError)
+			if (errorDetails) output.errorDetails = errorDetails
+			finishModelRequest(modelLog, { status: output.stopReason, finalMessage: output, error: output.errorMessage })
 			stream.push({ type: "error", reason: output.stopReason, error: output })
 			stream.end()
 		}

@@ -1,7 +1,8 @@
 // Stateful wrapper around the agent loop. Owns the transcript, queues for
 // steering and follow-up messages, abort signals, and event subscriptions.
 
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.js"
+import { emptyUsage } from "../ai-apis/usage.js"
+import { nextAgentAction, runAgentLoop, runAgentLoopContinue } from "./agent-loop.js"
 import { streamSimple as defaultStreamFn } from "./stream-adapter.js"
 
 /** @typedef {import("./types.js").AgentEvent} AgentEvent */
@@ -12,14 +13,7 @@ import { streamSimple as defaultStreamFn } from "./stream-adapter.js"
 /** @typedef {import("./types.js").ToolExecutionMode} ToolExecutionMode */
 /** @typedef {"all" | "one-at-a-time"} QueueMode */
 
-const EMPTY_USAGE = {
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	totalTokens: 0,
-	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-}
+const EMPTY_USAGE = emptyUsage()
 
 const DEFAULT_MODEL = {
 	id: "unknown",
@@ -61,6 +55,9 @@ class PendingMessageQueue {
 		this.messages = this.messages.slice(1)
 		return [first]
 	}
+	peek() {
+		return this.messages.slice()
+	}
 	clear() {
 		this.messages = []
 	}
@@ -72,7 +69,8 @@ function createMutableAgentState(initialState) {
 	return {
 		systemPrompt: initialState?.systemPrompt ?? "",
 		model: initialState?.model ?? DEFAULT_MODEL,
-		thinkingLevel: initialState?.thinkingLevel ?? "off",
+		thinkingLevel: initialState?.thinkingLevel ?? "high",
+		serviceTier: initialState?.serviceTier,
 		get tools() {
 			return tools
 		},
@@ -87,6 +85,7 @@ function createMutableAgentState(initialState) {
 		},
 		isStreaming: false,
 		streamingMessage: undefined,
+		currentModelRequest: undefined,
 		pendingToolCalls: new Set(),
 		errorMessage: undefined,
 	}
@@ -97,6 +96,25 @@ export class Agent {
 		this._state = createMutableAgentState(options.initialState)
 		/** @type {Set<(event: AgentEvent, signal: AbortSignal) => void | Promise<void>>} */
 		this.listeners = new Set()
+		/** Parallel listener channel for compaction events. Separate from
+		 * `listeners` because compaction can happen outside an active run
+		 * (manual /compact runs between turns) and isn't a streaming-loop
+		 * event the AbortSignal-bound dispatcher is designed for.
+		 * @type {Set<(message: any) => void | Promise<void>>} */
+		this.compactionListeners = new Set()
+		/** Maps in-memory messages to their session storage entry IDs.
+		 * Populated by interactive/RPC frontends — both on replay
+		 * (from the entry IDs returned by Session.getLogicalEntries) and
+		 * live (from Session.appendMessage's return value). Read by
+		 * `compact()` to resolve which entry ID bounds the elided prefix.
+		 * @type {WeakMap<object, string>} */
+		this.msgToEntryId = new WeakMap()
+		/** Optional session reference. Set by the frontend after opening
+		 * or switching sessions. `compact()` uses it to persist the
+		 * compaction operation as a custom entry so its effect survives
+		 * resume. When null, compaction stays in-memory only.
+		 * @type {import("../session-manager/session.js").Session | null} */
+		this.session = null
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time")
 		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time")
 
@@ -108,12 +126,18 @@ export class Agent {
 		this.onResponse = options.onResponse
 		this.beforeToolCall = options.beforeToolCall
 		this.afterToolCall = options.afterToolCall
+		this.automatedFollowUp = options.automatedFollowUp
+		/** Optional app-level hook for durable context-load entries. Agent core does not emit these itself; Pinano's lazy context loader calls it after recording a context entry. @type {((entry: any) => void | Promise<void>) | undefined} */
+		this.onContextLoad = options.onContextLoad
 
 		this.sessionId = options.sessionId
 		this.toolExecution = options.toolExecution ?? "parallel"
 
-		/** @type {{ promise: Promise<void>, resolve: () => void, abortController: AbortController } | undefined} */
+		/** @type {{ token: symbol, promise: Promise<void>, resolve: () => void, abortController: AbortController } | undefined} */
 		this.activeRun = undefined
+		/** @type {Promise<void> | undefined} */
+		this.sidecarRun = undefined
+		this.softStopRequested = false
 	}
 
 	/**
@@ -124,6 +148,26 @@ export class Agent {
 	subscribe(listener) {
 		this.listeners.add(listener)
 		return () => this.listeners.delete(listener)
+	}
+
+	/**
+	 * Subscribe to compaction events. The callback receives the compaction
+	 * marker message after `compact()` has rewritten state. Used by the TUI
+	 * to render a divider in the live transcript so the user sees that
+	 * compaction happened (otherwise it's silent — auto-compact in
+	 * particular gives no other indication).
+	 * @param {(message: any) => void | Promise<void>} listener
+	 */
+	subscribeCompaction(listener) {
+		this.compactionListeners.add(listener)
+		return () => this.compactionListeners.delete(listener)
+	}
+
+	/** @param {any} message */
+	async notifyCompaction(message) {
+		for (const listener of this.compactionListeners) {
+			await listener(message)
+		}
 	}
 
 	get state() {
@@ -142,6 +186,26 @@ export class Agent {
 	}
 	get followUpMode() {
 		return this.followUpQueue.mode
+	}
+
+	watchMessageEnd(message) {
+		/** @type {() => void} */
+		let unsubscribe = () => {}
+		const promise = new Promise((resolve) => {
+			unsubscribe = this.subscribe((event) => {
+				if (event.type !== "message_end" || event.message !== message) return
+				unsubscribe()
+				resolve(undefined)
+			})
+		})
+		return { promise, unsubscribe }
+	}
+
+	waitForMessagesAccepted(messages, run) {
+		const watchers = messages.map((message) => this.watchMessageEnd(message))
+		const accepted = Promise.all(watchers.map((watcher) => watcher.promise)).then(() => undefined)
+		run.finally(() => watchers.forEach((watcher) => watcher.unsubscribe())).catch(() => {})
+		return Promise.race([accepted, run.then(() => undefined)])
 	}
 
 	steer(message) {
@@ -169,6 +233,13 @@ export class Agent {
 		return this.steeringQueue.hasItems() || this.followUpQueue.hasItems()
 	}
 
+	getQueuedMessages() {
+		return [
+			...this.steeringQueue.peek().map((message) => ({ behavior: "steer", message })),
+			...this.followUpQueue.peek().map((message) => ({ behavior: "followUp", message })),
+		]
+	}
+
 	get signal() {
 		return this.activeRun?.abortController.signal
 	}
@@ -177,18 +248,54 @@ export class Agent {
 		this.activeRun?.abortController.abort()
 	}
 
+	softInterrupt() {
+		if (!this.activeRun) return "idle"
+		this.softStopRequested = true
+		if (this._state.pendingToolCalls.size === 0) {
+			this.activeRun.abortController.abort()
+			return "interrupted_stream"
+		}
+		return "waiting_for_tools"
+	}
+
 	waitForIdle() {
-		return this.activeRun?.promise ?? Promise.resolve()
+		return this.activeRun?.promise ?? this.sidecarRun ?? Promise.resolve()
 	}
 
 	reset() {
 		this._state.messages = []
 		this._state.isStreaming = false
 		this._state.streamingMessage = undefined
+		this._state.currentModelRequest = undefined
 		this._state.pendingToolCalls = new Set()
 		this._state.errorMessage = undefined
 		this.clearFollowUpQueue()
 		this.clearSteeringQueue()
+	}
+
+	/**
+	 * Start a new prompt without awaiting the full run. `accepted` resolves once
+	 * the initial user message(s) have entered the transcript, while `run`
+	 * resolves when the agent is idle again.
+	 * @param {string | AgentMessage | AgentMessage[]} input
+	 * @param {any[]} [images]
+	 */
+	startPrompt(input, images) {
+		if (this.activeRun) {
+			throw new Error(
+				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+			)
+		}
+		const messages = this.normalizePromptInput(input, images)
+		const watchers = messages.map((message) => this.watchMessageEnd(message))
+		const accepted = Promise.all(watchers.map((watcher) => watcher.promise)).then(() => undefined)
+		const run = this.runPromptMessages(messages)
+		run.finally(() => watchers.forEach((watcher) => watcher.unsubscribe())).catch(() => {})
+		return {
+			messages,
+			accepted: Promise.race([accepted, run.then(() => undefined)]),
+			run,
+		}
 	}
 
 	/**
@@ -197,13 +304,9 @@ export class Agent {
 	 * @param {any[]} [images]
 	 */
 	async prompt(input, images) {
-		if (this.activeRun) {
-			throw new Error(
-				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
-			)
-		}
-		const messages = this.normalizePromptInput(input, images)
-		await this.runPromptMessages(messages)
+		const { accepted, run } = this.startPrompt(input, images)
+		accepted.catch(() => {})
+		await run
 	}
 
 	async continue() {
@@ -213,7 +316,7 @@ export class Agent {
 		const last = this._state.messages[this._state.messages.length - 1]
 		if (!last) throw new Error("No messages to continue from")
 
-		if (last.role === "assistant") {
+		if (last.role === "assistant" && nextAgentAction(this._state.messages).type !== "execute_tool_calls") {
 			const queuedSteering = this.steeringQueue.drain()
 			if (queuedSteering.length > 0) {
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true })
@@ -224,7 +327,6 @@ export class Agent {
 				await this.runPromptMessages(queuedFollowUps)
 				return
 			}
-			throw new Error("Cannot continue from message role: assistant")
 		}
 		await this.runContinuation()
 	}
@@ -238,12 +340,12 @@ export class Agent {
 	}
 
 	async runPromptMessages(messages, options = {}) {
-		await this.runWithLifecycle(async (signal) => {
+		await this.runWithLifecycle(async (signal, runToken) => {
 			await runAgentLoop(
 				messages,
 				this.createContextSnapshot(),
 				this.createLoopConfig(options),
-				(event) => this.processEvents(event),
+				(event) => this.processEvents(event, runToken),
 				signal,
 				this.streamFn,
 			)
@@ -251,15 +353,94 @@ export class Agent {
 	}
 
 	async runContinuation() {
-		await this.runWithLifecycle(async (signal) => {
+		await this.runWithLifecycle(async (signal, runToken) => {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
 				this.createLoopConfig(),
-				(event) => this.processEvents(event),
+				(event) => this.processEvents(event, runToken),
 				signal,
 				this.streamFn,
 			)
 		})
+	}
+
+	/**
+	 * Run an agent-loop invocation against a snapshot of the current context
+	 * without appending its messages to the durable/live conversation. This is
+	 * for Pinano-owned sidecar work that should use the same model/tool
+	 * execution machinery as a normal turn
+	 * but must not become part of the user-visible session tree.
+	 *
+	 * @param {string | AgentMessage | AgentMessage[]} input
+	 * @param {{ tools?: AgentTool[], signal?: AbortSignal, sessionId?: string, transformContext?: any, onEvent?: (event: AgentEvent) => void | Promise<void> }} [options]
+	 */
+	async runSidecarPrompt(input, options = {}) {
+		const messages = this.normalizePromptInput(input)
+		const context = {
+			...this.createContextSnapshot(),
+			tools: options.tools ?? this._state.tools.slice(),
+		}
+		const baseConfig = this.createLoopConfig()
+		const config = {
+			...baseConfig,
+			sessionId: options.sessionId ?? (this.sessionId ? `${this.sessionId}:sidecar` : undefined),
+			transformContext: options.transformContext,
+			getSteeringMessages: async () => [],
+			getFollowUpMessages: async () => [],
+			afterToolCall: async (ctx, signal) => {
+				const after = await baseConfig.afterToolCall?.(ctx, signal)
+				return { ...after, terminate: true }
+			},
+		}
+		const run = runAgentLoop(
+			messages,
+			context,
+			config,
+			async (event) => options.onEvent?.(event),
+			options.signal,
+			this.streamFn,
+		)
+		this.sidecarRun = run
+		try {
+			await run
+		} finally {
+			if (this.sidecarRun === run) this.sidecarRun = undefined
+		}
+	}
+
+	/**
+	 * Create an independent Agent with the same model-facing configuration and
+	 * an explicit conversation snapshot. App-level factories may override this
+	 * to attach isolated tool executors, but the default keeps ordinary Agent
+	 * tests and embedded uses working without special wiring.
+	 * @param {{ messages: AgentMessage[], transformContext?: any, afterToolCall?: any }} options
+	 */
+	createSidecarAgent(options) {
+		const sidecar = new Agent({
+			initialState: {
+				systemPrompt: this._state.systemPrompt,
+				model: this._state.model,
+				thinkingLevel: this._state.thinkingLevel,
+				serviceTier: this._state.serviceTier,
+				messages: options.messages,
+				tools: this._state.tools.slice(),
+			},
+			streamFn: this.streamFn,
+			convertToLlm: this.convertToLlm,
+			transformContext: options.transformContext,
+			getApiKey: this.getApiKey,
+			onPayload: this.onPayload,
+			onResponse: this.onResponse,
+			beforeToolCall: this.beforeToolCall,
+			afterToolCall: options.afterToolCall,
+			automatedFollowUp: undefined,
+			toolExecution: this.toolExecution,
+		})
+		sidecar.sessionId = this.sessionId
+		sidecar.session = this.session
+		sidecar.contextFilesDisabled = this.contextFilesDisabled
+		sidecar.activeContextSnapshotFiles = this.activeContextSnapshotFiles?.slice?.() ?? []
+		return sidecar
 	}
 
 	createContextSnapshot() {
@@ -274,7 +455,8 @@ export class Agent {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true
 		return {
 			model: this._state.model,
-			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
+			reasoning: this._state.thinkingLevel,
+			serviceTier: this._state.serviceTier,
 			sessionId: this.sessionId,
 			onPayload: this.onPayload,
 			onResponse: this.onResponse,
@@ -292,6 +474,13 @@ export class Agent {
 				return this.steeringQueue.drain()
 			},
 			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			shouldStopAfterTurn: async (ctx) => {
+				if (this.softStopRequested) return true
+				if ((await options.shouldStopAfterTurn?.(ctx)) === true) return true
+				const automated = await this.automatedFollowUp?.(ctx)
+				for (const message of automated ?? []) this.followUpQueue.enqueue(message)
+				return false
+			},
 		}
 	}
 
@@ -299,19 +488,21 @@ export class Agent {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.")
 		}
+		const token = Symbol("agent-run")
 		const abortController = new AbortController()
 		let resolvePromise = () => {}
 		const promise = new Promise((resolve) => {
 			resolvePromise = resolve
 		})
-		this.activeRun = { promise, resolve: resolvePromise, abortController }
+		this.activeRun = { token, promise, resolve: resolvePromise, abortController }
 
 		this._state.isStreaming = true
 		this._state.streamingMessage = undefined
+		this._state.currentModelRequest = undefined
 		this._state.errorMessage = undefined
 
 		try {
-			await executor(abortController.signal)
+			await executor(abortController.signal, token)
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted)
 		} finally {
@@ -339,18 +530,34 @@ export class Agent {
 	finishRun() {
 		this._state.isStreaming = false
 		this._state.streamingMessage = undefined
+		this._state.currentModelRequest = undefined
 		this._state.pendingToolCalls = new Set()
 		this.activeRun?.resolve()
 		this.activeRun = undefined
+		this.softStopRequested = false
 	}
 
-	async processEvents(event) {
+	async processEvents(event, runToken = this.activeRun?.token) {
+		const activeRun = this.activeRun
+		if (!activeRun || runToken !== activeRun.token) {
+			// Late event from a detached/backgrounded operation belonging to a
+			// previous run. The run is over (or another run owns the agent now), so
+			// drop it before it can mutate live state or reach session persistence.
+			return
+		}
+		if (event.type === "agent_end" && this.softStopRequested) event = { ...event, interrupted: true }
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message
 				break
 			case "message_update":
 				this._state.streamingMessage = event.message
+				break
+			case "model_request_start":
+				this._state.currentModelRequest = event.request
+				break
+			case "model_request_end":
+				this._state.currentModelRequest = undefined
 				break
 			case "message_end":
 				this._state.streamingMessage = undefined
@@ -374,14 +581,13 @@ export class Agent {
 				}
 				break
 			case "agent_end":
+				this._state.isStreaming = false
 				this._state.streamingMessage = undefined
+				this._state.currentModelRequest = undefined
 				break
 		}
 
-		const signal = this.activeRun?.abortController.signal
-		if (!signal) {
-			throw new Error("Agent listener invoked outside active run")
-		}
+		const signal = activeRun.abortController.signal
 		for (const listener of this.listeners) {
 			await listener(event, signal)
 		}
