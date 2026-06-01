@@ -1393,6 +1393,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 			anchor: "top-left",
 			backdrop: true,
 		})
+		let closeAfterOAuth = false
 		try {
 			const credentials = await (this.options.loginCodex ?? loginCodex)({
 				signal: controller.signal,
@@ -1415,7 +1416,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 			})
 			await saveCodexCredentials(credentials)
 			await this.afterCredentialChange(`Saved ChatGPT subscription credentials to ${authFilePath("openai-codex")}`)
-			this.onClose?.()
+			closeAfterOAuth = true
 		} catch (err) {
 			this.setStatus(controller.signal.aborted ? "ChatGPT login cancelled" : `ChatGPT login failed: ${err?.message ?? err}`)
 		} finally {
@@ -1424,6 +1425,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 			this.busy = false
 			this.markDirty()
 			this.tui.requestRender()
+			if (closeAfterOAuth) this.onClose?.()
 		}
 	}
 
@@ -3393,7 +3395,34 @@ export async function runServiceTuiMode(options) {
 		requestShellRender()
 	}
 
-	unsubscribe = options.client.subscribe((event) => {
+	const pendingChatSnapshotRefreshes = new Set()
+	const refreshCurrentChatSnapshot = (sessionId) => {
+		if (!sessionId || currentChat?.sessionId !== sessionId || pendingChatSnapshotRefreshes.has(sessionId)) return
+		pendingChatSnapshotRefreshes.add(sessionId)
+		options.client.snapshot(sessionId)
+			.then((snapshot) => {
+				if (currentChat?.sessionId === sessionId) currentChat.updateFromEventSnapshot(snapshot)
+				requestShellRender()
+			})
+			.catch((err) => {
+				if (showStaleRuntime(err)) return
+				table.setNotice(`snapshot refresh error: ${err?.message ?? err}`)
+				requestShellRender()
+			})
+			.finally(() => {
+				pendingChatSnapshotRefreshes.delete(sessionId)
+			})
+	}
+	const handleServiceEventError = (event, err) => {
+		if (showStaleRuntime(err)) return
+		const message = err?.message ?? String(err)
+		if (event?.sessionId) {
+			table.setActivity(event.sessionId, `event error: ${message}`)
+			refreshCurrentChatSnapshot(event.sessionId)
+		} else table.setNotice(`service event error: ${message}`)
+		requestShellRender()
+	}
+	const handleServiceEvent = (event) => {
 		if (event.type === "sessions") table.setSessions(event.sessions)
 		else if (event.sessionId) {
 			if (event.type === "agent_start") table.setActivity(event.sessionId, "Thinking…")
@@ -3427,6 +3456,14 @@ export async function runServiceTuiMode(options) {
 			table.setNotice(`service event error: ${event.error}`)
 		}
 		requestShellRender()
+	}
+
+	unsubscribe = options.client.subscribe((event) => {
+		try {
+			handleServiceEvent(event)
+		} catch (err) {
+			handleServiceEventError(event, err)
+		}
 	})
 
 	tui.addInputListener((data) => {

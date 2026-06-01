@@ -1703,6 +1703,18 @@ export function createServiceClient(info, options = {}) {
 			let reconnectTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
 			let runtimeCheckTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
 			const bodyDecoder = new TextDecoder()
+			const reportEventHandlerError = (err) => {
+				const message = err?.message ?? String(err)
+				const stack = err?.stack ? String(err.stack) : ""
+				console.error("service event handler error:", stack.includes(message) ? stack : `${message}${stack ? `\n${stack}` : ""}`)
+			}
+			const dispatchEvent = (event) => {
+				try {
+					Promise.resolve(onEvent(event)).catch(reportEventHandlerError)
+				} catch (err) {
+					reportEventHandlerError(err)
+				}
+			}
 			const emitSse = (text) => {
 				sseBuffer += text
 				for (;;) {
@@ -1719,7 +1731,7 @@ export function createServiceClient(info, options = {}) {
 					if (!data) continue
 					const parsed = JSON.parse(data)
 					if (parsed.eventClientId) eventClientId = parsed.eventClientId
-					onEvent(filterSessionEvent(parsed))
+					dispatchEvent(filterSessionEvent(parsed))
 				}
 			}
 			const scheduleReconnect = (err) => {
@@ -1733,14 +1745,14 @@ export function createServiceClient(info, options = {}) {
 							if (!closed) connect()
 						})
 						.catch((nextErr) => {
-							if (!closed) onEvent({ type: "error", error: nextErr?.message ?? String(nextErr) })
+							if (!closed) dispatchEvent({ type: "error", error: nextErr?.message ?? String(nextErr) })
 						})
 				}, 250)
 				reconnectTimer.unref?.()
 				return true
 			}
 			const fail = (err) => {
-				if (!closed && !scheduleReconnect(err)) onEvent({ type: "error", error: err?.message ?? String(err) })
+				if (!closed && !scheduleReconnect(err)) dispatchEvent({ type: "error", error: err?.message ?? String(err) })
 			}
 			if (runtimeIdentity) {
 				runtimeCheckTimer = setInterval(() => {
