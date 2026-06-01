@@ -82,12 +82,14 @@ function parseUpdate(lines, state, path) {
 	let movePath = null
 	const hunks = []
 	let current = []
+	let currentStartLine = null
 	let sawLine = false
 
 	const finish = () => {
 		if (current.length > 0) {
-			hunks.push(current)
+			hunks.push({ startLine: currentStartLine ?? state.index + 1, lines: current })
 			current = []
+			currentStartLine = null
 		}
 	}
 
@@ -114,6 +116,7 @@ function parseUpdate(lines, state, path) {
 		}
 		if (line.startsWith("@@")) {
 			finish()
+			currentStartLine = state.index + 1
 			state.index++
 			continue
 		}
@@ -121,18 +124,18 @@ function parseUpdate(lines, state, path) {
 		if (marker !== " " && marker !== "+" && marker !== "-") {
 			throw syntaxErrorAt(state.index + 1, "Update File hunk lines must start with ' ', '+', '-', or '@@'")
 		}
+		currentStartLine ??= state.index + 1
 		current.push({ kind: marker, text: line.slice(1) })
 		sawLine = true
 		state.index++
 	}
 	finish()
 	if (!movePath && (!sawLine || hunks.length === 0)) throw syntaxErrorAt(state.index + 1, "Update File requires at least one hunk line or '*** Move to'")
-	for (const [idx, hunk] of hunks.entries()) {
-		if (!hunk.some((line) => line.kind === "+" || line.kind === "-")) {
-			throw syntaxErrorAt(state.index + 1, `hunk ${idx + 1} in ${path} contains no changes`)
-		}
+	const changedHunks = hunks.filter((hunk) => hunk.lines.some((line) => line.kind === "+" || line.kind === "-"))
+	if (!movePath && hunks.length > 0 && changedHunks.length === 0) {
+		throw syntaxErrorAt(hunks[0].startLine, `hunk 1 in ${path} contains no changes`)
 	}
-	return { type: "update", path, movePath, hunks }
+	return { type: "update", path, movePath, hunks: changedHunks.map((hunk) => hunk.lines) }
 }
 
 /**

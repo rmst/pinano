@@ -20,6 +20,17 @@ import {
 const SCHEMA_VERSION = 20
 const SESSION_PREVIEW_BATCH_SIZE = 200
 
+const HIDDEN_MESSAGE_EXTRA_SQL = `
+	em.extra_json IS NOT NULL
+	AND json_valid(em.extra_json)
+	AND (
+		COALESCE(json_extract(em.extra_json, '$.pinanoAutomated'), 0) = 1
+		OR COALESCE(json_extract(em.extra_json, '$.pinanoHidden'), 0) = 1
+		OR COALESCE(json_extract(em.extra_json, '$.pinanoCompactionMemento'), 0) = 1
+		OR json_type(em.extra_json, '$.pinanoMaintenance') IS NOT NULL
+	)
+`
+
 const migrations = [
 	// v0 → v1: initial server metadata schema.
 	(db) => {
@@ -1178,6 +1189,7 @@ export function openServerDb(options = {}) {
 					ce.timestamp AS timestamp,
 					em.role AS role,
 					em.content_format AS contentFormat,
+					CASE WHEN ${HIDDEN_MESSAGE_EXTRA_SQL} THEN 1 ELSE 0 END AS hasHiddenMessageMarker,
 					(
 						SELECT group_concat(mb.text, ' ')
 						FROM (
@@ -1207,7 +1219,8 @@ export function openServerDb(options = {}) {
 			visible_messages AS (
 				SELECT *
 				FROM branch_messages
-				WHERE role != 'user' OR COALESCE(textContent, '') NOT LIKE '%' || ? || '%'
+				WHERE hasHiddenMessageMarker = 0
+					AND (role != 'user' OR COALESCE(textContent, '') NOT LIKE '%' || ? || '%')
 			)
 		SELECT * FROM (
 			SELECT
@@ -1283,6 +1296,7 @@ export function openServerDb(options = {}) {
 						ce.timestamp AS timestamp,
 						em.role AS role,
 						em.content_format AS contentFormat,
+						CASE WHEN ${HIDDEN_MESSAGE_EXTRA_SQL} THEN 1 ELSE 0 END AS hasHiddenMessageMarker,
 						CASE WHEN em.role = 'user' THEN EXISTS (
 								SELECT 1
 								FROM entry_message_blocks mb
@@ -1299,7 +1313,8 @@ export function openServerDb(options = {}) {
 				visible_messages AS (
 					SELECT *
 					FROM branch_messages
-					WHERE role != 'user' OR hasProjectContextMarker = 0
+					WHERE hasHiddenMessageMarker = 0
+						AND (role != 'user' OR hasProjectContextMarker = 0)
 				),
 				first_messages AS (
 					SELECT

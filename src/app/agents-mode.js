@@ -713,7 +713,7 @@ export class AgentTable {
 	 * @param {number} width
 	 */
 	renderRow(session, selected, width) {
-		const description = session.agentView?.description || session.preview?.lastUser?.text || session.preview?.first?.text || this.activity.get(session.id) || session.id.slice(0, 8)
+		const description = session.agentView?.description || session.preview?.first?.text || session.preview?.lastUser?.text || this.activity.get(session.id) || session.id.slice(0, 8)
 		const age = relativeAge(session.updatedAt)
 		const prefix = `${selected ? "›" : " "} ${this.iconFor(session)} `
 		const suffix = age ? ` ${theme.dim(age)}` : ""
@@ -738,7 +738,7 @@ export class AgentTable {
 		if (session.runStatus === "failed") return "failed"
 		if (session.runStatus === "aborted") return "aborted"
 		if (session.runStatus === "interrupted") return "interrupted"
-		return session.preview?.lastUser?.text || session.preview?.first?.text || "ready"
+		return session.preview?.first?.text || session.preview?.lastUser?.text || "ready"
 	}
 
 	/**
