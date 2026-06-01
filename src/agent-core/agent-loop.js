@@ -256,6 +256,11 @@ async function finishAssistantTurn(currentContext, newMessages, message, config,
 	const toolResults = []
 	let hasMoreToolCalls = false
 	if (toolCalls.length > 0) {
+		if (await config.shouldStopBeforeToolCalls?.({ message, context: currentContext, newMessages })) {
+			await emit({ type: "turn_end", message, toolResults })
+			await emit({ type: "agent_end", messages: newMessages })
+			return { agentEnded: true, hasMoreToolCalls: false }
+		}
 		const batch = await executeToolCalls(currentContext, message, config, signal, emit, pendingToolCallIds)
 		toolResults.push(...batch.messages)
 		hasMoreToolCalls = !batch.terminate

@@ -20,9 +20,10 @@ const HOME = homedir()
  * @param {string} p
  * @returns {string}
  */
-function shorten(p) {
+export function formatToolPath(p) {
 	if (typeof p !== "string" || !p) return ""
-	if (HOME && p.startsWith(HOME)) return "~" + p.slice(HOME.length)
+	if (HOME && p === HOME) return "~"
+	if (HOME && p.startsWith(`${HOME}/`)) return "~" + p.slice(HOME.length)
 	return p
 }
 
@@ -86,7 +87,7 @@ function dimNote(s) {
  */
 function fmtRead(args, options) {
 	const path = pickStr(args?.file_path, args?.path)
-	const display = path === null ? dimNote("(missing path)") : path ? arg(shorten(path)) : dimNote("...")
+	const display = path === null ? dimNote("(missing path)") : path ? arg(formatToolPath(path)) : dimNote("...")
 	let out = `${title("read", options)} ${display}`
 	const offset = args?.offset
 	const limit = args?.limit
@@ -104,7 +105,7 @@ function fmtRead(args, options) {
  */
 function fmtWrite(args, options) {
 	const path = pickStr(args?.file_path, args?.path)
-	const display = path === null ? dimNote("(missing path)") : path ? arg(shorten(path)) : dimNote("...")
+	const display = path === null ? dimNote("(missing path)") : path ? arg(formatToolPath(path)) : dimNote("...")
 	return `${title("write", options)} ${display}`
 }
 
@@ -115,7 +116,7 @@ function fmtWrite(args, options) {
  */
 function fmtApplyPatch(input, options) {
 	const text = typeof input === "string" ? input : ""
-	const files = [...text.matchAll(/^\*\*\* (?:Add File|Update File|Delete File): (.+)$/gm)].map((match) => shorten(match[1]))
+	const files = [...text.matchAll(/^\*\*\* (?:Add File|Update File|Delete File): (.+)$/gm)].map((match) => formatToolPath(match[1]))
 	const suffix = files.length > 0 ? arg(files.slice(0, 3).join(", ")) : dimNote("...")
 	const more = files.length > 3 ? dimNote(` +${files.length - 3} more`) : ""
 	return `${title("edit", options)} ${suffix}${more}`
@@ -127,7 +128,7 @@ function fmtApplyPatch(input, options) {
  */
 function fmtEdit(args, options) {
 	const path = pickStr(args?.file_path, args?.path)
-	const display = path === null ? dimNote("(missing path)") : path ? arg(shorten(path)) : dimNote("...")
+	const display = path === null ? dimNote("(missing path)") : path ? arg(formatToolPath(path)) : dimNote("...")
 	return `${title("edit", options)} ${display}`
 }
 
@@ -150,7 +151,7 @@ function fmtBash(args, options) {
  */
 function fmtLs(args, options) {
 	const path = pickStr(args?.path) ?? "."
-	let out = `${title("ls", options)} ${arg(shorten(path))}`
+	let out = `${title("ls", options)} ${arg(formatToolPath(path))}`
 	if (typeof args?.limit === "number") out += dimNote(` (limit ${args.limit})`)
 	return out
 }
@@ -162,7 +163,7 @@ function fmtLs(args, options) {
 function fmtGrep(args, options) {
 	const pattern = pickStr(args?.pattern)
 	const path = pickStr(args?.path) ?? "."
-	let out = `${title("grep", options)} ${pattern === null ? dimNote("(missing pattern)") : arg(pattern)} ${arg(shorten(path))}`
+	let out = `${title("grep", options)} ${pattern === null ? dimNote("(missing pattern)") : arg(pattern)} ${arg(formatToolPath(path))}`
 	const glob = pickStr(args?.glob)
 	if (glob) out += dimNote(` --glob ${glob}`)
 	if (typeof args?.limit === "number") out += dimNote(` (limit ${args.limit})`)
@@ -176,7 +177,7 @@ function fmtGrep(args, options) {
 function fmtFind(args, options) {
 	const pattern = pickStr(args?.pattern)
 	const path = pickStr(args?.path) ?? "."
-	let out = `${title("find", options)} ${pattern === null ? dimNote("(missing pattern)") : arg(pattern)} ${arg(shorten(path))}`
+	let out = `${title("find", options)} ${pattern === null ? dimNote("(missing pattern)") : arg(pattern)} ${arg(formatToolPath(path))}`
 	if (typeof args?.limit === "number") out += dimNote(` (limit ${args.limit})`)
 	return out
 }
@@ -192,7 +193,7 @@ function fmtJs(args, options) {
 }
 
 function fmtSessionSet(args, options) {
-	return `${title("session", options)} ${arg(formatSessionWriteSummary(args, { formatPath: shorten }))}`
+	return `${title("session", options)} ${arg(formatSessionWriteSummary(args, { formatPath: formatToolPath }))}`
 }
 
 /** @type {Record<string, (args: any, options: ToolCallFormatOptions) => string>} */

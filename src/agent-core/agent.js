@@ -251,11 +251,7 @@ export class Agent {
 	softInterrupt() {
 		if (!this.activeRun) return "idle"
 		this.softStopRequested = true
-		if (this._state.pendingToolCalls.size === 0) {
-			this.activeRun.abortController.abort()
-			return "interrupted_stream"
-		}
-		return "waiting_for_tools"
+		return this._state.pendingToolCalls.size > 0 ? "waiting_for_tools" : "waiting_for_model_stream"
 	}
 
 	waitForIdle() {
@@ -474,6 +470,7 @@ export class Agent {
 				return this.steeringQueue.drain()
 			},
 			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			shouldStopBeforeToolCalls: async () => this.softStopRequested,
 			shouldStopAfterTurn: async (ctx) => {
 				if (this.softStopRequested) return true
 				if ((await options.shouldStopAfterTurn?.(ctx)) === true) return true

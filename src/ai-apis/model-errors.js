@@ -8,6 +8,7 @@ const RETRYABLE_MODEL_ERROR_PATTERNS = [
 	/stream.?inactivity|no sse data received/i,
 	/tls: stream read error|\bECONNRESET\b|\bEPIPE\b|\bETIMEDOUT\b/i,
 	/socket hang up|socket closed|connection (?:closed|reset|terminated)|stream (?:closed|terminated|disconnected)/i,
+	/^\s*(?:Error\s+)?(?:TypeError\s+)?terminated\s*$/i,
 	/\bUND_ERR_(?:SOCKET|BODY_TIMEOUT|HEADERS_TIMEOUT|CONNECT_TIMEOUT)\b/i,
 ]
 

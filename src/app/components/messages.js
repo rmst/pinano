@@ -14,8 +14,9 @@
 
 import { Box, Container, Markdown, Spacer, Text, TruncatedText } from "../../tui/index.js"
 import { isResponsesCompactionBlock } from "../../responses-compaction.js"
+import { contextLoadDisplayFiles } from "../../session-manager/context-display.js"
 import { getMarkdownTheme, theme } from "../theme.js"
-import { formatToolCall } from "./tool-format.js"
+import { formatToolCall, formatToolPath } from "./tool-format.js"
 
 /** @typedef {any} AnyMessage */
 /**
@@ -320,8 +321,55 @@ export class ToolExecutionComponent extends Container {
 }
 
 // =============================================================================
-// Custom / system messages
+// Context / custom / system messages
 // =============================================================================
+
+/**
+ * @param {any} load
+ * @returns {string[]}
+ */
+function contextLoadPaths(load) {
+	return contextLoadDisplayFiles(load)
+		.map((/** @type {any} */ file) => file?.path)
+		.filter((/** @type {any} */ path) => typeof path === "string" && path.length > 0)
+}
+
+/**
+ * @returns {string}
+ */
+function contextLabel() {
+	return theme.bold(theme.fg("customMessageLabel", "context"))
+}
+
+/**
+ * @param {string} path
+ * @returns {string}
+ */
+function contextLoadPathLine(path) {
+	return `${contextLabel()} ${theme.fg("toolText", "loaded")} ${theme.fg("toolArg", formatToolPath(path))}`
+}
+
+/**
+ * Compact context-load marker. It borrows the single-line tool-call rhythm, but without a background block.
+ */
+export class ContextLoadComponent extends Container {
+	/**
+	 * @param {any} load
+	 * @param {string} [fallbackText]
+	 */
+	constructor(load, fallbackText = "") {
+		super()
+		const paths = contextLoadPaths(load)
+		const lines = paths.length > 0
+			? paths.map(contextLoadPathLine)
+			: String(fallbackText ?? "")
+				.split("\n")
+				.map((line) => line.trim())
+				.filter(Boolean)
+				.map((line) => `${contextLabel()} ${theme.fg("customMessageText", line)}`)
+		for (const line of lines) this.addChild(new TruncatedText(line, 0, 0))
+	}
+}
 
 /**
  * Used for synthetic messages we inject into the transcript: status notes,

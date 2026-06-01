@@ -2,13 +2,9 @@
 
 (<i>experimental</i>)
 
-Pinano is an interactive AI coding agent for the terminal. It is a deliberately slimmed-down fork of [Pi](https://github.com/earendil-works/pi), focused on a small, inspectable codebase:
+Pinano is an interactive AI coding agent for the terminal, designed to be used with your ChatGPT/Codex subscription. It has a more advanced terminal UI than the official Codex CLI, while exposing the same system prompt and equivalent tools to the model, so model performance should be just as good. Other APIs are also supported, including llama.cpp and DeepSeek; see below.
 
-- **No npm dependency tree for the core terminal app.**
-- **No build step.** Source is plain JavaScript with JSDoc types.
-- **Reconnectable sessions.** Agent runs can continue while terminal windows detach and reconnect.
-
-Pinano also borrows a few ideas from Claude Code and Codex CLI, including lazy `AGENTS.md` / `CLAUDE.md` loading and `@import` in context files.
+Pinano is directly installable from GitHub source, with no npm dependencies and no build step.
 
 ## Screenshots and videos
 
@@ -181,4 +177,5 @@ src/
 
 ## Notes
 
+- The initial version of Pinano was based on [Pi](https://github.com/earendil-works/pi).
 - Pinano also runs on the experimental [Qn](https://github.com/rmst/qn) runtime.

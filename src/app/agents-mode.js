@@ -10,6 +10,7 @@ import {
 	CombinedAutocompleteProvider,
 	Container,
 	Editor,
+	Input,
 	Loader,
 	ProcessTerminal,
 	RetainedComponent,
@@ -27,6 +28,7 @@ import {
 } from "../tui/index.js"
 import {
 	AssistantMessageComponent,
+	ContextLoadComponent,
 	CustomMessageComponent,
 	TextLine,
 	ToolExecutionComponent,
@@ -34,7 +36,6 @@ import {
 } from "./components/messages.js"
 import { TranscriptContainer } from "./components/transcript.js"
 import { REASONING_LEVELS, reasoningLevelLabel } from "../reasoning.js"
-import { contextLoadDisplayText } from "../session-manager/context-display.js"
 import { Footer, modelDisplayLabel } from "./components/footer.js"
 import { pickInline } from "./components/inline-picker.js"
 import { pickFromOverlay } from "./components/picker.js"
@@ -1092,12 +1093,16 @@ class ChatGptOAuthModal extends RetainedComponent {
 		super()
 		this.tui = tui
 		this.onCancel = onCancel
-		this.onPasteCode = undefined
+		this.onManualCode = undefined
 		this.status = "Starting ChatGPT OAuth…"
 		this.instructions = "Complete the login in your browser, then return to Pinano."
 		this.url = ""
 		this.cancelled = false
-		this.pasteBusy = false
+		this.manualCodeBusy = false
+		this.focused = false
+		this.input = new Input()
+		this.input.onSubmit = (value) => void this.submitManualCode(value)
+		this.input.onEscape = () => this.cancel()
 	}
 
 	setAuth({ url, instructions }) {
@@ -1107,8 +1112,8 @@ class ChatGptOAuthModal extends RetainedComponent {
 		this.tui.requestRender()
 	}
 
-	setPasteCodeHandler(handler) {
-		this.onPasteCode = handler
+	setManualCodeSubmitHandler(handler) {
+		this.onManualCode = handler
 		this.markDirty()
 		this.tui.requestRender()
 	}
@@ -1126,14 +1131,20 @@ class ChatGptOAuthModal extends RetainedComponent {
 		this.onCancel?.()
 	}
 
-	async pasteCode() {
-		if (this.cancelled || this.pasteBusy || !this.onPasteCode) return
-		this.pasteBusy = true
-		this.setStatus("Paste the authorization code or full redirect URL.")
+	async submitManualCode(value) {
+		const input = value.trim()
+		if (this.cancelled || this.manualCodeBusy) return
+		if (!input) {
+			this.setStatus("Paste the authorization code or full redirect URL, then press Enter.")
+			return
+		}
+		this.manualCodeBusy = true
+		this.input.setValue("")
+		this.setStatus("Authorization code submitted; finishing login.")
 		try {
-			await this.onPasteCode()
+			await this.onManualCode?.(input)
 		} finally {
-			this.pasteBusy = false
+			this.manualCodeBusy = false
 			this.markDirty()
 			this.tui.requestRender()
 		}
@@ -1142,20 +1153,30 @@ class ChatGptOAuthModal extends RetainedComponent {
 	/** @param {string} data */
 	handleInput(data) {
 		const kb = getKeybindings()
-		if (kb.matches(data, "tui.select.cancel") || data === "\x03") this.cancel()
-		else if (data.toLowerCase() === "p") void this.pasteCode()
+		if (data === "\x03") {
+			this.cancel()
+			return
+		}
+		if (this.manualCodeBusy && !kb.matches(data, "tui.select.cancel")) return
+		this.input.handleInput(data)
+		this.markDirty()
 	}
 
 	/** @param {number} width */
 	render(width) {
 		const modalWidth = Math.max(44, width)
+		const innerWidth = Math.max(1, modalWidth - 4)
 		const height = Math.max(12, this.tui.terminal?.rows ?? 24)
 		const border = theme.fg("border", "─".repeat(modalWidth))
+		this.input.focused = this.focused && !this.cancelled
 		const lines = [
 			border,
 			fit(theme.bold(" ChatGPT subscription login"), modalWidth),
 			border,
 			...wrapTextWithAnsi(theme.dim(` ${this.instructions}`), modalWidth).map((line) => fit(line, modalWidth)),
+			border,
+			fit(theme.bold(" Authorization code or redirect URL"), modalWidth),
+			...this.input.render(innerWidth).map((line) => fit(`  ${line}`, modalWidth)),
 		]
 		if (this.url) {
 			lines.push(border)
@@ -1165,13 +1186,13 @@ class ChatGptOAuthModal extends RetainedComponent {
 		lines.push(border)
 		lines.push(...wrapTextWithAnsi(` ${this.cancelled ? theme.cyan("Cancelling…") : theme.cyan("Status:")} ${this.status}`, modalWidth).map((line) => fit(line, modalWidth)))
 		lines.push(border)
-		lines.push(fit(theme.dim(`${this.onPasteCode ? " P paste code · " : ""}Esc cancel ChatGPT login`), modalWidth))
+		lines.push(fit(theme.dim(" Enter submit · Esc cancel ChatGPT login"), modalWidth))
 		while (lines.length < height) lines.push(fit("", modalWidth))
 		return lines
 	}
 }
 
-class CredentialsSettingsModal extends RetainedComponent {
+export class CredentialsSettingsModal extends RetainedComponent {
 	constructor(tui, options = {}) {
 		super()
 		this.tui = tui
@@ -1313,7 +1334,59 @@ class CredentialsSettingsModal extends RetainedComponent {
 		this.setStatus("Starting ChatGPT OAuth…")
 		const controller = new AbortController()
 		const manualPromptController = new AbortController()
-		const oauthModal = new ChatGptOAuthModal(this.tui, { onCancel: () => controller.abort() })
+		const oauthModal = new ChatGptOAuthModal(this.tui, {
+			onCancel: () => {
+				controller.abort()
+				manualPromptController.abort()
+			},
+		})
+		const manualInputs = []
+		const manualWaiters = []
+		let requestManualCode
+		let manualRequestBusy = false
+		const provideManualInput = (value) => {
+			const waiter = manualWaiters.shift()
+			if (waiter) waiter(value)
+			else manualInputs.push(value)
+		}
+		const waitForManualInput = (signal) => {
+			if (manualInputs.length > 0) return Promise.resolve(manualInputs.shift())
+			return new Promise((resolve) => {
+				let done = false
+				const waiter = (value) => {
+					if (done) return
+					done = true
+					signal?.removeEventListener("abort", abort)
+					resolve(value)
+				}
+				const abort = () => {
+					const index = manualWaiters.indexOf(waiter)
+					if (index !== -1) manualWaiters.splice(index, 1)
+					waiter(null)
+				}
+				manualWaiters.push(waiter)
+				if (signal?.aborted) abort()
+				else signal?.addEventListener("abort", abort, { once: true })
+			})
+		}
+		const runManualCodeRequest = async () => {
+			if (!requestManualCode || manualRequestBusy) return
+			manualRequestBusy = true
+			try {
+				const result = await requestManualCode()
+				if (result?.status === "submitted") oauthModal.setStatus("Authorization code submitted; finishing login.")
+				else if (result?.status === "cancelled") oauthModal.setStatus("Still waiting for ChatGPT login.")
+				else if (result?.status === "busy") oauthModal.setStatus("Authorization code submission is already in progress.")
+				else if (result?.status === "error") oauthModal.setStatus(`Could not use authorization code: ${result.error?.message ?? result.error}`)
+			} finally {
+				manualRequestBusy = false
+			}
+		}
+		oauthModal.setManualCodeSubmitHandler(async (value) => {
+			provideManualInput(value)
+			if (requestManualCode) await runManualCodeRequest()
+			else oauthModal.setStatus("Authorization code submitted; finishing login.")
+		})
 		const oauthHandle = this.tui.showOverlay(oauthModal, {
 			width: "100%",
 			maxHeight: "100%",
@@ -1321,20 +1394,13 @@ class CredentialsSettingsModal extends RetainedComponent {
 			backdrop: true,
 		})
 		try {
-			const credentials = await loginCodex({
+			const credentials = await (this.options.loginCodex ?? loginCodex)({
 				signal: controller.signal,
-				onAuth: ({ url, instructions, requestManualCode }) => {
+				onAuth: ({ url, instructions, requestManualCode: nextRequestManualCode }) => {
+					requestManualCode = nextRequestManualCode
 					oauthModal.setAuth({ url, instructions })
 					oauthModal.setStatus("Complete ChatGPT login in your browser.")
-					oauthModal.setPasteCodeHandler(requestManualCode
-						? async () => {
-							const result = await requestManualCode()
-							if (result?.status === "submitted") oauthModal.setStatus("Authorization code submitted; finishing login.")
-							else if (result?.status === "cancelled") oauthModal.setStatus("Still waiting for ChatGPT login.")
-							else if (result?.status === "busy") oauthModal.setStatus("Authorization code prompt is already open.")
-							else if (result?.status === "error") oauthModal.setStatus(`Could not use pasted code: ${result.error?.message ?? result.error}`)
-						}
-						: undefined)
+					if (requestManualCode && manualInputs.length > 0) void runManualCodeRequest()
 					this.setStatus(`Complete ChatGPT login in your browser. If it did not open, visit: ${url}`)
 					void openUrlInBrowser(url).then((opened) => {
 						if (controller.signal.aborted) return
@@ -1342,14 +1408,14 @@ class CredentialsSettingsModal extends RetainedComponent {
 						this.setStatus(opened ? `Browser opened. Complete ChatGPT login to finish. If it did not open, visit: ${url}` : `Open this URL to finish ChatGPT login: ${url}`)
 					})
 				},
-				onPrompt: async ({ message }) => await promptForInput(this.tui, message, {
-					title: "ChatGPT authorization code",
-					subtitle: "If the browser lands on a localhost error page, copy the full address bar URL and paste it here.",
-					signal: manualPromptController.signal,
-				}),
+				onPrompt: async () => {
+					oauthModal.setStatus("Paste the authorization code or full redirect URL, then press Enter.")
+					return await waitForManualInput(manualPromptController.signal)
+				},
 			})
 			await saveCodexCredentials(credentials)
 			await this.afterCredentialChange(`Saved ChatGPT subscription credentials to ${authFilePath("openai-codex")}`)
+			this.onClose?.()
 		} catch (err) {
 			this.setStatus(controller.signal.aborted ? "ChatGPT login cancelled" : `ChatGPT login failed: ${err?.message ?? err}`)
 		} finally {
@@ -2085,7 +2151,7 @@ export class Chat {
 		for (const path of projectContextPathsInMessages(messages)) {
 			if (this.announcedContextPaths.has(path)) continue
 			this.announcedContextPaths.add(path)
-			this.chatContainer.addItem(new TextLine(theme.dim(`loaded ${path}`)), "custom")
+			this.chatContainer.addItem(new ContextLoadComponent({ files: [{ path }] }), "custom")
 			changed = true
 		}
 		if (changed && options.requestRender !== false) this.tui.requestRender()
@@ -2387,8 +2453,7 @@ export class Chat {
 		if (msg.role === "user") {
 			this.chatContainer.addItem(new UserMessageComponent(msg), "user")
 		} else if (msg.role === "contextLoad") {
-			const text = contextLoadDisplayText(msg.contextLoad) || flattenContent(msg.content)
-			this.chatContainer.addItem(new CustomMessageComponent(text, { label: "context" }), "custom")
+			this.chatContainer.addItem(new ContextLoadComponent(msg.contextLoad, flattenContent(msg.content)), "custom")
 		} else if (msg.role === "assistant") {
 			const c = new AssistantMessageComponent(msg, this.messageRenderOptions)
 			this.chatContainer.addItem(c, "assistant")

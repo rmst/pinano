@@ -1282,7 +1282,7 @@ function waitingToolNames(item) {
 function upgradeWaitLines(waiting, startedAtMs, { prompt = true } = {}) {
 	const elapsed = formatWaitElapsed(Date.now() - startedAtMs)
 	const lines = [
-		`pinano service upgrade has waited ${elapsed} for running tool calls:`,
+		`pinano service upgrade has waited ${elapsed} for running sessions:`,
 		...waiting.map((item) => `  ${item.sessionId.slice(0, 8)} ${waitingToolNames(item)}`),
 	]
 	if (prompt) lines.push(`Waited ${elapsed}. Hard interrupt and replace the service? [y/N] `)
@@ -1374,7 +1374,7 @@ async function waitForUpgradeBlockageDecision(info, initialWaiting, startedAtMs)
 	})
 }
 
-async function shouldHardInterruptForUpgrade(prompt = "Hard interrupt these running tool calls and replace the service? [y/N] ") {
+async function shouldHardInterruptForUpgrade(prompt = "Hard interrupt these running sessions and replace the service? [y/N] ") {
 	if (process.env.PINANO_SERVICE_HARD_INTERRUPT === "1" || process.env.PINANO_DAEMON_HARD_INTERRUPT === "1") return true
 	if (!process.stdin.isTTY || !process.stderr.isTTY) return false
 	const rl = createInterface({ input: process.stdin, output: process.stderr })
@@ -1441,9 +1441,9 @@ export async function ensureService(options) {
 			if (interrupted?.waiting?.length) {
 				const decision = await waitForUpgradeBlockageDecision(replacementTarget, interrupted.waiting, upgradeWaitStartedAt)
 				if (decision.action === "cleared") {
-					console.error("Running tool calls finished; continuing service replacement…")
+					console.error("Running sessions finished; continuing service replacement…")
 					if (!await ensureOldServiceStopped(replacementTarget, decision.interrupted)) {
-						throw new Error(`Existing pinano service pid ${pid} did not exit after running tool calls finished`)
+						throw new Error(`Existing pinano service pid ${pid} did not exit after running sessions finished`)
 					}
 				} else if (decision.action === "hard") {
 					console.error("Hard-interrupting old service…")
