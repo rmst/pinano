@@ -1203,7 +1203,7 @@ class CredentialsSettingsModal extends RetainedComponent {
 				kind: "chatgpt",
 				label: "Use your ChatGPT subscription",
 				value: codex?.kind === "codex" ? `connected${codex.accountId ? ` · ${codex.accountId}` : ""}` : "OAuth",
-				description: "Starts the OpenAI OAuth flow and stores a refresh token locally. Usage is subject to your ChatGPT plan and OpenAI's terms.",
+				description: "Starts the OpenAI OAuth flow. Usage is subject to your ChatGPT plan and OpenAI's terms.",
 			},
 			{ id: "spacer:api-keys", kind: "spacer", label: "", value: "" },
 			{ id: "section:api-keys", kind: "section", label: "API keys", value: "" },
