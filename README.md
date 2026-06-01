@@ -87,7 +87,7 @@ Type `/` to autocomplete. `/help` shows the full command list for the current vi
 
 | Command | What it does |
 |---|---|
-| `/model [model]` | select the default model for new sessions |
+| `/model` | select the default model for new sessions |
 | `/reasoning` | set the default reasoning effort for new sessions |
 | `/usage` | show ChatGPT/Codex usage limits |
 | `/settings` | edit local settings; includes credentials |
@@ -100,7 +100,7 @@ Type `/` to autocomplete. `/help` shows the full command list for the current vi
 | `/continue` | resume an interrupted turn, or ask the model to continue |
 | `/abort` | abort the current turn |
 | `/session` | show current session metadata |
-| `/fast on|off|status` | toggle Codex Fast mode when supported by the model |
+| `/fast on\|off\|status` | toggle Codex Fast mode when supported by the model |
 | `/compact` | compact older conversation messages |
 | `/branch` | create a new session from the current conversation branch |
 | `/rewind` | rewind to an earlier prompt or switch branch |
