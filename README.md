@@ -6,13 +6,9 @@ Pinano is an interactive AI coding agent for the terminal, designed to be used w
 
 Pinano is directly installable from GitHub source, with no npm dependencies and no build step.
 
-## Screenshots and videos
+## Demo
 
-Coming soon:
-
-- screenshot: session overview
-- screenshot: open chat session
-- video: dispatching and reviewing background agents
+https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4
 
 ## Install
 
