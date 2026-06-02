@@ -8,7 +8,35 @@ Pinano is directly installable from GitHub source, with no npm dependencies and 
 
 ## Demo
 
+Bare MP4:
+
 https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4
+
+MP4 as Markdown image:
+
+![MP4 as image](https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4)
+
+HTML video tag:
+
+<video src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4" controls width="720"></video>
+
+HTML video source tag:
+
+<video controls width="720">
+	<source src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4" type="video/mp4">
+</video>
+
+GIF as Markdown image:
+
+![GIF demo](https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif)
+
+GIF as HTML image:
+
+<img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif" alt="Pinano demo" width="720">
+
+GIF thumbnail linking to MP4:
+
+[![Pinano demo](https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif)](https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4)
 
 ## Install
 
