@@ -1,42 +1,13 @@
 # Pinano
 
-(<i>experimental</i>)
+<p>
+<img src="https://github.com/rmst/pinano/releases/download/readme-assets/install-setup-scripted-640w.gif" alt="Pinano install and setup demo" width="49%">
+<img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif" alt="Pinano session overview and running agent demo" width="49%">
+</p>
 
 Pinano is an interactive AI coding agent for the terminal, designed to be used with your ChatGPT/Codex subscription. It has a more advanced terminal UI than the official Codex CLI, while exposing the same system prompt and equivalent tools to the model, so model performance should be just as good. Other APIs are also supported, including llama.cpp and DeepSeek; see below.
 
 Pinano is directly installable from GitHub source, with no npm dependencies and no build step.
-
-## Demo
-
-Bare MP4:
-
-https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4
-
-MP4 as Markdown image:
-
-![MP4 as image](https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4)
-
-HTML video tag:
-
-<video src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4" controls width="720"></video>
-
-HTML video source tag:
-
-<video controls width="720">
-	<source src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4" type="video/mp4">
-</video>
-
-GIF as Markdown image:
-
-![GIF demo](https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif)
-
-GIF as HTML image:
-
-<img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif" alt="Pinano demo" width="720">
-
-GIF thumbnail linking to MP4:
-
-[![Pinano demo](https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif)](https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted.mp4)
 
 ## Install
 
