@@ -1,8 +1,8 @@
 # Pinano
 
 <p>
-<img src="https://github.com/rmst/pinano/releases/download/readme-assets/install-setup-scripted-640w.gif" alt="Pinano install and setup demo" width="49%">
-<img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif" alt="Pinano session overview and running agent demo" width="49%">
+<a href="#pinano"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/install-setup-scripted-640w.gif" alt="Pinano install and setup demo" width="49%"></a>
+<a href="#pinano"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif" alt="Pinano session overview and running agent demo" width="49%"></a>
 </p>
 
 Pinano is an interactive AI coding agent for the terminal, designed to be used with your ChatGPT/Codex subscription. It has a more advanced terminal UI than the official Codex CLI, while exposing the same system prompt and equivalent tools to the model, so model performance should be just as good. Other APIs are also supported, including llama.cpp and DeepSeek; see below.
