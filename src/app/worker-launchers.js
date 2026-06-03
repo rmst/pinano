@@ -322,12 +322,92 @@ function linuxBubblewrapReadableRoots(workerPath) {
 	])
 }
 
-async function assertNativeSandboxCommand(command, args, message) {
-	try {
-		await run(command, args)
-	} catch (err) {
-		throw new Error(`${message} Pinano will not fall back to unsandboxed execution automatically. To run tools unsandboxed anyway, set "sandbox": { "type": "none" } for this environment in environments.json.\n${err?.message ?? err}`)
+function nativeSandboxUnsupportedMessage(platform) {
+	return `Native sandbox workers are not supported on ${platform}. Configure sandbox.type "container" or explicitly configure sandbox.type "none".`
+}
+
+/**
+ * @param {{ platform?: string, sandboxExecCommand?: string, bwrapCommand?: string }} [options]
+ * @returns {{ platform: string, command: string, args: string[], message: string, recovery: string } | undefined}
+ */
+export function nativeSandboxProbeSpec(options = {}) {
+	const platform = options.platform ?? process.platform
+	if (platform === "darwin") {
+		return {
+			platform,
+			command: options.sandboxExecCommand ?? "/usr/bin/sandbox-exec",
+			args: ["-p", "(version 1)\n(allow default)", "/usr/bin/true"],
+			message: "Native macOS sandboxing requires a working sandbox-exec.",
+			recovery: "Continue without native sandboxing or run Pinano outside any outer sandbox-exec wrapper.",
+		}
 	}
+	if (platform === "linux") {
+		return {
+			platform,
+			command: options.bwrapCommand ?? "bwrap",
+			args: bubblewrapProbeArgs,
+			message: "Native Linux sandboxing requires a working bubblewrap (bwrap).",
+			recovery: "Install bubblewrap, enable unprivileged user namespaces if your distro requires it, or choose unsandboxed execution explicitly.",
+		}
+	}
+	return undefined
+}
+
+export class NativeSandboxUnavailableError extends Error {
+	/**
+	 * @param {{ platform: string, command?: string, args?: string[], message: string, recovery?: string, detail?: string }} result
+	 * @param {{ failClosedHint?: boolean, cause?: unknown }} [options]
+	 */
+	constructor(result, options = {}) {
+		const detail = result.detail ? `\n${result.detail}` : ""
+		const hint = options.failClosedHint === false
+			? ""
+			: " Pinano will not fall back to unsandboxed execution automatically. To run tools unsandboxed anyway, set \"sandbox\": { \"type\": \"none\" } for this environment in environments.json."
+		super(`${result.message}${result.recovery ? ` ${result.recovery}` : ""}${hint}${detail}`, { cause: options.cause })
+		this.name = "NativeSandboxUnavailableError"
+		this.platform = result.platform
+		this.command = result.command
+		this.args = result.args
+		this.detail = result.detail
+	}
+}
+
+function nativeSandboxProbeDetail(command, err) {
+	const detail = err?.message ?? String(err)
+	return detail.includes(command) ? detail : `${command}: ${detail}`
+}
+
+/** @param {{ platform?: string, sandboxExecCommand?: string, bwrapCommand?: string }} [options] */
+export async function probeNativeSandbox(options = {}) {
+	const platform = options.platform ?? process.platform
+	const spec = nativeSandboxProbeSpec({ ...options, platform })
+	if (!spec) {
+		return {
+			ok: false,
+			supported: false,
+			platform,
+			message: nativeSandboxUnsupportedMessage(platform),
+			recovery: "Configure sandbox.type \"container\" or explicitly configure sandbox.type \"none\".",
+		}
+	}
+	try {
+		await run(spec.command, spec.args)
+		return { ok: true, supported: true, ...spec }
+	} catch (err) {
+		return {
+			ok: false,
+			supported: true,
+			...spec,
+			error: err,
+			detail: nativeSandboxProbeDetail(spec.command, err),
+		}
+	}
+}
+
+/** @param {{ platform?: string, sandboxExecCommand?: string, bwrapCommand?: string }} [options] */
+async function assertNativeSandboxAvailable(options = {}) {
+	const result = await probeNativeSandbox(options)
+	if (!result.ok) throw new NativeSandboxUnavailableError(result, { cause: result.error })
 }
 
 export class NativeSandboxWorkerLauncher {
@@ -350,11 +430,7 @@ export class NativeSandboxWorkerLauncher {
 		let command
 		let args
 		if (this.platform === "darwin") {
-			await assertNativeSandboxCommand(
-				this.sandboxExecCommand,
-				["-p", "(version 1)\n(allow default)", "/usr/bin/true"],
-				`Native macOS sandboxing requires sandbox-exec.`,
-			)
+			await assertNativeSandboxAvailable({ platform: this.platform, sandboxExecCommand: this.sandboxExecCommand })
 			await prepareToolHome(toolHome)
 			command = this.sandboxExecCommand
 			args = createSeatbeltSandboxArgs({
@@ -363,11 +439,7 @@ export class NativeSandboxWorkerLauncher {
 				writableRoots: absolutePathVariantSet([...roots, toolHome, ...macosSeatbeltTempRoots()]),
 			})
 		} else if (this.platform === "linux") {
-			await assertNativeSandboxCommand(
-				this.bwrapCommand,
-				bubblewrapProbeArgs,
-				`Native Linux sandboxing requires a working bubblewrap (bwrap). Install bubblewrap, enable unprivileged user namespaces if your distro requires it, or choose unsandboxed execution explicitly.`,
-			)
+			await assertNativeSandboxAvailable({ platform: this.platform, bwrapCommand: this.bwrapCommand })
 			await prepareToolHome(toolHome)
 			command = this.bwrapCommand
 			args = bubblewrapArgs({
@@ -378,7 +450,7 @@ export class NativeSandboxWorkerLauncher {
 				command: [process.execPath, workerPath],
 			})
 		} else {
-			throw new Error(`Native sandbox workers are not supported on ${this.platform}. Configure sandbox.type "container" or explicitly configure sandbox.type "none".`)
+			throw new Error(nativeSandboxUnsupportedMessage(this.platform))
 		}
 		const child = spawnRpc(command, args, {
 			cwd: workdir,

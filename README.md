@@ -5,7 +5,7 @@
 <a href="#pinano"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif" alt="Pinano session overview and running agent demo" width="49%"></a>
 </p>
 
-Pinano is an interactive AI coding agent for the terminal. It's optimized to be used with a ChatGPT/Codex subscription. It has a more ergonomic UI than the official Codex CLI, while exposing the same system prompt and tools to the model, so agent performance should be just as good. Other APIs are also supported, including local models via `llama.cpp`.
+Pinano is an interactive AI coding assistant for the terminal with an ergonomic agent-view UI comparable to Claude Code's [Agent View](https://code.claude.com/docs/en/agent-view). Pinano works very well with a ChatGPT/Codex subscription. Pinano exposes the same system prompt and tools like the official Codex CLI, so agent performance with the flagship GPT-5.x models should be just as good. Other APIs are also supported, including local models via `llama.cpp`.
 
 Pinano is directly installable from GitHub source, with no npm dependencies and no build step.
 
@@ -96,7 +96,9 @@ Press `Esc Esc` on an empty editor to open `/rewind`. You can return to an earli
 
 ## Tool environments
 
-By default, tools run in a native filesystem sandbox on MacOS and Linux. You can optionally configure named local, container, or SSH environments for tool execution.
+By default, tools run in a native filesystem sandbox on MacOS and Linux. MacOS uses `sandbox-exec`; Linux uses Bubblewrap (`bwrap`). You can optionally configure named local, container, or SSH environments for tool execution.
+
+Sandbox paths default to `["."]`, resolved against the configured environment `cwd` when one is set, otherwise against the session's initial cwd; later `cwd` changes must stay under one of those paths. Native workers allow reads from sandbox paths plus system, toolchain, Pinano runtime paths, and the environment's tool home, while writes stay restricted to sandbox paths, temp directories, and that tool home. Native sandbox workers use a per-environment fake home under `$PINANO_HOME/environments/<environment-id>/home`; `HOME`, XDG roots, temp variables, and Pinano fallback-tool wrappers all point there so tools share state across projects without writing into project directories. On interactive TUI startup, Pinano probes the default local native sandbox first; if Linux `bwrap` is unavailable or unusable, or if MacOS `sandbox-exec` fails, Pinano shows a startup page that retries every 5 seconds and lets you continue by saving `sandbox.type: "none"` for that environment. Non-interactive tool execution still fails closed and tells you how to opt into `sandbox.type: "none"` explicitly.
 
 <details>
 <summary>Environment configuration</summary>

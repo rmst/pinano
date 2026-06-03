@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
-import { isAbsolute } from "node:path"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { dirname, isAbsolute } from "node:path"
 
 import { environmentsConfigPath } from "./paths.js"
 import { configuredWorkerSpec } from "./service-config.js"
@@ -21,6 +22,17 @@ function readEnvironmentsConfig() {
 		return parsed
 	} catch (err) {
 		if (err?.code === "ENOENT") return undefined
+		throw err
+	}
+}
+
+async function readEnvironmentsConfigForWrite() {
+	try {
+		const parsed = JSON.parse(await readFile(environmentsConfigPath(), "utf-8"))
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("environments.json must contain an object")
+		return parsed
+	} catch (err) {
+		if (err?.code === "ENOENT") return {}
 		throw err
 	}
 }
@@ -203,6 +215,53 @@ function legacyRegistry() {
 export function loadEnvironmentRegistry() {
 	const config = readEnvironmentsConfig()
 	return config ? normalizeRegistry(config) : legacyRegistry()
+}
+
+/**
+ * Persist an explicit unsandboxed opt-out for one configured environment.
+ * Existing target/cwd/default entries are preserved; only the selected
+ * environment's sandbox policy is replaced.
+ * @param {string} environmentId
+ */
+export async function disableEnvironmentSandbox(environmentId) {
+	validateEnvironmentId(environmentId)
+	const config = await readEnvironmentsConfigForWrite()
+	const rawEnvironments = config.environments
+	if (rawEnvironments !== undefined && (!rawEnvironments || typeof rawEnvironments !== "object" || Array.isArray(rawEnvironments))) {
+		throw new TypeError("environments must be an object mapping ids to environment configs")
+	}
+	const current = rawEnvironments?.[environmentId]
+	if (current === null) throw new TypeError(`Environment ${environmentId} is explicitly disabled`)
+	if (current !== undefined && (!current || typeof current !== "object" || Array.isArray(current))) {
+		throw new TypeError(`Environment ${environmentId} must be an object`)
+	}
+	const { worker: _worker, image: _image, ...rest } = current ?? {}
+	const nextEnvironment = {
+		...rest,
+		target: rest.target ?? "local",
+		sandbox: { type: "none" },
+	}
+	const path = environmentsConfigPath()
+	await mkdir(dirname(path), { recursive: true })
+	await writeFile(path, `${JSON.stringify({
+		...config,
+		environments: {
+			...(rawEnvironments ?? {}),
+			[environmentId]: nextEnvironment,
+		},
+	}, null, "\t")}\n`, { mode: 0o600 })
+}
+
+/** @param {ReturnType<typeof loadEnvironmentRegistry>} [registry] @param {string} [platform] */
+export function defaultNativeSandboxEnvironment(registry = loadEnvironmentRegistry(), platform = process.platform) {
+	if (platform !== "darwin" && platform !== "linux") return undefined
+	const environment = getEnvironment(registry.default, registry)
+	if (environment.target?.type !== "local" || environment.sandbox?.type !== "native") return undefined
+	return {
+		environmentId: environment.id,
+		platform,
+		sandbox: environment.sandbox,
+	}
 }
 
 /** @param {ReturnType<typeof loadEnvironmentRegistry>} registry */

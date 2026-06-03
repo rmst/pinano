@@ -69,6 +69,7 @@ import { isProjectContextMessage } from "./project-context.js"
 import { applySessionEvent, cloneSessionSnapshot, eventInvalidatesSessionList, eventInvalidatesSessionSnapshot, messageKey } from "./session-state.js"
 import { overviewRoute, routeToArg, routeToCliArgs, sessionRoute, settingsCredentialsRoute } from "./routes.js"
 import { reexecRuntime } from "./reexec-runtime.js"
+import { NativeSandboxStartupPage, nativeSandboxStartupIssue } from "./native-sandbox-onboarding.js"
 
 
 /** @typedef {import("./stderr-capture.js").StderrCapture} StderrCapture */
@@ -3824,10 +3825,37 @@ export async function runServiceTuiMode(options) {
 		return undefined
 	})
 
-	mountOverview()
+	let startupIssue
+	let startupCheckNotice
+	try {
+		startupIssue = await nativeSandboxStartupIssue()
+	} catch (err) {
+		startupCheckNotice = `native sandbox startup check skipped: ${err?.message ?? err}`
+	}
+	const startupPage = startupIssue
+		? new NativeSandboxStartupPage({
+			issue: startupIssue,
+			requestRender: () => tui.requestRender(),
+		})
+		: undefined
+	const startupDone = startupPage?.start()
+	if (startupPage) root.addChild(startupPage)
+	else mountOverview()
 	tui.addChild(root)
-	tui.setFocus(editor)
+	tui.setFocus(startupPage ?? editor)
 	tui.start()
+	if (startupDone && startupPage) {
+		await startupDone
+		startupPage.dispose()
+		root.clear()
+		mountOverview()
+		tui.setFocus(editor)
+		requestShellRender(true)
+	}
+	if (startupCheckNotice) {
+		table.setNotice(startupCheckNotice)
+		requestShellRender()
+	}
 	void refreshOverviewAuth().catch(() => {})
 	try {
 		await refreshRows()
