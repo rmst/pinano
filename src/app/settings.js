@@ -23,9 +23,9 @@ import { defaultSettingsPath, settingsPath } from "./paths.js"
  * @property {{ input?: number, output?: number, cacheRead?: number, cacheWrite?: number }} [cost]
  * @property {("text" | "image")[]} [input]
  * @property {Record<string, unknown>} [compat]
- * @property {{ implicitResponses?: boolean }} [compaction]
  * @property {"chat" | "responses"} [transport]
- * @property {"default" | "apply_patch"} [toolProfile]
+ * @property {string} [maintenanceModelRef]
+ * @property {"default" | "codex"} [toolProfile]
  * @property {string[]} [tags]
  */
 

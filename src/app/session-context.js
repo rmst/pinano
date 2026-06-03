@@ -1,5 +1,7 @@
-import { messageHasResponsesCompactionItem } from "../responses-compaction.js"
+import { insertContextAfterLatestResponsesCompaction, messageHasResponsesCompactionItem } from "../responses-compaction.js"
+import { modelCompactionHandoffMessage } from "./compaction-summary.js"
 import { buildContextBundleMessage, normalizeContextFiles } from "./context-format.js"
+import { getEffectiveSessionProperties } from "./session-properties.js"
 
 /** @typedef {{ path: string, scopeDir: string, content: string, hash: string }} ContextSnapshotFile */
 
@@ -67,7 +69,7 @@ export function conversationEntriesForModel(session, fromId = undefined) {
 	const entries = (session?.getLogicalEntries?.(fromId) ?? [])
 		.flatMap((entry) => {
 			const message = projectMessage(entry.message)
-			return message ? [{ ...entry, message }] : []
+			return message ? [{ ...entry, message: modelCompactionHandoffMessage(message) }] : []
 		})
 	return pruneBeforeLatestResponsesCompaction(entries)
 }
@@ -80,7 +82,7 @@ export function conversationEntriesForModel(session, fromId = undefined) {
  * @returns {any[]} */
 export function buildModelMessagesWithContextFiles(files, conversationMessages, cwd) {
 	const contextMessage = buildContextBundleMessage([...files], cwd)
-	return contextMessage ? [contextMessage, ...conversationMessages] : [...conversationMessages]
+	return insertContextAfterLatestResponsesCompaction(contextMessage ? [contextMessage] : [], conversationMessages)
 }
 
 /** Build the actual model-visible messages for a session by prefixing the
@@ -90,7 +92,7 @@ export function buildModelMessagesWithContextFiles(files, conversationMessages, 
  * @param {string} [cwd]
  * @returns {any[]} */
 export function buildModelMessagesForSession(session, conversationMessages, cwd = undefined) {
-	const initialCwd = cwd ?? session?.getMetadata?.().cwd ?? process.cwd()
+	const initialCwd = cwd ?? getEffectiveSessionProperties(session).cwd ?? session?.getMetadata?.().cwd ?? process.cwd()
 	return buildModelMessagesWithContextFiles(
 		activeContextFiles(session),
 		conversationMessages,
@@ -109,12 +111,14 @@ export function buildModelMessagesForAgent(agent, conversationMessages = undefin
 	const messages = conversationMessages ?? agent?.state?.messages ?? []
 	if (agent?.session) {
 		const conversation = stripStaleAutomatedMessages(messages)
-		if (contextFilesDisabledForAgent(agent)) return [...conversation]
-		return buildModelMessagesForSession(agent.session, conversation, cwd)
+		const modelConversation = conversation.map(modelCompactionHandoffMessage)
+		if (contextFilesDisabledForAgent(agent)) return modelConversation
+		return buildModelMessagesForSession(agent.session, modelConversation, cwd)
 	}
-	if (contextFilesDisabledForAgent(agent)) return [...messages]
+	const modelMessages = messages.map(modelCompactionHandoffMessage)
+	if (contextFilesDisabledForAgent(agent)) return modelMessages
 	const files = agent?.activeContextSnapshotFiles ?? []
-	return buildModelMessagesWithContextFiles(files, messages, cwd ?? process.cwd())
+	return buildModelMessagesWithContextFiles(files, modelMessages, cwd ?? process.cwd())
 }
 
 /** @param {any} session @param {string} [cwd] */

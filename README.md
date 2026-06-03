@@ -27,30 +27,15 @@ git clone https://github.com/rmst/pinano
 
 On first run, Pinano opens model provider credentials when no provider is configured. Pinano is currently optimized for use with a ChatGPT subscription; **Use your ChatGPT subscription** starts the OpenAI OAuth flow. You can also open this page later with `pinano open /settings/credentials`, `/credentials` from the session overview, or the credentials item inside `/settings`.
 
-API keys are also supported. Pinano can import supported API keys from the launch environment (`OPENAI_API_KEY`, `MOONSHOT_API_KEY`/`KIMI_API_KEY`, `DEEPSEEK_API_KEY`, `LLAMACPP_API_KEY`) or accept manual entry from the credentials page. Deployment-level API key fallbacks can also be configured in `$PINANO_HOME/config/service.json`:
+API keys are also supported. Pinano can import supported API keys from the launch environment (`OPENAI_API_KEY`, `MOONSHOT_API_KEY`/`KIMI_API_KEY`, `DEEPSEEK_API_KEY`, `LLAMACPP_API_KEY`) or accept manual entry from the credentials page. Deployment-level API keys and other settings can also be configured declaratively.
 
-```json
-{
-	"providers": {
-		"openai": { "apiKey": "..." },
-		"moonshot": { "apiKey": "..." },
-		"llamacpp": { "apiKey": "..." },
-		"deepseek": { "apiKey": "..." }
-	}
-}
-```
-
-Launcher/deployment defaults for user settings can be placed in `$PINANO_HOME/config/default-settings.json`. Pinano merges built-in defaults, `default-settings.json`, and user-owned `settings.json` in that order.
 
 ## Common commands
 
 ```bash
 pinano                           # open the session overview
-pinano open /                    # open the session overview
-pinano open /chat/<id>           # open a session
-pinano open /settings/credentials # manage ChatGPT/API-key credentials
+pinano open /chat/<id>           # open a session directly
 pinano service                   # show local service status
-pinano service status --json     # show local service status as JSON
 pinano --help
 ```
 
@@ -65,6 +50,7 @@ Useful keys:
 | `↑` / `↓` | select a session |
 | `Enter` / `→` | open the selected session |
 | `←` | return to the overview |
+| `Ctrl+G` | return to the overview, including while composing text |
 | `Space` | peek at the selected session or reply to it |
 | `Esc` | interrupt an open running session |
 | `Ctrl+X` | stop a selected running session |
@@ -85,13 +71,13 @@ Type `/` to autocomplete. `/help` shows the full command list for the current vi
 | `/model` | select the default model for new sessions |
 | `/reasoning` | set the default reasoning effort for new sessions |
 | `/usage` | show ChatGPT/Codex usage limits |
+| `/debug-log [clear]` | show captured stderr or clear it |
 | `/settings` | edit local settings; includes credentials |
 
 ### Session commands
 
 | Command | What it does |
 |---|---|
-| `/agents`, `/bg`, `/background` | return to the session overview |
 | `/continue` | resume an interrupted turn, or ask the model to continue |
 | `/abort` | abort the current turn |
 | `/session` | show current session metadata |
@@ -100,10 +86,12 @@ Type `/` to autocomplete. `/help` shows the full command list for the current vi
 | `/branch` | create a new session from the current conversation branch |
 | `/rewind` | rewind to an earlier prompt or switch branch |
 | `/context` | show context usage |
-| `/system` | show system prompt, tools, and loaded project context |
-| `/log [clear]` | show captured stderr or clear it |
 
 In an open session, type `!cmd` to run a shell command directly. Use `!!cmd` to run it without adding the result to agent context.
+
+Press `Ctrl+V` in the session or overview editor to paste an image from the system clipboard. On Linux this requires `wl-clipboard` (`wl-paste`) or `xclip`; under WSL, Pinano also opportunistically tries Windows clipboard access through `powershell.exe` interop.
+
+Shell commands run with Pinano's fallback-tool bin directory appended to `PATH`, so real system tools always win. GPT-5.x agents use `exec_command`/`write_stdin` for long-running shell processes, stdin/EOF, polling, and process-group signals; the legacy `bash` tool remains for non-Codex tool profiles and the `!cmd` shortcut. The first fallback tool is `curl`: it covers common HTTP(S) use (`-fsSL`, redirects, headers, data/json/forms, output files, basic auth, TLS files, compression, timeouts, `-w`, `-D`) and exits clearly for unsupported curl options or protocols.
 
 ## Branching and rewind
 
@@ -113,27 +101,42 @@ Press `Esc Esc` on an empty editor to open `/rewind`. You can return to an earli
 
 ## Tool environments
 
-By default tools run locally. You can also configure Docker or SSH environments in `$PINANO_HOME/config/environments.json`:
+By default tools run in a native filesystem sandbox on macOS and Linux. macOS uses `sandbox-exec`; Linux uses Bubblewrap (`bwrap`). Sandbox paths default to `["."]`, resolved against the configured environment `cwd` when one is set, otherwise against the session's initial cwd; later `cwd` changes must stay under one of those paths. Native workers allow reads from sandbox paths plus system, toolchain, Pinano runtime paths, and the environment's tool home, while writes stay restricted to sandbox paths, temp directories, and that tool home. Native sandbox workers use a per-environment fake home under `$PINANO_HOME/environments/<environment-id>/home`; `HOME`, XDG roots, temp variables, and Pinano fallback-tool wrappers all point there so tools share state across projects without writing into project directories. If Linux native sandboxing cannot start because `bwrap` is unavailable or unusable, Pinano fails closed and tells you how to opt into `sandbox.type: "none"` explicitly.
+
+You can also configure explicit local, container, or SSH environments in `$PINANO_HOME/config/environments.json`:
 
 ```json
 {
 	"default": "local",
 	"environments": {
-		"local": { "worker": "local" },
-		"container": {
-			"worker": "docker:pinano-tools",
-			"cwd": "/workspace/project"
+		"local": {
+			"target": "local",
+			"sandbox": {
+				"type": "container",
+				"image": "ghcr.io/example/pinano-tools:latest",
+				"paths": [".", "../shared"]
+			}
+		},
+		"existing-container": {
+			"target": "local",
+			"cwd": "/workspace/project",
+			"sandbox": {
+				"type": "container",
+				"engine": "docker",
+				"container": "pinano-tools"
+			}
 		},
 		"remote": {
-			"worker": "ssh:devbox",
-			"cwd": "/home/me/project"
+			"target": "ssh:devbox",
+			"cwd": "/home/me/project",
+			"sandbox": { "type": "none" }
 		}
 	}
 }
 
 ```
 
-`cwd` is the working directory inside that environment. Pinano does not guess host/container path mappings.
+`target` describes where tools run. `sandbox.type: "native"` uses `sandbox-exec` on macOS and `bwrap` on Linux. `sandbox.type: "container"` with `image` makes Pinano start and own the container; with `container` it execs into an already-running container. Managed containers default to `docker.io/library/node:22-alpine` when no image is set. `sandbox.paths` are writable roots, resolved relative to the environment `cwd` when it is configured and otherwise the session's initial cwd. `sandbox.type: "none"` runs without a Pinano sandbox and should be treated as an explicit unsafe opt-out. The legacy `worker` field is still accepted for existing configs.
 
 ## Project context
 
@@ -162,12 +165,27 @@ See @README for project overview.
 
 ```text
 src/
-  agent-core/        Agent loop and state
-  ai-apis/           OpenAI Chat Completions / Responses / Codex clients
-  tools/             read, write, edit, bash, ls, grep, find, js
-  session-manager/   SQLite + in-memory session storage
-  tui/               terminal UI components
-  app/               CLI, settings, auth, service, overview, chat UI
+  agent-core/        AgentLoop + Agent (streamFn-driven), JSDoc types
+  ai-apis/           zero-dep OpenAI Chat-Completions / Responses / Codex clients
+  tools/             read/view_image, write, edit/apply_patch, exec_command/write_stdin, bash, ls, grep, find, js
+  fallback-tools/    PATH fallbacks for common external commands (currently curl)
+  session-manager/   SQLite + in-memory storage, parent-link tree
+  tui/               ported pi-tui — Markdown renderer restored with vendored
+                     marked, east-asian-width vendored, Intl.Segmenter
+                     polyfilled for [qn](https://github.com/rmst/qn)
+  app/
+    main.js          entry, args, settings/auth wiring
+    agents-mode.js   service-backed agents overview + open chat view
+    components/      footer, picker, prompt-input, transcript message components
+    auth.js          multi-provider credential store
+    models.js        curated model registry
+    settings.js      ~/.pinano/config/settings.json (or $PINANO_HOME/config/)
+    session-store.js wraps Session for app-level open/list/metadata
+    server-db.js     SQLite db + migrations for session transcripts, metadata, and run state
+    server-runtime.js per-session Agent runtimes for Pinano server/web/service mode
+    service-mode.js   local background supervisor service + HTTP/SSE client
+    web-mode.js      browser UI / local server HTTP/SSE routes
+    compaction.js    auto-summarize older messages near context limit
 ```
 
 ## Notes

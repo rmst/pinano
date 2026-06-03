@@ -22,6 +22,11 @@ function toolExecutionMessage(entry) {
 	return data.message
 }
 
+function toolExecutionCallId(entry) {
+	if (entry.type !== "custom" || entry.customType !== "tool_execution") return undefined
+	return entry.data?.toolCallId
+}
+
 function assistantToolCallOrder(message) {
 	if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined
 	const order = new Map()
@@ -57,7 +62,7 @@ function displayMessageForCompactionEntry(entry) {
 export function compactionReplacementEntryId(entryId, replacementMessages, index) {
 	if (replacementMessages.length === 1) return entryId
 	const markerIndex = replacementMessages.reduce(
-		(latest, message, i) => message?.compaction === true ? i : latest,
+		(latest, message, i) => (message?.compaction === true || message?.pinanoCompactionSummary === true) ? i : latest,
 		-1,
 	)
 	const durableIndex = markerIndex >= 0 ? markerIndex : replacementMessages.length - 1
@@ -92,6 +97,7 @@ function reorderToolResultsAfterAssistant(logical) {
 export class Session {
 	constructor(storage) {
 		this.storage = storage
+		this.mutationRunId = null
 	}
 
 	getMetadata() {
@@ -100,6 +106,22 @@ export class Session {
 
 	getLeafId() {
 		return this.storage.getLeafId()
+	}
+
+	getMutationVersion() {
+		return this.storage.getMutationVersion?.() ?? 0
+	}
+
+	setMutationRunId(runId) {
+		this.mutationRunId = typeof runId === "string" && runId ? runId : null
+	}
+
+	clearMutationRunId(runId) {
+		if (!runId || this.mutationRunId === runId) this.mutationRunId = null
+	}
+
+	mutationOptions(options = {}) {
+		return { ...options, runId: options.runId ?? this.mutationRunId ?? undefined }
 	}
 
 	getEntry(id) {
@@ -137,29 +159,30 @@ export class Session {
 	 * against the linear message history. Returns the resulting logical message
 	 * list paired with the entry IDs that produced each message. Normal messages
 	 * keep their real entry ID; compaction replacements keep the compaction entry
-	 * ID on the durable marker (or final fallback message) and synthetic IDs for
-	 * hidden retained mementos. The entry IDs let callers build a Message→EntryId
-	 * map without re-walking the branch.
+	 * ID on the durable model-facing summary/display marker (or final fallback
+	 * message) and synthetic IDs for hidden retained mementos. The entry IDs let
+	 * callers build a Message→EntryId map without re-walking the branch.
 	 *
 	 * Each compaction custom entry carries:
 	 *   - `cutEntryId`: the entry ID at the upper end of the elided range
 	 *     (inclusive). Replaces every logical message from start-of-branch up to
 	 *     and including this entry with the stored replacement context (usually
-	 *     hidden retained user mementos plus a synthetic compaction marker).
+	 *     hidden retained user mementos plus a model-facing compaction summary).
 	 *     `cutEntryId` may itself refer to a previous compaction entry — that's
 	 *     how nested compactions compose.
 	 *   - `replacementContext`: the model-facing replacement messages.
 	 *   - `message`/`displayMessage`: the synthetic assistant marker to show in
-	 *     transcripts (carries summary text, removedCount/keptCount/tokensBefore
-	 *     metadata, the summary-call usage/cost, etc).
+	 *     transcripts (carries summary text, removedCount/mementoCount/keptCount/
+	 *     tokensBefore metadata, the summary-call usage/cost, etc). `keptCount`
+	 *     is provider-native checkpoints preserved verbatim; `mementoCount` is
+	 *     retained real user messages.
 	 *
-	 * `tool_execution` custom entries with `phase: "ended"` carry a durable
-	 * toolResult message. `phase: "recovered_unknown"` carries an explicit error
+	 * Legacy `tool_execution` custom entries with `phase: "ended"` may carry a
+	 * durable toolResult message for crash recovery. New completed-tool markers
+	 * point at the real persisted toolResult instead and are not replayed. A
+	 * `phase: "recovered_unknown"` entry still carries an explicit error
 	 * toolResult synthesized after restart for a tool that had started but whose
-	 * outcome was not durably known. Both replay as synthetic toolResults so the
-	 * normal state machine can continue without repeating side-effecting tools. If
-	 * the real toolResult message is present later on the branch, it replaces the
-	 * synthetic copy.
+	 * outcome was not durably known.
 	 *
 	 * If a compaction entry's `cutEntryId` isn't found in the current logical list
 	 * (corrupted state, manual edit), the patch is skipped defensively — replay
@@ -177,6 +200,9 @@ export class Session {
 	 */
 	projectEntries(fromId, options) {
 		const branch = this.getBranch(fromId)
+		const realToolResultCallIds = new Set(branch
+			.filter((entry) => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolCallId)
+			.map((entry) => entry.message.toolCallId))
 		/** @type {Array<{ message: any, entryId: string }>} */
 		let projected = []
 		const syntheticToolResultByCallId = new Map()
@@ -227,6 +253,8 @@ export class Session {
 					if (message) projected.push({ message, entryId: entry.id })
 				}
 			} else {
+				const toolCallId = toolExecutionCallId(entry)
+				if (toolCallId && realToolResultCallIds.has(toolCallId)) continue
 				const message = toolExecutionMessage(entry)
 				if (message?.role === "toolResult" && !syntheticToolResultByCallId.has(message.toolCallId)) {
 					syntheticToolResultByCallId.set(message.toolCallId, projected.length)
@@ -248,7 +276,7 @@ export class Session {
 			.filter(Boolean)
 	}
 
-	async appendContextLoad(load) {
+	async appendContextLoad(load, options = {}) {
 		const entry = {
 			type: "context",
 			id: this.storage.createEntryId(),
@@ -262,15 +290,15 @@ export class Session {
 				files: (load.files ?? []).map(normalizeContextFile),
 			},
 		}
-		await this.storage.appendEntry(entry)
+		await this.storage.appendEntry(entry, this.mutationOptions(options))
 		return entry.id
 	}
 
-	async appendConfigPatch(data) {
-		return this.appendCustomEntry("config", data)
+	async appendConfigPatch(data, options = {}) {
+		return this.appendCustomEntry("config", data, options)
 	}
 
-	async appendMessage(message) {
+	async appendMessage(message, options = {}) {
 		const entry = {
 			type: "message",
 			id: this.storage.createEntryId(),
@@ -278,11 +306,11 @@ export class Session {
 			timestamp: new Date().toISOString(),
 			message,
 		}
-		await this.storage.appendEntry(entry)
+		await this.storage.appendEntry(entry, this.mutationOptions(options))
 		return entry.id
 	}
 
-	async appendLabel(targetId, label) {
+	async appendLabel(targetId, label, options = {}) {
 		if (!this.storage.getEntry(targetId)) throw new Error(`Entry ${targetId} not found`)
 		const entry = {
 			type: "label",
@@ -292,11 +320,11 @@ export class Session {
 			targetId,
 			label,
 		}
-		await this.storage.appendEntry(entry)
+		await this.storage.appendEntry(entry, this.mutationOptions(options))
 		return entry.id
 	}
 
-	async appendCustomEntry(customType, data) {
+	async appendCustomEntry(customType, data, options = {}) {
 		const entry = {
 			type: "custom",
 			id: this.storage.createEntryId(),
@@ -305,7 +333,7 @@ export class Session {
 			customType,
 			data,
 		}
-		await this.storage.appendEntry(entry)
+		await this.storage.appendEntry(entry, this.mutationOptions(options))
 		return entry.id
 	}
 
@@ -313,7 +341,7 @@ export class Session {
 	 * Move the leaf to `entryId` (or `null` for the root). Subsequent appends
 	 * branch off from there.
 	 */
-	moveTo(entryId) {
-		this.storage.setLeafId(entryId)
+	moveTo(entryId, options = {}) {
+		this.storage.setLeafId(entryId, this.mutationOptions(options))
 	}
 }

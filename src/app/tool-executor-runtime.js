@@ -2,7 +2,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { markUncertainToolExecution } from "../agent-core/tool-errors.js"
-import { resolveExecutionEnvironment } from "./environments.js"
+import { resolveExecutionEnvironment, resolveSandboxRootCwd } from "./environments.js"
 import { recordFileCheckpoint } from "./file-checkpoints.js"
 import { JsonLineRpc } from "./json-rpc-lines.js"
 import { getEffectiveSessionProperties } from "./session-properties.js"
@@ -11,6 +11,11 @@ import { WORKER_PROTOCOL_VERSION, assertWorkerProtocolVersion } from "./worker-p
 
 const here = dirname(fileURLToPath(import.meta.url))
 const defaultToolWorkerPath = join(here, "tool-worker.js")
+
+function sandboxFallbackCwd(session, fallbackCwd) {
+	const config = session?.getSessionConfig?.() ?? {}
+	return config.worktree ?? config.cwd ?? session?.getMetadata?.()?.cwd ?? fallbackCwd
+}
 
 class ToolWorkerConnection {
 	/**
@@ -55,7 +60,7 @@ class ToolWorkerConnection {
 	}
 
 	async startWorker() {
-		const handle = await this.launcher.start({ cwd: this.startCwd, workerPath: this.workerPath })
+		const handle = await this.launcher.start({ cwd: this.startCwd, environmentId: this.environmentId, workerPath: this.workerPath })
 		if (this.dead) {
 			handle.stop?.()
 			throw new Error("Tool executor was disposed before startup completed")
@@ -115,17 +120,17 @@ class ToolWorkerConnection {
 	 * @param {string} cwd
 	 * @param {AbortSignal | undefined} signal
 	 * @param {(update: any) => void} [onUpdate]
-	 * @param {{ scope?: any, environmentId?: string, toolProfile?: "default" | "apply_patch" }} [options]
+	 * @param {{ scope?: any, environmentId?: string, toolProfile?: "default" | "codex" }} [options]
 	 */
 	async executeTool(name, id, args, cwd, signal, onUpdate, options = {}) {
-		if (this.dead) throw markUncertainToolExecution(new Error("Tool executor is not running"))
+		if (this.dead) throw new Error("Tool executor is not running")
 		try {
 			await this.ready
 		} catch (error) {
-			if (error instanceof Error) throw markUncertainToolExecution(error)
 			throw error
 		}
 		if (signal?.aborted) throw new Error("Operation aborted")
+		this.workerHandle?.assertCwdAllowed?.(cwd)
 		if (onUpdate) this.pendingToolUpdates.set(id, onUpdate)
 		const cancel = () => {
 			this.rpc.request("cancelTool", { id }).catch(() => {})
@@ -195,6 +200,7 @@ export class ToolExecutorRuntime {
 		this.workerPath = options.workerPath ?? defaultToolWorkerPath
 		this.environmentRegistry = options.environmentRegistry
 		this.workers = new Map()
+		this.startCwds = new Map()
 		this.disposed = false
 		this.lastWorker = undefined
 		this.ready = Promise.resolve()
@@ -219,11 +225,19 @@ export class ToolExecutorRuntime {
 		const registry = this.environmentRegistry?.()
 		const session = this.getSession()
 		const props = session ? getEffectiveSessionProperties(session) : undefined
-		return resolveExecutionEnvironment(props, this.cwd, registry)
+		const target = resolveExecutionEnvironment(props, this.cwd, registry)
+		const sandboxRootCwd = resolveSandboxRootCwd(props, sandboxFallbackCwd(session, this.cwd), registry)
+		const sessionId = session?.getMetadata?.()?.id
+		return { ...target, sandboxRootCwd, workerScope: sessionId ? `session:${sessionId}` : "runtime" }
 	}
 
 	async workerFor(target) {
-		const key = `${target.environmentId}\0${target.worker}`
+		const key = `${target.workerScope}\0${target.environmentId}\0${JSON.stringify(target.target)}\0${JSON.stringify(target.sandbox)}`
+		let startCwd = target.cwd
+		if (target.sandbox?.type && target.sandbox.type !== "none") {
+			if (!this.startCwds.has(key)) this.startCwds.set(key, target.sandboxRootCwd ?? target.cwd)
+			startCwd = this.startCwds.get(key)
+		}
 		const existing = this.workers.get(key)
 		if (existing && !existing.dead) {
 			this.lastWorker = existing
@@ -235,8 +249,8 @@ export class ToolExecutorRuntime {
 		}
 		const worker = new ToolWorkerConnection({
 			environmentId: target.environmentId,
-			startCwd: target.cwd,
-			launcher: this.fixedWorkerLauncher ?? createWorkerLauncher(target.worker),
+			startCwd,
+			launcher: this.fixedWorkerLauncher ?? createWorkerLauncher({ target: target.target, sandbox: target.sandbox }),
 			workerPath: this.workerPath,
 			getSession: this.getSession,
 			pinanoApiRequest: this.pinanoApiRequest,
@@ -253,10 +267,10 @@ export class ToolExecutorRuntime {
 	 * @param {any} args
 	 * @param {AbortSignal | undefined} signal
 	 * @param {(update: any) => void} [onUpdate]
-	 * @param {{ scope?: any, toolProfile?: "default" | "apply_patch" }} [options]
+	 * @param {{ scope?: any, toolProfile?: "default" | "codex" }} [options]
 	 */
 	async executeTool(name, id, args, signal, onUpdate, options = {}) {
-		if (this.disposed) throw markUncertainToolExecution(new Error("Tool executor is not running"))
+		if (this.disposed) throw new Error("Tool executor is not running")
 		const target = this.resolveTarget()
 		const worker = await this.workerFor(target)
 		return worker.executeTool(name, id, args, target.cwd, signal, onUpdate, {

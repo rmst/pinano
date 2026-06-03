@@ -14,12 +14,6 @@ import { beginModelRequest, finishModelRequest } from "./model-io-log.js"
 import { executeResponsesRequest } from "./responses-transport.js"
 import { retryableModelErrorDetails } from "./model-errors.js"
 import { buildAssistantAuth, emptyUsage } from "./usage.js"
-import {
-	disableImplicitResponsesCompaction,
-	isUnsupportedImplicitResponsesCompactionError,
-	responsesCompactThreshold,
-	supportsImplicitResponsesCompaction,
-} from "../responses-compaction.js"
 
 function buildUrl(baseUrl) {
 	const trimmed = (baseUrl ?? "").replace(/\/+$/, "")
@@ -65,10 +59,6 @@ function buildBody(model, context, options) {
 	const textVerbosity = model.supportsTextVerbosity === false ? undefined : options?.textVerbosity ?? model.defaultTextVerbosity
 	if (textVerbosity !== undefined) body.text = { verbosity: textVerbosity }
 	if (options?.sessionId) body.prompt_cache_key = options.sessionId
-	if (!options?.disableImplicitResponsesCompaction && supportsImplicitResponsesCompaction(model)) {
-		const compactThreshold = responsesCompactThreshold(model, options?.autocompactThreshold)
-		if (compactThreshold) body.context_management = [{ type: "compaction", compact_threshold: compactThreshold }]
-	}
 	return body
 }
 
@@ -133,19 +123,7 @@ export function streamOpenAIResponses(model, context, options) {
 				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,
 				streamInactivityTimeoutMs: options?.streamInactivityTimeoutMs,
 			})
-			try {
-				await execute(bodyJson)
-			} catch (error) {
-				const canRetryWithoutCompaction = output.content.length === 0
-					&& !output.responseId
-					&& body.context_management
-					&& isUnsupportedImplicitResponsesCompactionError(error)
-				if (!canRetryWithoutCompaction) throw error
-				disableImplicitResponsesCompaction(model)
-				const fallbackBody = { ...body }
-				delete fallbackBody.context_management
-				await execute(JSON.stringify(fallbackBody))
-			}
+			await execute(bodyJson)
 
 			if (options?.signal?.aborted) throw new Error("Request was aborted")
 			if (output.stopReason === "error") {

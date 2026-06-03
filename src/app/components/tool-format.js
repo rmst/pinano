@@ -149,6 +149,41 @@ function fmtBash(args, options) {
  * @param {any} args
  * @returns {string}
  */
+function fmtExecCommand(args, options) {
+	const cmd = pickStr(args?.cmd)
+	const display = cmd === null ? dimNote("(missing cmd)") : cmd ? arg(oneLine(cmd)) : dimNote("...")
+	let out = `${title("exec", options)} ${display}`
+	const notes = []
+	if (typeof args?.yield_time_ms === "number") notes.push(`yield ${args.yield_time_ms}ms`)
+	if (typeof args?.timeout_ms === "number") notes.push(`timeout ${args.timeout_ms}ms`)
+	if (typeof args?.max_output_tokens === "number") notes.push(`max ${args.max_output_tokens}t`)
+	if (typeof args?.interactive === "string" && args.interactive !== "none") notes.push(args.interactive)
+	if (typeof args?.workdir === "string") notes.push(formatToolPath(args.workdir))
+	if (notes.length > 0) out += dimNote(` (${notes.join(", ")})`)
+	return out
+}
+
+/**
+ * @param {any} args
+ * @returns {string}
+ */
+function fmtWriteStdin(args, options) {
+	const rawSessionId = args?.session_id
+	const sessionId = typeof rawSessionId === "number" && Number.isInteger(rawSessionId) ? String(rawSessionId) : pickStr(rawSessionId)
+	const actions = []
+	if (typeof args?.chars === "string" && args.chars.length > 0) actions.push(`${args.chars.length} chars`)
+	if (args?.close_stdin === true) actions.push("close stdin")
+	if (typeof args?.signal === "string") actions.push(args.signal)
+	if (actions.length === 0) actions.push("poll")
+	let out = `${title("write_stdin", options)} ${sessionId === null ? dimNote("(missing session_id)") : arg(sessionId)}`
+	out += dimNote(` (${actions.join(", ")})`)
+	return out
+}
+
+/**
+ * @param {any} args
+ * @returns {string}
+ */
 function fmtLs(args, options) {
 	const path = pickStr(args?.path) ?? "."
 	let out = `${title("ls", options)} ${arg(formatToolPath(path))}`
@@ -202,6 +237,8 @@ const REGISTRY = {
 	write: fmtWrite,
 	apply_patch: fmtApplyPatch,
 	edit: fmtEdit,
+	exec_command: fmtExecCommand,
+	write_stdin: fmtWriteStdin,
 	bash: fmtBash,
 	ls: fmtLs,
 	grep: fmtGrep,

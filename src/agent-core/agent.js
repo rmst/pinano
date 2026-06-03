@@ -2,6 +2,7 @@
 // steering and follow-up messages, abort signals, and event subscriptions.
 
 import { emptyUsage } from "../ai-apis/usage.js"
+import { promptContentWithImages } from "../prompt-images.js"
 import { nextAgentAction, runAgentLoop, runAgentLoopContinue } from "./agent-loop.js"
 import { streamSimple as defaultStreamFn } from "./stream-adapter.js"
 
@@ -126,6 +127,7 @@ export class Agent {
 		this.onResponse = options.onResponse
 		this.beforeToolCall = options.beforeToolCall
 		this.afterToolCall = options.afterToolCall
+		this.modelForRequest = options.modelForRequest
 		this.automatedFollowUp = options.automatedFollowUp
 		/** Optional app-level hook for durable context-load entries. Agent core does not emit these itself; Pinano's lazy context loader calls it after recording a context entry. @type {((entry: any) => void | Promise<void>) | undefined} */
 		this.onContextLoad = options.onContextLoad
@@ -251,7 +253,11 @@ export class Agent {
 	softInterrupt() {
 		if (!this.activeRun) return "idle"
 		this.softStopRequested = true
-		return this._state.pendingToolCalls.size > 0 ? "waiting_for_tools" : "waiting_for_model_stream"
+		if (this._state.pendingToolCalls.size === 0) {
+			this.activeRun.abortController.abort()
+			return "interrupted_stream"
+		}
+		return "waiting_for_tools"
 	}
 
 	waitForIdle() {
@@ -330,8 +336,7 @@ export class Agent {
 	normalizePromptInput(input, images) {
 		if (Array.isArray(input)) return input
 		if (typeof input !== "string") return [input]
-		const content = [{ type: "text", text: input }]
-		if (images && images.length > 0) content.push(...images)
+		const content = promptContentWithImages(input, images)
 		return [{ role: "user", content, timestamp: Date.now() }]
 	}
 
@@ -427,6 +432,7 @@ export class Agent {
 			getApiKey: this.getApiKey,
 			onPayload: this.onPayload,
 			onResponse: this.onResponse,
+			modelForRequest: this.modelForRequest,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: options.afterToolCall,
 			automatedFollowUp: undefined,
@@ -459,6 +465,7 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			modelForRequest: this.modelForRequest,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,

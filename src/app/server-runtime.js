@@ -8,7 +8,7 @@ import { messageHasRetryableModelError } from "../ai-apis/model-errors.js"
 import { contextLoadDisplayMessage } from "../session-manager/context-display.js"
 import { normalizeReasoningLevel } from "../reasoning.js"
 import { isModelIoLogEnabled } from "../ai-apis/model-io-log.js"
-import { PROJECT_CONTEXT_HEADING, ensureProjectContextMessage, isProjectContextMessage } from "./project-context.js"
+import { ensureProjectContextMessage, isProjectContextMessage, loadProjectContextForCwd } from "./project-context.js"
 import { compact, summarizeMessages } from "./compaction.js"
 import { systemPromptFor } from "./agent-factory.js"
 import { toolProfileForModel } from "./model-instructions.js"
@@ -21,7 +21,12 @@ import { handleFastCommand } from "./fast-mode.js"
 import { createPinanoJsApi } from "./pinano-js-api.js"
 import { restoreFilesToCheckpoint, appendFileRestoreEntry, deleteFileCheckpoints, fileCheckpointsForRestore } from "./file-checkpoints.js"
 import { messageKey } from "./session-state.js"
-import { buildModelMessagesForSession, contextFilesDisabledForAgent, conversationEntriesForModel } from "./session-context.js"
+import { activeContextFiles, buildModelMessagesForSession, contextFilesDisabledForAgent, conversationEntriesForModel } from "./session-context.js"
+import { environmentContextFor, prependEnvironmentContext } from "./environment-context.js"
+import { summarizeContext } from "./context-summary.js"
+import { formatContextReport } from "./context-report.js"
+import { formatSystemReport } from "./project-context-display.js"
+import { isPromptImageMarkerText, promptContentWithImages } from "../prompt-images.js"
 import {
 	SESSION_CUSTOM_TYPE_PROPERTIES,
 	SESSION_MODEL_WRITABLE_STATES,
@@ -59,7 +64,7 @@ const MODEL_RETRY_BASE_DELAY_MS = 1000
  * @param {{ retainedMaintenanceToolCallIds?: Set<string> }} [options]
  */
 export function projectVisibleMessage(message, options = {}) {
-	if (!message || isProjectContextMessage(message) || message.pinanoCompactionMemento) return undefined
+	if (!message || isProjectContextMessage(message) || message.pinanoCompactionMemento || message.pinanoCompactionSummary) return undefined
 	if (!message.pinanoAutomated && !message.pinanoMaintenance) return message
 	const retainedToolCallIds = options.retainedMaintenanceToolCallIds
 	if (message.role === "assistant") {
@@ -108,8 +113,17 @@ export function textFromContent(content) {
 	if (!Array.isArray(content)) return ""
 	return /** @type {any[]} */ (content)
 		.filter((block) => block?.type === "text")
+		.filter((block) => !isPromptImageMarkerText(block.text ?? ""))
 		.map((block) => block.text || "")
 		.join("")
+}
+
+/** @param {unknown} content */
+export function imageBlocksFromContent(content) {
+	if (!Array.isArray(content)) return []
+	return /** @type {any[]} */ (content)
+		.filter((block) => block?.type === "image")
+		.map((block) => ({ ...block }))
 }
 
 /** @param {string} value @param {number} max */
@@ -123,6 +137,15 @@ export function isShortCompletionConfirmation(text) {
 	if (!normalized) return false
 	const wordCount = normalized.split(/\s+/).length
 	return wordCount < 20 && (/\bdone\b/.test(normalized) || /\ball set\b/.test(normalized))
+}
+
+/** @param {any[]} messages */
+function sessionPropertiesMaintenanceExchangeActive(messages) {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i]
+		if (message?.role === "user") return isAutomatedMaintenanceMessage(message) && message.pinanoMaintenance === SESSION_CUSTOM_TYPE_PROPERTIES
+	}
+	return false
 }
 
 /** @param {string} cwd */
@@ -356,11 +379,12 @@ export class SessionRuntime {
 	 * @param {ServerDb} options.db
 	 * @param {(event: any) => void} options.emit
 	 * @param {() => Promise<any[]>} options.sessions
-	 * @param {(sessionId: string) => Promise<void>} options.sendSnapshot
+	 * @param {(sessionId: string) => Promise<void>} options.invalidateSnapshot
 	 * @param {() => number} options.nextEventSeq
 	 * @param {() => number} options.getEventSeq
 	 * @param {() => number} options.getViewEpoch
 	 * @param {() => number} options.bumpViewEpoch
+	 * @param {() => { models?: Record<string, any> }} [options.getSettings]
 	 * @param {{ span?: (name: string, args?: Record<string, any>) => (extraArgs?: Record<string, any>) => void }} [options.diagnostics]
 	 */
 	constructor(options) {
@@ -371,11 +395,12 @@ export class SessionRuntime {
 		this.db = options.db
 		this.emit = options.emit
 		this.sessions = options.sessions
-		this.sendSnapshot = options.sendSnapshot
+		this.invalidateSnapshot = options.invalidateSnapshot
 		this.nextEventSeqValue = options.nextEventSeq
 		this.getEventSeq = options.getEventSeq
 		this.getViewEpoch = options.getViewEpoch
 		this.bumpViewEpoch = options.bumpViewEpoch
+		this.getSettings = options.getSettings
 		this.diagnostics = options.diagnostics
 		this.currentRunId = null
 		this.finishedRunIds = new Set()
@@ -396,8 +421,15 @@ export class SessionRuntime {
 		this.visibleMaintenanceToolCallIds = new Set()
 		this.installPinanoApi(this.agent)
 		this.installAutomatedMaintenanceToolGuard(this.agent)
+		const existingModelForRequest = this.agent.modelForRequest
+		this.agent.modelForRequest = (ctx) => {
+			const maintenanceModel = this.maintenanceModelForRequest(ctx)
+			if (maintenanceModel) return maintenanceModel
+			return existingModelForRequest?.call(this.agent, ctx)
+		}
 		this.agent.automatedFollowUp = (ctx) => this.automatedMaintenanceFollowUp(ctx)
 		this.agent.onContextLoad = (entry) => this.handleContextLoad(entry)
+		this.agent.pinanoEnvironmentContext = () => this.environmentContext()
 		this.hydrateAgentFromSession()
 		this.unsubscribe = this.agent.subscribe(async (event) => {
 			const end = this.diagnostics?.span?.("SessionRuntime.handleAgentEvent", {
@@ -479,6 +511,16 @@ export class SessionRuntime {
 		return getEffectiveSessionProperties(this.session)
 	}
 
+	environmentContext() {
+		const props = this.effectiveSessionProperties()
+		const config = this.session.getSessionConfig?.() ?? {}
+		return environmentContextFor({
+			cwd: props.cwd ?? this.cwd,
+			initialCwd: config.worktree ?? config.cwd ?? this.session.getMetadata?.()?.cwd ?? this.cwd,
+			environmentId: props.environmentId,
+		})
+	}
+
 	refreshSessionPropertyCache(options = {}) {
 		const props = this.effectiveSessionProperties()
 		if (props.cwd && props.cwd !== this.cwd) {
@@ -489,6 +531,16 @@ export class SessionRuntime {
 		this.db.setAgentViewMetadata(this.sessionId, metadata)
 		this.emitRuntimeEvent({ type: "agent_view_metadata", metadata, source: options.source })
 		return props
+	}
+
+	async appendCwdContextLoad(cwd) {
+		if (!cwd || contextFilesDisabledForAgent(this.agent)) return
+		const loadedPaths = new Set(activeContextFiles(this.session).map((file) => file.path))
+		const files = loadProjectContextForCwd(cwd).filter((file) => !loadedPaths.has(file.path))
+		if (files.length === 0) return
+		const load = { source: "cwd", cwd, loadedAt: new Date().toISOString(), files }
+		const entryId = await this.session.appendContextLoad(load)
+		this.handleContextLoad({ entryId, timestamp: load.loadedAt, contextLoad: load })
 	}
 
 	async appendSessionPropertyPatch(patch, source = undefined) {
@@ -528,7 +580,9 @@ export class SessionRuntime {
 			updatedAt,
 			source,
 		})
-		return writeResult(this.refreshSessionPropertyCache({ source }))
+		const properties = this.refreshSessionPropertyCache({ source })
+		if (Object.prototype.hasOwnProperty.call(changed, "cwd")) await this.appendCwdContextLoad(properties.cwd)
+		return writeResult(properties)
 	}
 
 	/** @param {any} scope @param {string} id */
@@ -557,7 +611,7 @@ export class SessionRuntime {
 				if (Object.prototype.hasOwnProperty.call(request.patch.overview, "projectTag")) patch.projectTag = request.patch.overview.projectTag
 			}
 			const write = await this.appendSessionPropertyPatch(patch, request.source ?? { kind: "api" })
-			await this.sendSnapshot(this.sessionId)
+			await this.invalidateSnapshot(this.sessionId)
 			const info = this.pinanoSessionInfo(id)
 			if (!info) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 			return { ...info, sessionWrite: write }
@@ -672,39 +726,6 @@ export class SessionRuntime {
 				end?.()
 			}
 		}
-		if (event.type === "tool_execution_end") {
-			const message = {
-				role: "toolResult",
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				content: event.result?.content ?? [],
-				details: event.result?.details ?? {},
-				isError: event.isError,
-				timestamp: Date.now(),
-				...(this.automatedMaintenanceTurnActive ? { pinanoAutomated: true } : {}),
-			}
-			const end = this.diagnostics?.span?.("SessionRuntime.appendCustomEntry", {
-				sessionId: this.sessionId,
-				customType: "tool_execution",
-				phase: "ended",
-				toolName: event.toolName,
-				isError: event.isError,
-			})
-			try {
-				await this.session.appendCustomEntry("tool_execution", {
-					version: 1,
-					phase: "ended",
-					runId: this.currentRunId,
-					toolCallId: event.toolCallId,
-					toolName: event.toolName,
-					result: event.result,
-					isError: event.isError,
-					message,
-				})
-			} finally {
-				end?.()
-			}
-		}
 		if (event.type === "message_end") {
 			const endAppend = this.diagnostics?.span?.("SessionRuntime.appendMessage", {
 				sessionId: this.sessionId,
@@ -718,6 +739,29 @@ export class SessionRuntime {
 			}
 			if (id) this.agent.msgToEntryId.set(/** @type {any} */ (event.message), id)
 			emitEvent = { ...emitEvent, entryId: id, message: id ? { ...emitEvent.message, entryId: id } : emitEvent.message }
+			if (event.message?.role === "toolResult" && event.message.toolCallId) {
+				const end = this.diagnostics?.span?.("SessionRuntime.appendCustomEntry", {
+					sessionId: this.sessionId,
+					customType: "tool_execution",
+					phase: "ended",
+					toolName: event.message.toolName,
+					isError: event.message.isError,
+				})
+				try {
+					await this.session.appendCustomEntry("tool_execution", {
+						version: 2,
+						phase: "ended",
+						runId: this.currentRunId,
+						toolCallId: event.message.toolCallId,
+						toolName: event.message.toolName,
+						isError: event.message.isError,
+						messageEntryId: id,
+						hasDurableMessage: true,
+					})
+				} finally {
+					end?.()
+				}
+			}
 			if (event.message?.role === "user" || event.message?.role === "assistant") {
 				const endActivity = this.diagnostics?.span?.("SessionRuntime.sessionActivityAt", {
 					sessionId: this.sessionId,
@@ -773,16 +817,23 @@ export class SessionRuntime {
 		}
 		if (event.type === "message_end" && event.message?.role === "assistant") this.streamingAssistantMessageId = null
 		if (event.type === "agent_end") {
-			const endSnapshot = this.diagnostics?.span?.("SessionRuntime.sendSnapshot", {
+			const endInvalidation = this.diagnostics?.span?.("SessionRuntime.invalidateSnapshot", {
 				sessionId: this.sessionId,
 				reason: "agent_end",
 			})
 			try {
-				await this.sendSnapshot(this.sessionId)
+				await this.invalidateSnapshot(this.sessionId)
 			} finally {
-				endSnapshot?.()
+				endInvalidation?.()
 			}
 		}
+	}
+
+	maintenanceModelForRequest(ctx) {
+		if (!sessionPropertiesMaintenanceExchangeActive(ctx?.context?.messages ?? [])) return undefined
+		const ref = this.agent.state.model?.maintenanceModelRef
+		if (!ref) return undefined
+		return resolveModel(ref, { models: this.getSettings?.()?.models })
 	}
 
 	automatedMaintenanceFollowUp(ctx) {
@@ -804,7 +855,7 @@ export class SessionRuntime {
 		if (!visibleMessage(message)) return
 		this.bumpViewEpoch()
 		this.emitRuntimeEvent({ type: "compaction", message })
-		await this.sendSnapshot(this.sessionId)
+		await this.invalidateSnapshot(this.sessionId)
 	}
 
 	finishRunFromAgentEnd(event) {
@@ -820,6 +871,7 @@ export class SessionRuntime {
 		this.db.finishRun(runId, { status, error: errorMessage, stopReason })
 		this.finishedRunIds.add(runId)
 		this.currentRunId = null
+		this.session.clearMutationRunId(runId)
 	}
 
 	finishRunFromFailure(runId, err) {
@@ -831,6 +883,7 @@ export class SessionRuntime {
 		})
 		this.finishedRunIds.add(runId)
 		if (this.currentRunId === runId) this.currentRunId = null
+		this.session.clearMutationRunId(runId)
 	}
 
 	isStreaming() {
@@ -855,6 +908,40 @@ export class SessionRuntime {
 			.filter(Boolean)
 	}
 
+	contextMessages(logicalEntries = conversationEntriesForModel(this.session)) {
+		const messages = logicalEntries.map((entry) => entry.message)
+		const contextMessages = contextFilesDisabledForAgent(this.agent)
+			? messages
+			: buildModelMessagesForSession(this.session, messages)
+		return prependEnvironmentContext(this.environmentContext(), contextMessages)
+	}
+
+	contextStats(contextMessages) {
+		return summarizeContext({
+			messages: contextMessages,
+			systemPrompt: this.agent.state.systemPrompt,
+			tools: this.agent.state.tools,
+		})
+	}
+
+	contextReport() {
+		const messages = this.contextMessages()
+		return formatContextReport({
+			messages,
+			systemPrompt: this.agent.state.systemPrompt,
+			tools: this.agent.state.tools,
+			model: this.agent.state.model,
+		})
+	}
+
+	systemReport() {
+		return formatSystemReport({
+			systemPrompt: this.agent.state.systemPrompt,
+			tools: this.agent.state.tools,
+			messages: this.contextMessages(),
+		})
+	}
+
 	async snapshot(options = {}) {
 		this.touch()
 		let logicalEntries
@@ -876,12 +963,11 @@ export class SessionRuntime {
 		let contextMessages
 		const endContext = this.diagnostics?.span?.("SessionRuntime.snapshot.contextMessages", { sessionId: this.sessionId })
 		try {
-			contextMessages = contextFilesDisabledForAgent(this.agent)
-				? logicalEntries.map((entry) => entry.message)
-				: buildModelMessagesForSession(this.session, logicalEntries.map((entry) => entry.message))
+			contextMessages = this.contextMessages(logicalEntries)
 		} finally {
 			endContext?.({ count: contextMessages?.length ?? 0 })
 		}
+		const contextStats = this.contextStats(contextMessages)
 		const endPayload = this.diagnostics?.span?.("SessionRuntime.snapshot.payload", { sessionId: this.sessionId })
 		const properties = this.effectiveSessionProperties()
 		const streamingMessage = projectVisibleMessage(this.agent.state.streamingMessage)
@@ -907,21 +993,34 @@ export class SessionRuntime {
 			sessionProperties: properties,
 			promptDraft: this.db.getPromptDraft(this.sessionId),
 			messages: visibleDisplayEntries.map((entry) => ({ ...entry.message, entryId: entry.entryId })),
-			contextMessages: contextMessages.map((message) => ({ ...message, entryId: message.entryId ?? "context" })),
+			contextStats,
 			streamingMessage: streamingMessage
 				? { ...streamingMessage, messageId: this.streamingAssistantMessageId }
 				: null,
 		}
-		endPayload?.({ messages: snapshot.messages.length, contextMessages: snapshot.contextMessages.length })
+		if (options.includeContextMessages) snapshot.contextMessages = contextMessages.map((message) => ({ ...message, entryId: message.entryId ?? "context" }))
+		endPayload?.({ messages: snapshot.messages.length, contextMessages: contextStats.messageCount, includeContextMessages: options.includeContextMessages === true })
 		if (options.includeSessions) snapshot.sessions = await this.sessions()
 		return snapshot
 	}
 
+	snapshotCursor() {
+		return {
+			seq: this.getEventSeq(),
+			viewEpoch: this.getViewEpoch(),
+		}
+	}
+
 	startRunRecord() {
 		const runId = randomUUID()
-		this.currentRunId = runId
+		this.db.startRun({
+			id: runId,
+			sessionId: this.sessionId,
+			expectedMutationVersion: this.session.getMutationVersion(),
+		})
 		this.finishedRunIds.delete(runId)
-		this.db.startRun({ id: runId, sessionId: this.sessionId })
+		this.currentRunId = runId
+		this.session.setMutationRunId(runId)
 		return runId
 	}
 
@@ -941,7 +1040,7 @@ export class SessionRuntime {
 		} catch (err) {
 			this.finishRunFromFailure(retry.runId, err)
 			this.emitRuntimeEvent({ type: "error", error: /** @type {any} */ (err)?.message ?? String(err) })
-			this.sendSnapshot(this.sessionId).catch(() => {})
+			this.invalidateSnapshot(this.sessionId).catch(() => {})
 			return
 		}
 
@@ -977,7 +1076,7 @@ export class SessionRuntime {
 			})
 		} catch (err) {
 			this.emitRuntimeEvent({ type: "error", error: /** @type {any} */ (err)?.message ?? String(err) })
-			this.sendSnapshot(this.sessionId).catch(() => {})
+			this.invalidateSnapshot(this.sessionId).catch(() => {})
 		}
 	}
 
@@ -1030,14 +1129,15 @@ export class SessionRuntime {
 		}
 		this.monitorRunForModelRetry(run, { runId }).catch((err) => {
 			this.emitRuntimeEvent({ type: "error", error: /** @type {any} */ (err)?.message ?? String(err) })
-			this.sendSnapshot(this.sessionId).catch(() => {})
+			this.invalidateSnapshot(this.sessionId).catch(() => {})
 		})
 		return { accepted }
 	}
 
-	async prompt(message, streamingBehavior) {
+	async prompt(message, streamingBehavior, images = []) {
 		this.touch()
-		const userMessage = { role: "user", content: [{ type: "text", text: message }], timestamp: Date.now() }
+		const content = promptContentWithImages(message, images)
+		const userMessage = { role: "user", content, timestamp: Date.now() }
 		const { accepted, streamingBehavior: acceptedStreamingBehavior } = await this.enqueueTurnStart(async () => {
 			if (this.agent.state.isStreaming) return this.startStreamingPrompt(userMessage, streamingBehavior)
 			await this.agent.waitForIdle()
@@ -1097,7 +1197,11 @@ export class SessionRuntime {
 
 	async prepareContinuationState() {
 		await this.reconcileUnknownToolExecutions()
-		this.rewindFailedAssistantTail()
+		if (this.rewindFailedAssistantTail()) {
+			this.bumpViewEpoch()
+			this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
+			await this.invalidateSnapshot(this.sessionId)
+		}
 		return deriveSessionRunState(this.session)
 	}
 
@@ -1122,7 +1226,7 @@ export class SessionRuntime {
 		const monitored = this.monitorRunForModelRetry(run, { runId, ...(options.retry ?? {}) })
 		if (!options.waitForCompletion) monitored.catch((err) => {
 			this.emitRuntimeEvent({ type: "error", error: /** @type {any} */ (err)?.message ?? String(err) })
-			this.sendSnapshot(this.sessionId).catch(() => {})
+			this.invalidateSnapshot(this.sessionId).catch(() => {})
 		})
 		return { monitored }
 	}
@@ -1153,11 +1257,11 @@ export class SessionRuntime {
 		this.touch()
 		const prompt = this.currentPrompt
 		if (!this.agent.state.isStreaming) {
-			return { ok: true, cancelled: false, reason: "not_streaming", snapshot: await this.snapshot() }
+			return { ok: true, cancelled: false, reason: "not_streaming" }
 		}
 		if (!prompt) {
 			await this.abort()
-			return { ok: true, cancelled: false, reason: "no_current_prompt", snapshot: await this.snapshot() }
+			return { ok: true, cancelled: false, reason: "no_current_prompt" }
 		}
 		const toolStartedBeforeAbort = this.toolStartedForRun(prompt.runId)
 		if (!toolStartedBeforeAbort) this.promptCancellation = { runId: prompt.runId, sawToolStart: false }
@@ -1170,29 +1274,31 @@ export class SessionRuntime {
 			}
 		}
 		const toolStarted = toolStartedBeforeAbort || this.toolStartedForRun(prompt.runId) || this.promptCancellation?.sawToolStart === true
-		if (toolStarted) return { ok: true, cancelled: false, reason: "tool_started", snapshot: await this.snapshot() }
+		if (toolStarted) return { ok: true, cancelled: false, reason: "tool_started" }
 
 		const entry = prompt.userEntryId ? this.session.getEntry(prompt.userEntryId) : undefined
 		if (!entry || entry.type !== "message" || entry.message?.role !== "user") {
 			if (this.promptCancellation?.runId === prompt.runId) this.promptCancellation = undefined
-			return { ok: true, cancelled: false, reason: "prompt_entry_not_found", snapshot: await this.snapshot() }
+			return { ok: true, cancelled: false, reason: "prompt_entry_not_found" }
 		}
 
 		const text = textFromContent(entry.message.content)
-		this.session.moveTo(entry.parentId ?? null)
+		const images = imageBlocksFromContent(entry.message.content)
+		this.session.moveTo(entry.parentId ?? null, { runId: prompt.runId })
 		this.hydrateAgentFromSession()
 		this.agent.state.errorMessage = undefined
 		this.refreshSessionPropertyCache({ source: { kind: "cancel_prompt" } })
 		this.db.finishRun(prompt.runId, { status: "completed", stopReason: "cancelled" })
 		this.finishedRunIds.add(prompt.runId)
 		if (this.currentRunId === prompt.runId) this.currentRunId = null
+		this.session.clearMutationRunId(prompt.runId)
 		this.currentPrompt = undefined
 		this.streamingAssistantMessageId = null
 		if (this.promptCancellation?.runId === prompt.runId) this.promptCancellation = undefined
 		this.bumpViewEpoch()
 		this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
-		await this.sendSnapshot(this.sessionId)
-		return { ok: true, cancelled: true, text, snapshot: await this.snapshot() }
+		await this.invalidateSnapshot(this.sessionId)
+		return { ok: true, cancelled: true, text, images }
 	}
 
 	softInterrupt() {
@@ -1259,7 +1365,7 @@ export class SessionRuntime {
 		this.bumpViewEpoch()
 		this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
 		this.refreshSessionPropertyCache({ source: { kind: "rewind" } })
-		await this.sendSnapshot(this.sessionId)
+		await this.invalidateSnapshot(this.sessionId)
 		return editorText
 	}
 
@@ -1289,7 +1395,7 @@ export class SessionRuntime {
 		this.bumpViewEpoch()
 		this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
 		this.refreshSessionPropertyCache({ source: { kind: "branch_switch" } })
-		await this.sendSnapshot(this.sessionId)
+		await this.invalidateSnapshot(this.sessionId)
 	}
 
 	dispose() {
@@ -1307,7 +1413,7 @@ export class RuntimeManager {
 	 * @param {string} [opts.sessionId]
 	 * @param {string} opts.cwd
 	 * @param {(info: { sessionId: string, session: Session, cwd: string }) => Agent} [opts.createAgent]
-	 * @param {() => { model?: string, thinkingLevel?: string }} [opts.getSettings]
+	 * @param {() => { model?: string, thinkingLevel?: string, models?: Record<string, any> }} [opts.getSettings]
 	 * @param {number} [opts.idleRuntimeTtlMs]
 	 * @param {number} [opts.maxIdleRuntimes]
 	 * @param {boolean} [opts.snapshotIncludesSessions]
@@ -1398,11 +1504,12 @@ export class RuntimeManager {
 			db: this.db,
 			emit: (event) => this.hub.send(event),
 			sessions: () => this.sessions(),
-			sendSnapshot: (sessionId) => this.sendSnapshot(sessionId),
+			invalidateSnapshot: (sessionId) => this.invalidateSnapshot(sessionId),
 			nextEventSeq: () => this.nextEventSeq(id),
 			getEventSeq: () => this.getEventSeq(id),
 			getViewEpoch: () => this.getViewEpoch(id),
 			bumpViewEpoch: () => this.bumpViewEpoch(id),
+			getSettings: this.opts.getSettings,
 			diagnostics: this.diagnostics,
 		})
 		this.runtimes.set(id, runtime)
@@ -1497,7 +1604,7 @@ export class RuntimeManager {
 			state: sourceProps.state === "needs_input" ? "needs_input" : null,
 			descriptionInUi: sourceDescription.startsWith("(branched)") ? sourceDescription : `(branched) ${sourceDescription}`,
 		}, { kind: "branch" })
-		await this.sendSnapshot(opened.id)
+		await this.invalidateSnapshot(opened.id)
 		return runtime
 	}
 
@@ -1562,7 +1669,7 @@ export class RuntimeManager {
 		if (this.runtimes.get(id)?.isStreaming() || entry.runStatus === "running") throw Object.assign(new Error(runningMessage), { status: 409 })
 		const runtime = await this.getRuntime(id)
 		const write = await runtime.appendSessionPropertyPatch({ state }, { kind: "user_mark" })
-		await this.sendSnapshot(id)
+		await this.invalidateSnapshot(id)
 		return sessionPropertiesToAgentView(write.properties) ?? {}
 	}
 
@@ -1613,7 +1720,7 @@ export class RuntimeManager {
 			const endPreviews = this.diagnostics?.span?.("RuntimeManager.loadSessionPreviews", { count: entries.length })
 			const previewRowsBySessionId = new Map()
 			try {
-				for (const row of this.db.loadSessionOverviewPreviewMessagesForSessions(entries.map((entry) => entry.id), PROJECT_CONTEXT_HEADING)) {
+				for (const row of this.db.loadSessionOverviewPreviewMessagesForSessions(entries.map((entry) => entry.id))) {
 					const rows = previewRowsBySessionId.get(row.sessionId) ?? []
 					rows.push(row)
 					previewRowsBySessionId.set(row.sessionId, rows)
@@ -1668,13 +1775,30 @@ export class RuntimeManager {
 		}
 	}
 
-	async sendSnapshot(id, options = this.snapshotOptions) {
-		const end = this.diagnostics?.span?.("RuntimeManager.sendSnapshot", {
+	async contextReport(id = this.initialSessionId) {
+		if (!id) throw new Error("No session selected")
+		return (await this.getRuntime(id)).contextReport()
+	}
+
+	async systemReport(id = this.initialSessionId) {
+		if (!id) throw new Error("No session selected")
+		return (await this.getRuntime(id)).systemReport()
+	}
+
+	async invalidateSnapshot(id, options = this.snapshotOptions) {
+		if (!id) throw new Error("No session selected")
+		const end = this.diagnostics?.span?.("RuntimeManager.invalidateSnapshot", {
 			sessionId: id,
 			includeSessions: options.includeSessions === true,
 		})
 		try {
-			this.hub.send({ type: "snapshot", sessionId: id, snapshot: await this.snapshot(id, options) })
+			const cursor = this.runtimes.get(id)?.snapshotCursor() ?? { seq: this.getEventSeq(id), viewEpoch: this.getViewEpoch(id) }
+			this.hub.send({
+				type: "snapshot_invalidated",
+				sessionId: id,
+				scopes: options.includeSessions === true ? ["session", "sessions"] : ["session"],
+				cursor,
+			})
 		} finally {
 			end?.()
 		}

@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs"
+import { dirname } from "node:path"
+
 import { createDefaultTools } from "../tools/index.js"
 import { JsonLineRpc } from "./json-rpc-lines.js"
 import { WORKER_PROTOCOL_VERSION, assertWorkerProtocolVersion } from "./worker-protocol.js"
@@ -7,6 +10,33 @@ import { WORKER_PROTOCOL_VERSION, assertWorkerProtocolVersion } from "./worker-p
 let cwd = process.cwd()
 /** @type {Map<string, AbortController>} */
 const activeTools = new Map()
+let shuttingDown = false
+
+function registerPidFile() {
+	const pidFile = process.env.PINANO_WORKER_PID_FILE
+	if (!pidFile) return
+	try {
+		mkdirSync(dirname(pidFile), { recursive: true })
+		writeFileSync(pidFile, `${process.pid}\n`, { mode: 0o600 })
+		process.on("exit", () => {
+			try {
+				unlinkSync(pidFile)
+			} catch {}
+		})
+	} catch (err) {
+		console.error(`failed to register Pinano worker pid file: ${err?.message ?? err}`)
+		process.exit(1)
+	}
+}
+
+function shutdown() {
+	if (shuttingDown) return
+	shuttingDown = true
+	for (const controller of activeTools.values()) controller.abort()
+	setTimeout(() => process.exit(0), 50)
+}
+
+registerPidFile()
 
 /** @param {any} tool */
 function serializableTool(tool) {
@@ -14,7 +44,7 @@ function serializableTool(tool) {
 	return rest
 }
 
-/** @param {any} _scope @param {string} toolCwd @param {{ toolProfile?: "default" | "apply_patch" }} [options] */
+/** @param {any} _scope @param {string} toolCwd @param {{ toolProfile?: "default" | "codex" }} [options] */
 function toolsForScope(_scope, toolCwd = cwd, options = {}) {
 	return createDefaultTools(toolCwd, {
 		beforeFileMutation: (info) => rpc.request("beforeFileMutation", info),
@@ -61,9 +91,8 @@ const rpc = new JsonLineRpc({
 	onProtocolError: (err) => {
 		console.error(err?.stack ?? err)
 	},
+	onClose: shutdown,
 })
 
-process.on("SIGTERM", () => {
-	for (const controller of activeTools.values()) controller.abort()
-	setTimeout(() => process.exit(0), 50)
-})
+process.on("SIGTERM", shutdown)
+process.on("SIGINT", shutdown)

@@ -158,6 +158,47 @@ function entryKind(entry) {
 	throw new Error(`Unsupported session entry type: ${entry.type}`)
 }
 
+function storageMutationError(message, code) {
+	const err = new Error(message)
+	err.code = code
+	return err
+}
+
+function mutationOwnerRunId(options) {
+	return typeof options?.runId === "string" && options.runId ? options.runId : null
+}
+
+function sessionMutationRow(db, sessionId) {
+	return db.prepare(`
+		SELECT mutation_version AS mutationVersion, mutation_run_id AS mutationRunId
+		FROM sessions
+		WHERE id = ? AND deleted_at IS NULL
+	`).get(sessionId)
+}
+
+function assertSessionMutationAllowed(db, sessionId, expectedVersion, ownerRunId) {
+	const row = sessionMutationRow(db, sessionId)
+	if (!row) throw storageMutationError(`Session not found: ${sessionId}`, "PINANO_SESSION_NOT_FOUND")
+	const actualVersion = Number(row.mutationVersion ?? 0)
+	if (actualVersion !== expectedVersion) {
+		throw storageMutationError(`Session ${sessionId} changed in the database; reopen it before mutating.`, "PINANO_SESSION_STALE")
+	}
+	const actualOwnerRunId = row.mutationRunId ?? null
+	if (actualOwnerRunId !== ownerRunId) {
+		throw storageMutationError(
+			actualOwnerRunId
+				? `Session ${sessionId} is being mutated by another run.`
+				: `Run ${ownerRunId} does not own session ${sessionId}.`,
+			"PINANO_SESSION_MUTATION_OWNER_MISMATCH",
+		)
+	}
+}
+
+function nextSessionSeq(db, sessionId) {
+	const row = db.prepare("SELECT COALESCE(MAX(seq) + 1, 0) AS seq FROM session_entry_refs WHERE session_id = ?").get(sessionId)
+	return Number(row?.seq ?? 0)
+}
+
 export class SqliteSessionStorage {
 	#db
 	#metadata
@@ -166,9 +207,9 @@ export class SqliteSessionStorage {
 	#globalById
 	#labels
 	#leafId
-	#nextSeq
+	#mutationVersion
 
-	constructor(db, metadata, entries, entryGlobalIds, leafId, nextSeq) {
+	constructor(db, metadata, entries, entryGlobalIds, leafId, mutationVersion) {
 		this.#db = db
 		this.#metadata = metadata
 		this.#entries = entries
@@ -176,7 +217,7 @@ export class SqliteSessionStorage {
 		this.#globalById = entryGlobalIds
 		this.#labels = buildLabelMap(entries)
 		this.#leafId = leafId
-		this.#nextSeq = nextSeq
+		this.#mutationVersion = mutationVersion
 	}
 
 	static create(db, options) {
@@ -192,11 +233,12 @@ export class SqliteSessionStorage {
 				active_leaf_entry_id = COALESCE(sessions.active_leaf_entry_id, excluded.active_leaf_entry_id),
 				active_leaf_global_id = COALESCE(sessions.active_leaf_global_id, excluded.active_leaf_global_id)
 		`).run(options.sessionId, options.cwd, createdAt, options.updatedAt ?? createdAt)
+		const row = db.prepare("SELECT mutation_version AS mutationVersion FROM sessions WHERE id = ?").get(options.sessionId)
 		return new SqliteSessionStorage(db, {
 			id: options.sessionId,
 			createdAt,
 			cwd: options.cwd,
-		}, [], new Map(), null, 0)
+		}, [], new Map(), null, Number(row?.mutationVersion ?? 0))
 	}
 
 	static branchFrom(db, sourceSessionId, options = {}) {
@@ -281,7 +323,13 @@ export class SqliteSessionStorage {
 
 	static open(db, sessionId) {
 		const row = db.prepare(`
-			SELECT id, cwd, created_at AS createdAt, active_leaf_entry_id AS activeLeafEntryId, active_leaf_global_id AS activeLeafGlobalId
+			SELECT
+				id,
+				cwd,
+				created_at AS createdAt,
+				active_leaf_entry_id AS activeLeafEntryId,
+				active_leaf_global_id AS activeLeafGlobalId,
+				mutation_version AS mutationVersion
 			FROM sessions
 			WHERE id = ? AND deleted_at IS NULL
 		`).get(sessionId)
@@ -308,7 +356,7 @@ export class SqliteSessionStorage {
 			id: row.id,
 			createdAt: row.createdAt,
 			cwd: row.cwd,
-		}, entries, entryGlobalIds, activeLeaf, Number(last?.seq ?? -1) + 1)
+		}, entries, entryGlobalIds, activeLeaf, Number(row.mutationVersion ?? 0))
 	}
 
 	getMetadata() {
@@ -317,12 +365,30 @@ export class SqliteSessionStorage {
 	getLeafId() {
 		return this.#leafId
 	}
-	setLeafId(id) {
+	getMutationVersion() {
+		return this.#mutationVersion
+	}
+	setLeafId(id, options = {}) {
 		if (id !== null && !this.#byId.has(id)) throw new Error(`Entry ${id} not found`)
 		const globalId = id === null ? null : this.#globalById.get(id)
-		this.#db.prepare("UPDATE sessions SET active_leaf_entry_id = ?, active_leaf_global_id = ? WHERE id = ? AND deleted_at IS NULL")
-			.run(id, globalId ?? null, this.#metadata.id)
+		const ownerRunId = mutationOwnerRunId(options)
+		this.#db.exec("BEGIN IMMEDIATE")
+		try {
+			assertSessionMutationAllowed(this.#db, this.#metadata.id, this.#mutationVersion, ownerRunId)
+			this.#db.prepare(`
+				UPDATE sessions
+				SET active_leaf_entry_id = ?,
+					active_leaf_global_id = ?,
+					mutation_version = mutation_version + 1
+				WHERE id = ? AND deleted_at IS NULL
+			`).run(id, globalId ?? null, this.#metadata.id)
+			this.#db.exec("COMMIT")
+		} catch (err) {
+			this.#db.exec("ROLLBACK")
+			throw err
+		}
 		this.#leafId = id
+		this.#mutationVersion += 1
 	}
 	createEntryId() {
 		return shortId(this.#byId)
@@ -346,22 +412,29 @@ export class SqliteSessionStorage {
 		return this.getPathToRoot(fromId ?? this.#leafId).map((entry) => this.#globalById.get(entry.id)).filter(Boolean)
 	}
 
-	async appendEntry(entry) {
-		const seq = this.#nextSeq++
+	async appendEntry(entry, options = {}) {
 		const globalId = randomUUID()
 		const parentGlobalId = entry.parentId ? this.#globalById.get(entry.parentId) : null
 		if (entry.parentId && !parentGlobalId) throw new Error(`Parent entry ${entry.parentId} not found`)
 		const targetGlobalId = entry.type === "label" ? this.#globalById.get(entry.targetId) : undefined
 		if (entry.type === "label" && !targetGlobalId) throw new Error(`Entry ${entry.targetId} not found`)
+		const ownerRunId = mutationOwnerRunId(options)
 		this.#db.exec("BEGIN IMMEDIATE")
 		try {
+			assertSessionMutationAllowed(this.#db, this.#metadata.id, this.#mutationVersion, ownerRunId)
+			const seq = nextSessionSeq(this.#db, this.#metadata.id)
 			insertEntry(this.#db, this.#metadata.id, seq, entry, { globalId, parentGlobalId, targetGlobalId })
-			this.#db.prepare("UPDATE sessions SET active_leaf_entry_id = ?, active_leaf_global_id = ? WHERE id = ? AND deleted_at IS NULL")
+			this.#db.prepare(`
+				UPDATE sessions
+				SET active_leaf_entry_id = ?,
+					active_leaf_global_id = ?,
+					mutation_version = mutation_version + 1
+				WHERE id = ? AND deleted_at IS NULL
+			`)
 				.run(entry.id, globalId, this.#metadata.id)
 			this.#db.exec("COMMIT")
 		} catch (err) {
 			this.#db.exec("ROLLBACK")
-			this.#nextSeq--
 			throw err
 		}
 		this.#entries.push(entry)
@@ -373,6 +446,7 @@ export class SqliteSessionStorage {
 			else this.#labels.delete(entry.targetId)
 		}
 		this.#leafId = entry.id
+		this.#mutationVersion += 1
 	}
 
 	getPathToRoot(leafId) {
@@ -423,11 +497,82 @@ function loadEntry(db, row) {
 		return withContextLoad(db, row.globalId, { ...base, type: "label", targetId: label?.targetId, label: label?.label ?? undefined })
 	}
 	if (row.type === "custom") {
-		const custom = db.prepare("SELECT custom_type AS customType, data_json AS dataJson FROM entry_custom_entries WHERE global_id = ?").get(row.globalId)
-		return withContextLoad(db, row.globalId, { ...base, type: "custom", customType: custom?.customType ?? "unknown", data: parseJson(custom?.dataJson) })
+		const custom = db.prepare("SELECT custom_type AS customType FROM entry_custom_entries WHERE global_id = ?").get(row.globalId)
+		const customType = custom?.customType ?? "unknown"
+		const data = customType === "tool_execution" ? loadToolExecutionData(db, row.globalId) : loadCustomData(db, row.globalId)
+		return withContextLoad(db, row.globalId, { ...base, type: "custom", customType, data })
 	}
 	if (row.type === "context") return { ...base, type: "context", contextLoad: loadContextLoad(db, row.globalId) ?? { source: "unknown", files: [] } }
 	throw new Error(`Unsupported session entry kind in database: ${row.type}`)
+}
+
+function loadCustomData(db, globalId) {
+	const row = db.prepare("SELECT data_json AS dataJson FROM entry_custom_entries WHERE global_id = ?").get(globalId)
+	return parseJson(row?.dataJson)
+}
+
+function withDefined(object, key, value) {
+	if (value !== null && value !== undefined) object[key] = value
+	return object
+}
+
+function defineLazyJsonField(object, key, loadText) {
+	let loaded = false
+	let value
+	Object.defineProperty(object, key, {
+		enumerable: true,
+		configurable: true,
+		get() {
+			if (!loaded) {
+				value = parseJson(loadText())
+				loaded = true
+			}
+			return value
+		},
+	})
+	return object
+}
+
+function loadToolExecutionData(db, globalId) {
+	const row = db.prepare(`
+		SELECT
+			CASE
+				WHEN NOT json_valid(data_json) THEN data_json
+				WHEN COALESCE(json_extract(data_json, '$.phase'), '') != 'ended' THEN data_json
+				ELSE NULL
+			END AS dataJson,
+			CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.version') END AS version,
+			CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.phase') END AS phase,
+			CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.runId') END AS runId,
+			CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.toolCallId') END AS toolCallId,
+			CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.toolName') END AS toolName,
+			CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.isError') END AS isError,
+			CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.messageEntryId') END AS messageEntryId,
+			CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.hasDurableMessage') END AS hasDurableMessage,
+			CASE WHEN json_valid(data_json) AND json_type(data_json, '$.message') IS NOT NULL THEN 1 ELSE 0 END AS hasRecoveryMessage
+		FROM entry_custom_entries
+		WHERE global_id = ?
+	`).get(globalId)
+	if (!row) return undefined
+	if (row.dataJson !== null && row.dataJson !== undefined) return parseJson(row.dataJson)
+	const data = {}
+	withDefined(data, "version", row.version)
+	withDefined(data, "phase", row.phase)
+	withDefined(data, "runId", row.runId)
+	withDefined(data, "toolCallId", row.toolCallId)
+	withDefined(data, "toolName", row.toolName)
+	if (row.isError !== null && row.isError !== undefined) data.isError = intToBool(row.isError)
+	withDefined(data, "messageEntryId", row.messageEntryId)
+	if (row.hasDurableMessage !== null && row.hasDurableMessage !== undefined) data.hasDurableMessage = intToBool(row.hasDurableMessage)
+	if (row.hasRecoveryMessage) {
+		data.hasRecoveryMessage = true
+		defineLazyJsonField(data, "message", () => db.prepare(`
+			SELECT CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.message') END AS messageJson
+			FROM entry_custom_entries
+			WHERE global_id = ?
+		`).get(globalId)?.messageJson)
+	}
+	return data
 }
 
 function loadContextLoad(db, globalId) {

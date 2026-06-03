@@ -16,7 +16,9 @@ import { Box, Container, Markdown, Spacer, Text, TruncatedText } from "../../tui
 import { isResponsesCompactionBlock } from "../../responses-compaction.js"
 import { contextLoadDisplayFiles } from "../../session-manager/context-display.js"
 import { getMarkdownTheme, theme } from "../theme.js"
+import { truncateCompactionSummaryForDisplay } from "../compaction-summary.js"
 import { formatToolCall, formatToolPath } from "./tool-format.js"
+import { isPromptImageMarkerText } from "../../prompt-images.js"
 
 /** @typedef {any} AnyMessage */
 /**
@@ -63,6 +65,7 @@ function userText(message) {
 	if (!Array.isArray(c)) return ""
 	return c
 		.filter((/** @type {any} */ p) => p.type === "text")
+		.filter((/** @type {any} */ p) => !isPromptImageMarkerText(p.text ?? ""))
 		.map((/** @type {any} */ p) => p.text)
 		.join("")
 		.trim()
@@ -183,12 +186,17 @@ export class AssistantMessageComponent extends Container {
 	renderCompactionMarker(message) {
 		const removed = message.removedCount ?? 0
 		const kept = message.keptCount ?? 0
+		const mementos = typeof message.mementoCount === "number" ? message.mementoCount : undefined
 		const tokens = message.tokensBefore ?? 0
 		// Build the metadata fragment only if the numbers exist (a marker
 		// loaded from an older session may not have them).
-		const meta = removed > 0
-			? ` (${removed} message${removed === 1 ? "" : "s"} → ${kept} kept, ~${tokens} tok)`
-			: ""
+		const metaParts = []
+		if (removed > 0) metaParts.push(`${removed} message${removed === 1 ? "" : "s"} compacted`)
+		if (mementos !== undefined) metaParts.push(`${mementos} user message${mementos === 1 ? "" : "s"} retained`)
+		else if (kept > 0) metaParts.push(`${kept} kept`)
+		if (mementos !== undefined && kept > 0) metaParts.push(`${kept} provider checkpoint${kept === 1 ? "" : "s"}`)
+		if (tokens > 0) metaParts.push(`~${tokens} tok`)
+		const meta = metaParts.length > 0 ? ` (${metaParts.join(", ")})` : ""
 		this.content.addChild(new Text(theme.dim(`─── earlier context compacted${meta} ───`), 1, 0))
 		const blocks = Array.isArray(message.content) ? message.content : []
 		const body = blocks
@@ -196,13 +204,8 @@ export class AssistantMessageComponent extends Container {
 			.map((/** @type {any} */ b) => b.text.replace(/^\[earlier context compacted\]\n?/, "").trim())
 			.filter(Boolean)
 			.join("\n")
-		if (body) {
-			this.content.addChild(
-				new Markdown(body, 1, 0, getMarkdownTheme(), {
-					color: (s) => theme.fg("dim", s),
-				}),
-			)
-		}
+		const truncatedBody = truncateCompactionSummaryForDisplay(body)
+		if (truncatedBody) this.content.addChild(new Text(theme.dim(truncatedBody), 1, 0))
 	}
 
 	/** @returns {boolean} */

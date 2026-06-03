@@ -1,6 +1,6 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -14,6 +14,7 @@ const fallbackTools = {
 }
 
 let binDir
+let binDirKey
 
 /** @param {string} s */
 function shellQuote(s) {
@@ -41,11 +42,35 @@ fi
 `
 }
 
-function ensureFallbackToolsBin() {
-	if (binDir) return binDir
-	const dir = mkdtempSync(join(tmpdir(), "pinano-fallback-tools-"))
+function createRuntimeWrapper(runtimePath) {
+	return `#!/bin/sh
+exec ${shellQuote(runtimePath)} "$@"
+`
+}
+
+function runtimeWrapperNames(runtimePath) {
+	const name = basename(runtimePath)
+	if (name === "node" || name === "qn") return [name]
+	return []
+}
+
+function fallbackToolsTmpdir(baseEnv) {
+	const configured = baseEnv.PINANO_FALLBACK_TOOLS_TMPDIR
+	if (!configured) return tmpdir()
+	if (!isAbsolute(configured)) throw new Error(`PINANO_FALLBACK_TOOLS_TMPDIR must be absolute: ${configured}`)
+	return resolve(configured)
+}
+
+function ensureFallbackToolsBin(baseEnv = process.env) {
+	const parent = fallbackToolsTmpdir(baseEnv)
+	const key = parent
+	if (binDir && binDirKey === key) return binDir
+	const removeParentOnExit = !existsSync(parent)
+	mkdirSync(parent, { recursive: true })
+	const dir = mkdtempSync(join(parent, ".pinano-fallback-tools-"))
 	const bin = join(dir, "bin")
 	binDir = bin
+	binDirKey = key
 	try {
 		mkdirSync(bin, { recursive: true })
 		for (const [toolName, relativeScript] of Object.entries(fallbackTools)) {
@@ -53,12 +78,24 @@ function ensureFallbackToolsBin() {
 			writeFileSync(path, createWrapper(toolName, join(repoRoot, relativeScript), process.execPath))
 			chmodSync(path, 0o755)
 		}
+		for (const runtimeName of runtimeWrapperNames(process.execPath)) {
+			const path = join(bin, runtimeName)
+			if (existsSync(path)) continue
+			writeFileSync(path, createRuntimeWrapper(process.execPath))
+			chmodSync(path, 0o755)
+		}
 		process.once("exit", () => {
 			rmSync(dir, { recursive: true, force: true })
+			if (removeParentOnExit) {
+				try {
+					rmSync(parent)
+				} catch {}
+			}
 		})
 		return bin
 	} catch (err) {
 		binDir = undefined
+		binDirKey = undefined
 		rmSync(dir, { recursive: true, force: true })
 		throw err
 	}
@@ -72,7 +109,7 @@ function ensureFallbackToolsBin() {
  * @returns {NodeJS.ProcessEnv}
  */
 export function envWithFallbackTools(baseEnv = process.env) {
-	const bin = ensureFallbackToolsBin()
+	const bin = ensureFallbackToolsBin(baseEnv)
 	const path = baseEnv.PATH ? `${baseEnv.PATH}:${bin}` : bin
 	return {
 		...baseEnv,

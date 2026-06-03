@@ -1,26 +1,21 @@
 // Conversation compaction.
 //
 // When the cumulative context approaches the model's contextWindow, we
-// replace the oldest N messages with a compact checkpoint: selected recent
-// user-message mementos plus a synthetic compaction summary marker. The
-// summary is produced by asking the same model to summarize the discarded
-// prefix.
+// replace the current logical history with a compact checkpoint: selected
+// recent user-message mementos plus a model-facing handoff summary. The
+// summary is produced by asking the same model to summarize the compactable
+// conversation history.
 //
 // Strategy:
 //   - threshold:   compact when usage > settings.autocompactThreshold * contextWindow
-//   - cut point:   keep the last K turns intact; summarize everything before.
-//                  The cut snaps forward across leading toolResults so that
-//                  function_call/function_call_output pairs never split across
-//                  the boundary (the OpenAI Responses API rejects an orphan
-//                  function output).
 //   - replacement: recent real user messages are retained as hidden model
-//                  mementos, followed by a synthetic assistant handoff marker
-//                  (`compaction: true`) that round-trips through agent context
-//                  but is rendered specially.
+//                  mementos, followed by a user-role handoff summary
+//                  (`pinanoCompactionSummary: true`). A separate display marker
+//                  (`compaction: true`) is emitted/persisted for the transcript.
 //
 // Persistence:
-//   When the agent has a session and the cut boundary has an entry ID in
-//   `agent.msgToEntryId`, the compaction is also written to session storage
+//   When the agent has a session and the last replaced message has an entry ID
+//   in `agent.msgToEntryId`, the compaction is also written to session storage
 //   as a `compaction` custom entry. On replay, Session.getLogicalEntries()
 //   applies the entry as an agent-context patch, while getDisplayEntries()
 //   keeps the original messages and inserts the marker at the cut boundary.
@@ -29,6 +24,8 @@
 //   prompt too big" cliff on very long sessions).
 
 import { stream as openaiStream } from "../ai-apis/index.js"
+import { messageHasResponsesCompactionItem } from "../responses-compaction.js"
+import { isPromptImageMarkerText } from "../prompt-images.js"
 import { compactionReplacementEntryId } from "../session-manager/session.js"
 import {
 	breakdownContext,
@@ -38,11 +35,15 @@ import { resolveModelStreamOptions } from "./model-auth.js"
 import { isFastModeEligibleModel } from "./fast-mode.js"
 import { buildModelMessagesForAgent } from "./session-context.js"
 import { isProjectContextMessage } from "./project-context.js"
+import { lastReportedTokens } from "./context-summary.js"
 import {
 	COMPACTION_MARKER_PREFIX,
 	SUMMARY_PROMPT,
 	SUMMARY_USER_PREAMBLE,
 	compactionSummaryText,
+	isCompactionCheckpointMessage,
+	isCompactionSummaryMessage,
+	modelCompactionHandoffMessage,
 } from "./compaction-summary.js"
 
 /** @typedef {import("../agent-core/agent.js").Agent} Agent */
@@ -65,33 +66,7 @@ export function estimateTokens(messages) {
 	return estimateMessageTokens(messages)
 }
 
-/** Last reported usage from any prior assistant message, or 0.
- *
- * After a compaction, assistant messages kept in the tail still carry their
- * pre-compaction `totalTokens` — a number that reflects a prompt size that
- * no longer exists. We ignore those and fall back to the compaction marker's
- * own estimate until a fresh post-compaction turn reports real usage.
- * @param {any[]} messages
- * @returns {number} */
-export function lastReportedTokens(messages) {
-	let compactionTs = 0
-	for (const m of messages) {
-		if (m.compaction && m.timestamp) compactionTs = m.timestamp
-	}
-	let fallback = 0
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const m = messages[i]
-		if (m.compaction) {
-			if (!fallback) fallback = m.usage?.totalTokens ?? 0
-			continue
-		}
-		if (m.role !== "assistant") continue
-		if (!m.usage?.totalTokens) continue
-		if (compactionTs && (m.timestamp ?? 0) < compactionTs) continue
-		return m.usage.totalTokens
-	}
-	return fallback
-}
+export { lastReportedTokens }
 
 /** Decide whether the agent should compact before its next turn.
  *
@@ -131,7 +106,6 @@ async function streamForSummary(agent, ctx, signal) {
 	const options = {
 		signal,
 		serviceTier: isFastModeEligibleModel(model) ? agent.state.serviceTier : undefined,
-		disableImplicitResponsesCompaction: true,
 	}
 	if (agent.streamFn?.serviceMediated) return agent.streamFn(model, ctx, options)
 	const streamOptions = await resolveModelStreamOptions(model, options)
@@ -181,7 +155,7 @@ function textFromContent(content) {
 	if (!Array.isArray(content)) return ""
 	return content
 		.map((/** @type {any} */ block) => {
-			if (block.type === "text") return block.text ?? ""
+			if (block.type === "text") return isPromptImageMarkerText(block.text ?? "") ? "" : block.text ?? ""
 			if (block.type === "image") return `[image${block.mediaType ? ` ${block.mediaType}` : ""}]`
 			return ""
 		})
@@ -234,6 +208,7 @@ function isRealUserMessageForMemento(message) {
 		&& !message.pinanoAutomated
 		&& !message.pinanoMaintenance
 		&& !message.branchSummary
+		&& !isCompactionSummaryMessage(message)
 		&& !isProjectContextMessage(message)
 }
 
@@ -276,9 +251,9 @@ export function selectCompactionMementoMessages(messages, maxTokens = COMPACTION
 	return selected.reverse()
 }
 
-/** @param {any[]} prefix @param {any} compactionMsg @param {{ maxMementoTokens?: number }} [options] */
-export function buildCompactionReplacementMessages(prefix, compactionMsg, options = {}) {
-	return [...selectCompactionMementoMessages(prefix, options.maxMementoTokens), compactionMsg]
+/** @param {any[]} messages @param {any} summaryMessage @param {{ maxMementoTokens?: number }} [options] */
+export function buildCompactionReplacementMessages(messages, summaryMessage, options = {}) {
+	return [...selectCompactionMementoMessages(messages, options.maxMementoTokens), summaryMessage]
 }
 
 /** @param {any} message */
@@ -300,10 +275,12 @@ function serializeToolCall(call) {
 
 /** @param {any} message */
 function serializeMessage(message) {
-	if (message?.compaction === true) {
+	if (isCompactionCheckpointMessage(message)) {
 		const meta = [
 			message.removedCount !== undefined ? `removed=${message.removedCount}` : "",
-			message.keptCount !== undefined ? `kept=${message.keptCount}` : "",
+			message.mementoCount !== undefined ? `mementos=${message.mementoCount}` : "",
+			message.mementoCount !== undefined && message.keptCount ? `provider_checkpoints=${message.keptCount}` : "",
+			message.mementoCount === undefined && message.keptCount !== undefined ? `kept=${message.keptCount}` : "",
 		].filter(Boolean).join(" ")
 		return `<compaction_summary${meta ? ` ${meta}` : ""}>\n${truncateForSummary(compactionSummaryText(message), SUMMARY_TEXT_MAX_CHARS)}\n</compaction_summary>`
 	}
@@ -328,6 +305,36 @@ function serializeMessage(message) {
 		return `<tool_result ${attrs}>\n${truncateForSummary(text, TOOL_RESULT_MAX_CHARS)}\n</tool_result>`
 	}
 	return `<message role="${attr(role)}">\n${truncateForSummary(text, SUMMARY_TEXT_MAX_CHARS)}\n</message>`
+}
+
+/** @param {any} message */
+function isGeneratedContextMessage(message) {
+	return isProjectContextMessage(message) || message?.pinanoAutomated === true || message?.pinanoMaintenance === true
+}
+
+/** @param {any[]} messages */
+function compactableMessages(messages) {
+	return messages.filter((message) => !isGeneratedContextMessage(message))
+}
+
+/** @param {any[]} messages */
+function latestResponsesCompactionIndex(messages) {
+	let latest = -1
+	for (let i = 0; i < messages.length; i++) {
+		if (messageHasResponsesCompactionItem(messages[i])) latest = i
+	}
+	return latest
+}
+
+/** @param {any[]} messages */
+function compactionSource(messages) {
+	const sourceMessages = compactableMessages(messages)
+	const nativeIndex = latestResponsesCompactionIndex(sourceMessages)
+	if (nativeIndex < 0) return { preservedMessages: [], summarySourceMessages: sourceMessages }
+	return {
+		preservedMessages: [sourceMessages[nativeIndex]],
+		summarySourceMessages: sourceMessages.slice(nativeIndex + 1),
+	}
 }
 
 /**
@@ -441,83 +448,97 @@ function compactionMementoBudget(agent, basePostCompactTokens) {
 }
 
 /**
- * Compact the agent's transcript in place. Keeps the system prompt + the most
- * recent `keepLast` messages, replaces everything before with selected recent
- * user-message mementos plus a compaction-summary assistant marker.
+ * Compact the agent's transcript in place. The model-facing replacement is
+ * selected recent user-message mementos plus a user-role handoff summary. If
+ * legacy provider-native Responses compaction is already present, the latest
+ * opaque checkpoint is preserved as the model prefix and only later messages
+ * are summarized. The user-facing transcript gets a separate assistant divider
+ * marker through the persisted `displayMessage` and the live compaction event.
  *
  * Returns metadata describing the compaction (used by /compact UI).
  *
  * @param {Agent} agent
- * @param {number} [keepLast]
+ * @param {number} [keepLast] Legacy compatibility parameter; whole-history compaction ignores it.
  * @param {AbortSignal} [signal]
  * @returns {Promise<CompactionResult>}
  */
 export async function compact(agent, keepLast = 6, signal) {
+	void keepLast
 	const messages = /** @type {any[]} */ (agent.state.messages)
 	const tokensBefore = lastReportedTokens(messages) || estimateTokens(messages)
 
-	if (messages.length <= keepLast) {
-		return { summary: "", keptCount: messages.length, removedCount: 0, tokensBefore }
+	if (messages.length === 0) {
+		return { summary: "", keptCount: 0, removedCount: 0, tokensBefore }
 	}
-	const cutIndex = findCompactionCutIndex(messages, keepLast)
-	const prefix = messages.slice(0, cutIndex)
-	const tail = messages.slice(cutIndex)
+	const { preservedMessages, summarySourceMessages } = compactionSource(messages)
+	if (summarySourceMessages.length === 0) {
+		return { summary: "", keptCount: preservedMessages.length, removedCount: 0, tokensBefore, mementoCount: 0 }
+	}
 
-	const { summary, usage: summaryUsage, summaryOmittedCount } = await summarize(agent, prefix, signal)
+	const { summary, usage: summaryUsage, summaryOmittedCount } = await summarize(agent, summarySourceMessages, signal)
 	// Carry the cost of the summarization API call so it shows up in the
 	// running session total (the call is real money on metered providers).
-	// Token counters stay at 0: the marker's `totalTokens` is reserved for
-	// the post-compaction prompt-size estimate (see below). Metadata fields
-	// (removedCount/keptCount/tokensBefore) are stamped on the marker too so
-	// the renderer can show them in the compaction divider.
-	const compactionMsg = {
-		role: "assistant",
-		content: [{ type: "text", text: `${COMPACTION_MARKER_PREFIX}\n${summary}` }],
+	// Token counters stay at 0: `totalTokens` is reserved for the
+	// post-compaction prompt-size estimate (see below). Metadata fields are
+	// stamped on both the visible marker and the model-facing summary.
+	const compactionUsage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: {
+			input: summaryUsage?.cost?.input ?? 0,
+			output: summaryUsage?.cost?.output ?? 0,
+			cacheRead: summaryUsage?.cost?.cacheRead ?? 0,
+			cacheWrite: summaryUsage?.cost?.cacheWrite ?? 0,
+			total: summaryUsage?.cost?.total ?? 0,
+		},
+	}
+	const compactionMeta = {
 		provider: agent.state.model.provider,
 		model: agent.state.model.id,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: {
-				input: summaryUsage?.cost?.input ?? 0,
-				output: summaryUsage?.cost?.output ?? 0,
-				cacheRead: summaryUsage?.cost?.cacheRead ?? 0,
-				cacheWrite: summaryUsage?.cost?.cacheWrite ?? 0,
-				total: summaryUsage?.cost?.total ?? 0,
-			},
-		},
+		usage: compactionUsage,
 		stopReason: "stop",
 		timestamp: Date.now(),
-		compaction: true,
-		removedCount: prefix.length,
-		keptCount: tail.length,
+		removedCount: messages.length - preservedMessages.length,
+		keptCount: preservedMessages.length,
 		tokensBefore,
 		summaryOmittedCount,
 	}
+	const displayMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: `${COMPACTION_MARKER_PREFIX}\n${summary}` }],
+		...compactionMeta,
+		compaction: true,
+	}
+	const summaryMessage = modelCompactionHandoffMessage(displayMessage)
 	const basePostCompactTokens = breakdownContext({
-		messages: buildModelMessagesForAgent(agent, [compactionMsg, ...tail]),
+		messages: buildModelMessagesForAgent(agent, [...preservedMessages, summaryMessage]),
 		systemPrompt: agent.state.systemPrompt,
 		tools: agent.state.tools,
 	}).total
-	const replacementMessages = buildCompactionReplacementMessages(prefix, compactionMsg, {
-		maxMementoTokens: compactionMementoBudget(agent, basePostCompactTokens),
-	})
-	const newMessages = [...replacementMessages, ...tail]
+	const replacementMessages = [
+		...preservedMessages,
+		...buildCompactionReplacementMessages(summarySourceMessages, summaryMessage, {
+			maxMementoTokens: compactionMementoBudget(agent, basePostCompactTokens),
+		}),
+	]
+	const mementoCount = replacementMessages.length - preservedMessages.length - 1
+	displayMessage.mementoCount = mementoCount
+	summaryMessage.mementoCount = mementoCount
+	const newMessages = replacementMessages
 	// Stamp the new prompt size estimate so the footer and shouldCompact
 	// can stop showing the stale pre-compaction percentage. Includes the
 	// system prompt and tool definitions — both are sent on every request
-	// and form a non-trivial slice of the token budget. Kept tail
-	// assistants still carry their old totalTokens; consumers ignore
-	// those once they see this marker (see lastReportedTokens /
-	// Footer.update).
-	compactionMsg.usage.totalTokens = breakdownContext({
+	// and form a non-trivial slice of the token budget.
+	const postCompactTokens = breakdownContext({
 		messages: buildModelMessagesForAgent(agent, newMessages),
 		systemPrompt: agent.state.systemPrompt,
 		tools: agent.state.tools,
 	}).total
+	displayMessage.usage.totalTokens = postCompactTokens
+	summaryMessage.usage.totalTokens = postCompactTokens
 
 	agent.state.messages = /** @type {any} */ (newMessages)
 
@@ -538,14 +559,14 @@ export async function compact(agent, keepLast = 6, signal) {
 	// gracefully — compaction still works in-memory, just won't survive
 	// resume for this particular event. That preserves today's behavior
 	// in code paths that don't wire up the map.
-	const boundary = prefix[prefix.length - 1]
+	const boundary = messages[messages.length - 1]
 	if (agent.persistCompaction) {
 		try {
 			const newEntryId = await agent.persistCompaction({
 				version: 2,
-				cutMessageIndex: prefix.length - 1,
-				message: compactionMsg,
-				displayMessage: compactionMsg,
+				cutMessageIndex: messages.length - 1,
+				message: displayMessage,
+				displayMessage,
 				replacementContext: { kind: "pinano-messages", messages: replacementMessages },
 			})
 			mapReplacementEntryIds(agent, newEntryId, replacementMessages)
@@ -559,8 +580,8 @@ export async function compact(agent, keepLast = 6, signal) {
 				const newEntryId = await agent.session.appendCustomEntry("compaction", {
 					version: 2,
 					cutEntryId,
-					message: compactionMsg,
-					displayMessage: compactionMsg,
+					message: displayMessage,
+					displayMessage,
 					replacementContext: { kind: "pinano-messages", messages: replacementMessages },
 				})
 				// Map the synthetic replacement messages to persisted IDs so any
@@ -578,14 +599,14 @@ export async function compact(agent, keepLast = 6, signal) {
 	// Notify subscribers (live UIs render the marker into the transcript so
 	// the user sees that compaction happened). Optional-chain
 	// to tolerate unit-test stubs that don't implement the method.
-	await agent.notifyCompaction?.(compactionMsg)
+	await agent.notifyCompaction?.(displayMessage)
 
 	return {
 		summary,
-		keptCount: tail.length,
-		removedCount: prefix.length,
+		keptCount: preservedMessages.length,
+		removedCount: messages.length - preservedMessages.length,
 		tokensBefore,
-		mementoCount: replacementMessages.length - 1,
+		mementoCount,
 		summaryOmittedCount,
 	}
 }
@@ -609,7 +630,7 @@ export function findCompactionCutIndex(messages, keepLast) {
 	while (cut < messages.length && (
 		messages[cut]?.role === "toolResult"
 		|| messages[cut]?.pinanoCompactionMemento
-		|| messages[cut]?.compaction === true
+		|| isCompactionCheckpointMessage(messages[cut])
 	)) {
 		cut++
 	}

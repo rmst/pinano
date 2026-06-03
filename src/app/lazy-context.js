@@ -17,10 +17,11 @@
 // sessions that still have lazy context inside tool_result messages keep their
 // previous conversation-history behavior; they are not migrated.
 
-import { isAbsolute, relative, resolve, dirname } from "node:path"
+import { basename, isAbsolute, relative, resolve, dirname } from "node:path"
 
 import { loadContextFileFromDir } from "./context-files.js"
 import { LAZY_NOTICE_HEADING, PROJECT_CONTEXT_HEADING } from "./context-format.js"
+import { extractShellCommandPathInfo } from "./shell-paths.js"
 
 /** @typedef {import("./context-files.js").ContextFile} ContextFile */
 
@@ -30,6 +31,7 @@ export { LAZY_NOTICE_HEADING }
  * recognise it here so that paths announced in that message also count as
  * "already loaded" and the lazy loader won't re-emit them. */
 const STARTUP_CONTEXT_HEADING = PROJECT_CONTEXT_HEADING
+const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"])
 
 export class LazyContextLoader {
 	/** @type {string} */
@@ -41,6 +43,11 @@ export class LazyContextLoader {
 	constructor(options) {
 		this.cwd = resolve(options.cwd)
 		this.loaded = new Set(options.alreadyLoaded)
+	}
+
+	/** @param {string} cwd */
+	setCwd(cwd) {
+		this.cwd = resolve(cwd)
 	}
 
 	/** Paths already loaded (including those passed in at construction).
@@ -59,8 +66,7 @@ export class LazyContextLoader {
 	 * Add to the loaded-paths set every absolute path mentioned under one of
 	 * our context-block headings in replayed history. We scan two slots:
 	 *   - `toolResult` messages — where lazy notices live (LAZY_NOTICE_HEADING).
-	 *   - `user` messages — where the startup project-context block lives
-	 *     (STARTUP_CONTEXT_HEADING).
+	 *   - structurally marked `user` project-context messages — where the startup project-context block lives (STARTUP_CONTEXT_HEADING).
 	 *
 	 * Idempotent: safe to call before every `loadForPath`, including after a
 	 * mid-session resume that swapped in different history.
@@ -76,7 +82,7 @@ export class LazyContextLoader {
 		for (const m of messages) {
 			const role = m?.role
 			const heading = role === "toolResult" ? LAZY_NOTICE_HEADING
-				: role === "user" ? STARTUP_CONTEXT_HEADING
+				: role === "user" && m.projectContext === true ? STARTUP_CONTEXT_HEADING
 				: null
 			if (!heading) continue
 			const content = m.content
@@ -159,21 +165,70 @@ export function formatLazyContextNotice(files) {
 	return out
 }
 
-const PATH_TOOLS = new Set(["read", "write", "edit", "ls", "grep", "find"])
+const PATH_TOOLS = new Set(["read", "write", "edit", "ls", "grep", "find", "view_image"])
+
+function isContextFilePath(path) {
+	return CONTEXT_FILE_NAMES.has(basename(path))
+}
+
+function resolvePathForCwd(path, cwd) {
+	return isAbsolute(path) ? path : resolve(cwd, path)
+}
+
+function extractExecCommandPaths(args, cwd) {
+	const command = typeof args?.cmd === "string" ? args.cmd : ""
+	const baseCwd = typeof args?.workdir === "string"
+		? (isAbsolute(args.workdir) ? args.workdir : resolve(cwd, args.workdir))
+		: cwd
+	/** @type {string[]} */
+	const paths = []
+	/** @type {string[]} */
+	const manuallyLoadedContextPaths = []
+	if (typeof args?.workdir === "string") paths.push(baseCwd)
+	const extracted = extractShellCommandPathInfo(command, baseCwd)
+	paths.push(...extracted.paths)
+	manuallyLoadedContextPaths.push(...extracted.manuallyLoadedContextPaths)
+	return { paths, manuallyLoadedContextPaths }
+}
+
+function readManuallyLoadedContextPaths(args, cwd, result) {
+	if (typeof args?.path !== "string") return []
+	const abs = resolvePathForCwd(args.path, cwd)
+	if (!isContextFilePath(abs)) return []
+	return result?.details?.text?.fullFile === true ? [abs] : []
+}
+
+/**
+ * Pick path args from a tool call. For shell commands this is intentionally conservative: only literal existing paths passed to common read/list/search commands are returned.
+ *
+ * @param {string} toolName
+ * @param {any} args
+ * @param {string} cwd
+ * @param {any} [result]
+ * @returns {{ paths: string[], manuallyLoadedContextPaths: string[] }}
+ */
+export function extractToolPaths(toolName, args, cwd = process.cwd(), result = undefined) {
+	if (toolName === "apply_patch") {
+		if (typeof args !== "string") return { paths: [], manuallyLoadedContextPaths: [] }
+		const paths = [...args.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm)].map((match) => match[1])
+		return { paths, manuallyLoadedContextPaths: [] }
+	}
+	if (toolName === "exec_command") return extractExecCommandPaths(args, cwd)
+	if (!PATH_TOOLS.has(toolName)) return { paths: [], manuallyLoadedContextPaths: [] }
+	if (toolName === "read" && args && typeof args.path === "string") {
+		return { paths: [args.path], manuallyLoadedContextPaths: readManuallyLoadedContextPaths(args, cwd, result) }
+	}
+	if (args && typeof args.path === "string") return { paths: [args.path], manuallyLoadedContextPaths: [] }
+	// ls/grep/find default to cwd when path is omitted — nothing new to load.
+	return { paths: [], manuallyLoadedContextPaths: [] }
+}
 
 /** Pick the path arg from a tool call, or null if the tool isn't path-bound.
  * @param {string} toolName
  * @param {any} args
+ * @param {string} [cwd]
  * @returns {string | null}
  */
-export function extractToolPath(toolName, args) {
-	if (toolName === "apply_patch") {
-		if (typeof args !== "string") return null
-		const match = /^\*\*\* (?:Add File|Update File|Delete File): (.+)$/m.exec(args)
-		return match?.[1] ?? null
-	}
-	if (!PATH_TOOLS.has(toolName)) return null
-	if (args && typeof args.path === "string") return args.path
-	// ls/grep/find default to cwd when path is omitted — nothing new to load.
-	return null
+export function extractToolPath(toolName, args, cwd = process.cwd()) {
+	return extractToolPaths(toolName, args, cwd).paths[0] ?? null
 }

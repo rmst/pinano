@@ -180,7 +180,8 @@
  * @property {("none" | "minimal" | "low" | "medium" | "high" | "xhigh")[]} [supportedReasoningLevels]
  * @property {"none" | "minimal" | "low" | "medium" | "high" | "xhigh"} [defaultReasoningLevel]
  * @property {string} [baseInstructionsKey]
- * @property {"default" | "apply_patch"} [toolProfile]
+ * @property {string} [maintenanceModelRef]
+ * @property {"default" | "codex"} [toolProfile]
  */
 
 /**

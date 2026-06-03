@@ -36,13 +36,19 @@ export function defaultAgentDirs() {
  * @param {string} cwd
  * @returns {any | null} */
 export function buildProjectContextMessage(cwd) {
-	const files = loadProjectContextFiles({ cwd, agentDirs: defaultAgentDirs() })
+	const files = loadProjectContextForCwd(cwd)
 	if (files.length === 0) return null
 	return {
 		role: "user",
 		content: [{ type: "text", text: formatContextFilesAsUserMessage(files, cwd) }],
 		timestamp: Date.now(),
+		projectContext: true,
 	}
+}
+
+/** @param {string} cwd @returns {ContextFile[]} */
+export function loadProjectContextForCwd(cwd) {
+	return loadProjectContextFiles({ cwd, agentDirs: defaultAgentDirs() })
 }
 
 /**
@@ -62,7 +68,7 @@ export async function ensureProjectContextMessage(session, cwd) {
 	const displayMessages = session.getDisplayEntries?.().map((entry) => entry.message) ?? session.getMessages?.() ?? []
 	if (hasProjectContextMessage(displayMessages)) return
 	if (displayMessages.length > 0) return
-	const files = loadProjectContextFiles({ cwd, agentDirs: defaultAgentDirs() })
+	const files = loadProjectContextForCwd(cwd)
 	if (session.appendContextLoad) {
 		await session.appendContextLoad({ source: "startup", cwd, files })
 		return
@@ -74,5 +80,6 @@ export async function ensureProjectContextMessage(session, cwd) {
 		role: "user",
 		content: [{ type: "text", text: formatContextFilesAsUserMessage(files, cwd) }],
 		timestamp: Date.now(),
+		projectContext: true,
 	})
 }

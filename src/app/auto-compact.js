@@ -15,7 +15,6 @@
 
 import { compact, shouldCompact } from "./compaction.js"
 import { modelCompactionHandoffMessage } from "./compaction-summary.js"
-import { supportsImplicitResponsesCompaction } from "../responses-compaction.js"
 import { buildModelMessagesForAgent } from "./session-context.js"
 
 /** @typedef {import("../agent-core/agent.js").Agent} Agent */
@@ -33,12 +32,11 @@ export function makeAutoCompactTransform(getAgent, getThreshold) {
 			? agent.state.messages.map(modelCompactionHandoffMessage)
 			: buildModelMessagesForAgent(agent, agent.state.messages)
 		if (signal?.aborted) return modelMessages()
-		if (supportsImplicitResponsesCompaction(agent.state.model)) return modelMessages()
 		if (!shouldCompact(agent, getThreshold())) return modelMessages()
 		try {
 			await compact(agent, undefined, signal)
 		} catch (err) {
-			// Surface failures via /log — silent swallowing here historically
+			// Surface failures through stderr capture — silent swallowing here historically
 			// masked the case where the prefix to summarize was itself too big
 			// for one API call, leaving an un-compacted (oversize) request to
 			// go out and 400 instead.

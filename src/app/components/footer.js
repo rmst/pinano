@@ -5,6 +5,7 @@
 
 import { Text } from "../../tui/index.js"
 import { breakdownContext } from "../context-accounting.js"
+import { summarizeMessageBilling } from "../context-summary.js"
 import { reasoningLevelLabel } from "../../reasoning.js"
 import { findModelEntry } from "../models.js"
 import { buildModelMessagesForSession, contextFilesDisabledForAgent } from "../session-context.js"
@@ -66,41 +67,22 @@ export class Footer {
 		//                 definitions, and every message — so big tool
 		//                 results push the bar up immediately rather than
 		//                 waiting for the next assistant turn.
-		// A compaction marker invalidates any earlier assistant total (the
-		// prompt those numbers described no longer exists); its own
-		// totalTokens is the post-compaction estimate, used until a fresh
-		// turn reports real usage. A zero totalTokens means an error/aborted
-		// turn — don't let it clobber a valid prior value (`??` would, since
-		// `0` is not nullish).
-		let cost = 0
-		let lastTotal = 0
-		let compactionTs = 0
-		let compactionEstimate = 0
-		for (const msg of /** @type {any[]} */ (this.agent.state.messages)) {
-			if (msg.compaction) {
-				compactionTs = msg.timestamp ?? 0
-				compactionEstimate = msg.usage?.totalTokens ?? 0
-				cost += msg.usage?.cost?.total ?? 0
-				continue
-			}
-			if (msg.role !== "assistant") continue
-			const u = msg.usage
-			if (!u) continue
-			cost += u.cost?.total ?? 0
-			if (compactionTs && (msg.timestamp ?? 0) < compactionTs) continue
-			if (u.totalTokens) lastTotal = u.totalTokens
+		// Snapshot-backed clients receive precomputed context stats so normal UI refreshes do not need the full model-context message array.
+		const contextStats = this.agent.state.contextStats
+		const billing = summarizeMessageBilling(/** @type {any[]} */ (this.agent.state.messages))
+		const cost = Number.isFinite(contextStats?.costTotal) ? contextStats.costTotal : billing.costTotal
+		let used = Number.isFinite(contextStats?.usedTokens) ? contextStats.usedTokens : undefined
+		if (used === undefined) {
+			const messages = this.agent.session && !contextFilesDisabledForAgent(this.agent)
+				? buildModelMessagesForSession(this.agent.session, this.agent.state.messages)
+				: this.agent.state.messages
+			const estimated = breakdownContext({
+				messages,
+				systemPrompt: this.agent.state.systemPrompt,
+				tools: this.agent.state.tools,
+			}).total
+			used = Math.max(billing.lastTotalTokens, estimated)
 		}
-		if (!lastTotal) lastTotal = compactionEstimate
-
-		const messages = this.agent.session && !contextFilesDisabledForAgent(this.agent)
-			? buildModelMessagesForSession(this.agent.session, this.agent.state.messages)
-			: this.agent.state.messages
-		const estimated = breakdownContext({
-			messages,
-			systemPrompt: this.agent.state.systemPrompt,
-			tools: this.agent.state.tools,
-		}).total
-		const used = Math.max(lastTotal, estimated)
 
 		const ctxWindow = m.contextWindow ?? 0
 		const ctxPct = ctxWindow > 0 ? Math.min(100, Math.round((used / ctxWindow) * 100)) : 0

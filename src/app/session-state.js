@@ -5,6 +5,8 @@
  */
 
 import { isResponsesCompactionBlock } from "../responses-compaction.js"
+import { isPromptImageMarkerText } from "../prompt-images.js"
+import { appendMessageToContextStats } from "./context-summary.js"
 
 /** @param {any} content */
 export function contentText(content) {
@@ -12,7 +14,7 @@ export function contentText(content) {
 	if (!Array.isArray(content)) return ""
 	return content
 		.map((block) => {
-			if (block?.type === "text") return block.text ?? ""
+			if (block?.type === "text") return isPromptImageMarkerText(block.text ?? "") ? "" : block.text ?? ""
 			if (isResponsesCompactionBlock(block)) return "─── earlier context compacted by provider ───"
 			return ""
 		})
@@ -41,6 +43,7 @@ function messageLogicalKey(message) {
 		message.stopReason ?? "",
 		message.errorMessage ?? "",
 		message.compaction ?? "",
+		message.pinanoCompactionSummary ?? "",
 		message.content ?? "",
 	].map(stableJson).join("\u001f")
 }
@@ -73,6 +76,20 @@ export function cloneSessionSnapshot(snapshot) {
 	}
 }
 
+/** @param {any} event @param {string | null | undefined} [sessionId] */
+export function eventInvalidatesSessionSnapshot(event, sessionId = undefined) {
+	return event?.type === "snapshot_invalidated"
+		&& (!Array.isArray(event.scopes) || event.scopes.includes("session"))
+		&& (sessionId === undefined || event.sessionId === sessionId)
+}
+
+/** @param {any} event */
+export function eventInvalidatesSessionList(event) {
+	return event?.type === "snapshot_invalidated"
+		&& Array.isArray(event.scopes)
+		&& event.scopes.includes("sessions")
+}
+
 /** @param {any} snapshot @param {any} message */
 function appendDisplayMessage(snapshot, message) {
 	if (!message) return snapshot
@@ -85,13 +102,15 @@ function appendDisplayMessage(snapshot, message) {
 /** @param {any} snapshot @param {any} message */
 function appendMessage(snapshot, message) {
 	if (!message) return snapshot
+	const hadDisplayMessage = hasMessage(snapshot.messages, message)
 	const next = appendDisplayMessage(snapshot, message)
 	const contextMessages = Array.isArray(snapshot.contextMessages)
 		? hasMessage(snapshot.contextMessages, message)
 			? snapshot.contextMessages
 			: [...snapshot.contextMessages, message]
 		: snapshot.contextMessages
-	return { ...next, contextMessages }
+	const contextStats = hadDisplayMessage ? snapshot.contextStats : appendMessageToContextStats(snapshot.contextStats, message)
+	return { ...next, contextMessages, contextStats }
 }
 
 /** @param {any} snapshot @param {any} message */

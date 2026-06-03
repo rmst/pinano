@@ -7,15 +7,8 @@
 // Auth: API keys and ChatGPT subscription OAuth are managed in credentials settings.
 // Stored credentials are refreshed/resolved on demand.
 
-import { spawn } from "node:child_process"
-
-import { availableModelEntries, modelEntryMatches, modelRef, modelSettingsHasRef, resolveModel } from "./models.js"
-import { loadSettings } from "./settings.js"
-import { buildProjectContextMessage, isProjectContextMessage } from "./project-context.js"
-import { runPrintMode } from "./print-mode.js"
-import { installStderrCapture } from "./stderr-capture.js"
-import { createPinanoAgent, createPinanoSidecarAgent } from "./agent-factory.js"
-import { overviewRoute, parseRouteArg } from "./routes.js"
+import { readFile } from "node:fs/promises"
+import { reexecRuntime } from "./reexec-runtime.js"
 
 const NO_MODEL_PROVIDER_CLI_MESSAGE = "No model provider configured. Run `pinano open /settings/credentials` to add your ChatGPT subscription or an API key."
 
@@ -25,6 +18,7 @@ if (process.env.PINANO_PROCESS_TITLE) process.title = process.env.PINANO_PROCESS
  * @typedef {object} Args
  * @property {string} cwd
  * @property {boolean} help
+ * @property {boolean} version
  * @property {"print" | "bg" | "logs" | "stop"} [sessionCommand]
  * @property {"text" | "json"} mode
  * @property {string[]} messages
@@ -110,6 +104,7 @@ function parseArgs(argv) {
 	const args = {
 		cwd: process.cwd(),
 		help: false,
+		version: false,
 		mode: "text",
 		messages: [],
 		noContextFiles: false,
@@ -119,6 +114,7 @@ function parseArgs(argv) {
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i]
 		if (arg === "--help" || arg === "-h") args.help = true
+		else if (arg === "--version" || arg === "-v") args.version = true
 		else if (arg === "--no-context-files") args.noContextFiles = true
 		else if (arg === "--cwd") failUsage("--cwd was removed. Run `cd <path> && pinano` instead.")
 		else if (arg === "--mode") failUsage("--mode is only supported by the hidden `pinano session print` command.")
@@ -163,15 +159,8 @@ function parseArgs(argv) {
 			failUsage(`Unknown option: ${arg}`)
 		}
 	}
-	if (!args.help) {
+	if (!args.help && !args.version) {
 		if (args.command === "open" && !args.commandArg) failUsage("open requires a route: /, /chat/<id>, or /settings/credentials")
-		if (args.command === "open") {
-			try {
-				args.route = parseRouteArg(args.commandArg)
-			} catch (err) {
-				failUsage(/** @type {any} */ (err)?.message ?? err)
-			}
-		}
 		if ((args.serviceHost || args.servicePort !== undefined || args.serviceRunId || args.serviceClaimId) && !args.serviceRun) {
 			failUsage("Service internals require `pinano service run`.")
 		}
@@ -190,6 +179,12 @@ function parseArgs(argv) {
 
 function webDisabledMessage() {
 	return "Pinano Web is disabled. Set \"web\": true in $PINANO_HOME/config/default-settings.json or settings.json to enable it."
+}
+
+async function packageVersion() {
+	const pkg = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf-8"))
+	if (typeof pkg.version !== "string" || !pkg.version) throw new Error("Pinano package.json is missing a version")
+	return pkg.version
 }
 
 /**
@@ -217,7 +212,8 @@ function mainHelpLines(settings) {
 		...usage,
 		"",
 		"Options:",
-		"  -h, --help  show help",
+		"  -h, --help     show help",
+		"  -v, --version  show version",
 		"",
 		"In the TUI, type /help for slash commands.",
 	]
@@ -275,24 +271,11 @@ async function reexecForStaleRuntime(err, cliArgs = process.argv.slice(2)) {
 	const depth = Number(process.env.PINANO_STALE_RUNTIME_REEXEC_DEPTH ?? 0)
 	if (Number.isFinite(depth) && depth >= 3) return false
 	console.error("Pinano was updated; reopening…")
-	const child = spawn(runtime, [target, ...cliArgs], {
+	await reexecRuntime({
+		command: runtime,
+		args: [target, ...cliArgs],
 		cwd: process.cwd(),
-		env: { ...process.env, PINANO_STALE_RUNTIME_REEXEC_DEPTH: String((Number.isFinite(depth) ? depth : 0) + 1) },
-		stdio: "inherit",
-	})
-	await new Promise((resolve, reject) => {
-		let settled = false
-		child.on("error", (childErr) => {
-			if (settled) return
-			settled = true
-			reject(childErr)
-		})
-		child.on("exit", (code, signal) => {
-			if (settled) return
-			settled = true
-			if (signal) process.kill(process.pid, signal)
-			else process.exit(code ?? 0)
-		})
+		envPatch: { PINANO_STALE_RUNTIME_REEXEC_DEPTH: String((Number.isFinite(depth) ? depth : 0) + 1) },
 	})
 	return true
 }
@@ -300,6 +283,31 @@ async function reexecForStaleRuntime(err, cliArgs = process.argv.slice(2)) {
 
 async function main() {
 	const args = parseArgs(process.argv.slice(2))
+	if (args.version) {
+		console.log(await packageVersion())
+		return
+	}
+
+	const [
+		{ loadSettings },
+		{ availableModelEntries, modelEntryMatches, modelRef, modelSettingsHasRef, resolveModel },
+		{ buildProjectContextMessage, isProjectContextMessage },
+		{ runPrintMode },
+		{ installStderrCapture },
+		{ createPinanoAgent, createPinanoSidecarAgent },
+		{ overviewRoute, parseRouteArg },
+		{ initialEnvironmentContextFor },
+	] = await Promise.all([
+		import("./settings.js"),
+		import("./models.js"),
+		import("./project-context.js"),
+		import("./print-mode.js"),
+		import("./stderr-capture.js"),
+		import("./agent-factory.js"),
+		import("./routes.js"),
+		import("./environment-context.js"),
+	])
+
 	const settings = await loadSettings()
 	if (args.web && !settings.web) {
 		console.error(webDisabledMessage())
@@ -308,6 +316,13 @@ async function main() {
 	if (args.help) {
 		printHelp(args, settings)
 		return
+	}
+	if (args.command === "open") {
+		try {
+			args.route = parseRouteArg(args.commandArg)
+		} catch (err) {
+			failUsage(/** @type {any} */ (err)?.message ?? err)
+		}
 	}
 
 	const availableModels = await availableModelEntries(settings)
@@ -320,19 +335,14 @@ async function main() {
 	const modelId = configuredModel || configuredDeclarativeModel ? settings.model : (availableModels[0] ? modelRef(availableModels[0]) : settings.model)
 	const model = resolveModel(modelId, { models: settings.models })
 
-	const createAgent = ({ cwd = args.cwd } = {}) => createPinanoAgent({
+	const createAgent = ({ cwd = args.cwd, toolExecutor = undefined } = {}) => createPinanoAgent({
 		cwd,
 		model,
 		settings,
 		noContextFiles: args.noContextFiles,
+		environmentContext: () => initialEnvironmentContextFor(cwd),
+		...(toolExecutor ? { toolExecutor } : {}),
 	})
-
-	/** @type {ReturnType<typeof createAgent> | undefined} */
-	let agent
-	const getAgent = () => {
-		agent ??= createAgent({ cwd: args.cwd })
-		return agent
-	}
 
 	if (args.serviceRun) {
 		const { runService } = await import("./service-mode.js")
@@ -362,6 +372,7 @@ async function main() {
 					settings,
 					noContextFiles: args.noContextFiles,
 					toolExecutor: executor,
+					environmentContext: () => initialEnvironmentContextFor(cwd),
 				})
 				agent.createSidecarAgent = (sidecarOptions) => {
 					let sidecar
@@ -460,12 +471,19 @@ async function main() {
 
 	// Print mode is hermetic: no session creation, no index work.
 	if (args.sessionCommand === "print") {
-		const agent = getAgent()
-		if (!args.noContextFiles) {
-			const ctxMsg = buildProjectContextMessage(args.cwd)
-			if (ctxMsg) agent.state.messages = [ctxMsg]
+		const { ToolExecutorRuntime } = await import("./tool-executor-runtime.js")
+		const executor = new ToolExecutorRuntime({ cwd: args.cwd })
+		const agent = createAgent({ cwd: args.cwd, toolExecutor: executor })
+		let code = 1
+		try {
+			if (!args.noContextFiles) {
+				const ctxMsg = buildProjectContextMessage(args.cwd)
+				if (ctxMsg) agent.state.messages = [ctxMsg]
+			}
+			code = await runPrintMode(agent, { mode: args.mode, messages: args.messages })
+		} finally {
+			agent.dispose?.()
 		}
-		const code = await runPrintMode(agent, { mode: args.mode, messages: args.messages })
 		process.exit(code)
 	}
 

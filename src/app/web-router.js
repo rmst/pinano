@@ -10,7 +10,7 @@
 
 /**
  * @typedef {object} WebContext
- * @property {{ url: string, header: (name: string) => string | null, json: () => Promise<any>, param: (name: string) => string | undefined }} req
+ * @property {{ url: string, signal: AbortSignal, header: (name: string) => string | null, json: () => Promise<any>, param: (name: string) => string | undefined }} req
  * @property {Response} res
  * @property {(data: any, status?: number, headers?: HeadersInit) => Response} json
  * @property {(body: BodyInit | null | undefined, status?: number, headers?: HeadersInit) => Response} body
@@ -57,6 +57,7 @@ function createContext(request, params) {
 	return {
 		req: {
 			url: request.url,
+			signal: request.signal,
 			header: (name) => request.headers.get(name),
 			json: () => request.json(),
 			param: (name) => params?.[name],

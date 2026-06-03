@@ -17,12 +17,6 @@ import { beginModelRequest, finishModelRequest } from "../model-io-log.js"
 import { executeResponsesRequest } from "../responses-transport.js"
 import { buildAssistantAuth, emptyUsage } from "../usage.js"
 import { convertResponsesMessages, convertResponsesTools } from "./responses-shared.js"
-import {
-	disableImplicitResponsesCompaction,
-	isUnsupportedImplicitResponsesCompactionError,
-	responsesCompactThreshold,
-	supportsImplicitResponsesCompaction,
-} from "../../responses-compaction.js"
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
 const JWT_CLAIM_PATH = "https://api.openai.com/auth"
@@ -100,10 +94,6 @@ function buildBody(model, context, options) {
 			effort,
 			summary: options.reasoningSummary ?? "auto",
 		}
-	}
-	if (!options?.disableImplicitResponsesCompaction && supportsImplicitResponsesCompaction(model)) {
-		const compactThreshold = responsesCompactThreshold(model, options?.autocompactThreshold)
-		if (compactThreshold) body.context_management = [{ type: "compaction", compact_threshold: compactThreshold }]
 	}
 	return body
 }
@@ -241,19 +231,7 @@ export function streamCodex(model, context, options) {
 				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,
 				streamInactivityTimeoutMs: options?.streamInactivityTimeoutMs,
 			})
-			try {
-				await execute(bodyJson)
-			} catch (error) {
-				const canRetryWithoutCompaction = output.content.length === 0
-					&& !output.responseId
-					&& body.context_management
-					&& isUnsupportedImplicitResponsesCompactionError(error)
-				if (!canRetryWithoutCompaction) throw error
-				disableImplicitResponsesCompaction(model)
-				const fallbackBody = { ...body }
-				delete fallbackBody.context_management
-				await execute(JSON.stringify(fallbackBody))
-			}
+			await execute(bodyJson)
 
 			if (options?.signal?.aborted) throw new Error("Request was aborted")
 			if (output.stopReason === "error") {

@@ -18,6 +18,7 @@ export class MemorySessionStorage {
 		this.byId = new Map()
 		this.labels = new Map()
 		this.leafId = null
+		this.mutationVersion = 0
 	}
 
 	getMetadata() {
@@ -26,9 +27,13 @@ export class MemorySessionStorage {
 	getLeafId() {
 		return this.leafId
 	}
+	getMutationVersion() {
+		return this.mutationVersion
+	}
 	setLeafId(id) {
 		if (id !== null && !this.byId.has(id)) throw new Error(`Entry ${id} not found`)
 		this.leafId = id
+		this.mutationVersion += 1
 	}
 	createEntryId() {
 		return shortId(this.byId)
@@ -54,6 +59,7 @@ export class MemorySessionStorage {
 			else this.labels.delete(entry.targetId)
 		}
 		this.leafId = entry.id
+		this.mutationVersion += 1
 	}
 	getPathToRoot(leafId) {
 		if (leafId === null) return []

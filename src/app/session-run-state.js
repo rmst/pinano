@@ -14,7 +14,10 @@ function toolExecutionData(entry) {
 }
 
 function toolExecutionHasDurableResult(data) {
-	return (data?.phase === "ended" || data?.phase === "recovered_unknown") && data.toolCallId
+	if (!data?.toolCallId) return false
+	if (data.phase === "recovered_unknown") return true
+	if (data.phase !== "ended") return false
+	return data.hasDurableMessage === true || !!data.messageEntryId || data.hasRecoveryMessage === true || !!data.message
 }
 
 function unknownToolResultMessage(tool) {

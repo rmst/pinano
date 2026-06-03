@@ -8,6 +8,8 @@
 //   3. Skip assistant messages with stopReason "error" or "aborted" —
 //      they're incomplete turns that shouldn't be replayed.
 
+import { isPromptImageMarkerText } from "../prompt-images.js"
+
 const NON_VISION_USER_PLACEHOLDER = "(image omitted: model does not support images)"
 const NON_VISION_TOOL_PLACEHOLDER = "(tool image omitted: model does not support images)"
 
@@ -20,6 +22,7 @@ function replaceImagesWithPlaceholder(content, placeholder) {
 			prevWasPlaceholder = true
 			continue
 		}
+		if (block.type === "text" && isPromptImageMarkerText(block.text ?? "")) continue
 		result.push(block)
 		prevWasPlaceholder = block.type === "text" && block.text === placeholder
 	}

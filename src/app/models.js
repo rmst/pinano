@@ -2,8 +2,8 @@
 // pi-mono's `packages/ai/src/models.generated.ts` (commit 3d5cbe98) and are
 // kept in sync manually for the providers we actually care about:
 //
-//   - OpenAI cloud (API key)        — gpt-5.5 / gpt-5.4
-//   - Codex (ChatGPT subscription)  — gpt-5.5 / gpt-5.4 / gpt-5.4-mini via OAuth
+//   - OpenAI cloud (API key)        — gpt-5.5 / gpt-5.4-mini
+//   - Codex (ChatGPT subscription)  — gpt-5.5 / gpt-5.4-mini via OAuth
 //   - Local llama.cpp / OpenAI-compat
 //   - Moonshot Kimi K2.x
 //   - DeepSeek V4
@@ -15,7 +15,7 @@
 // most OpenAI-compatible servers speak.
 
 import { resolveApiKey } from "./auth.js"
-import { APPLY_PATCH_TOOL_PROFILE, DEFAULT_TOOL_PROFILE, GPT_5_4_MINI_PINANO_INSTRUCTIONS_KEY, GPT_5_5_PINANO_INSTRUCTIONS_KEY } from "./model-instructions.js"
+import { CODEX_TOOL_PROFILE, DEFAULT_TOOL_PROFILE, GPT_5_4_MINI_PINANO_INSTRUCTIONS_KEY, GPT_5_5_PINANO_INSTRUCTIONS_KEY } from "./model-instructions.js"
 
 /** @typedef {"openai" | "openai-codex" | "llamacpp" | "moonshot" | "deepseek"} ModelProvider */
 
@@ -34,7 +34,6 @@ import { APPLY_PATCH_TOOL_PROFILE, DEFAULT_TOOL_PROFILE, GPT_5_4_MINI_PINANO_INS
  * @property {{ input: number, output: number, cacheRead: number, cacheWrite: number }} cost
  * @property {("text" | "image")[]} [input]
  * @property {Record<string, unknown>} [compat]
- * @property {{ implicitResponses?: boolean }} [compaction]
  * @property {"chat" | "responses"} [transport]
  * @property {boolean} [supportsTextVerbosity]
  * @property {"low" | "medium" | "high"} [defaultTextVerbosity]
@@ -42,7 +41,8 @@ import { APPLY_PATCH_TOOL_PROFILE, DEFAULT_TOOL_PROFILE, GPT_5_4_MINI_PINANO_INS
  * @property {("none" | "minimal" | "low" | "medium" | "high" | "xhigh")[]} [supportedReasoningLevels]
  * @property {"none" | "minimal" | "low" | "medium" | "high" | "xhigh"} [defaultReasoningLevel]
  * @property {string} [baseInstructionsKey]
- * @property {"default" | "apply_patch"} [toolProfile]
+ * @property {string} [maintenanceModelRef]
+ * @property {"default" | "codex"} [toolProfile]
  * @property {string[]} [tags]
  */
 
@@ -74,8 +74,7 @@ const GPT_5_5_REASONING_LEVELS = ["low", "medium", "high", "xhigh"]
 const GPT_5_5_MODEL = {
 	reasoning: true,
 	transport: "responses",
-	toolProfile: APPLY_PATCH_TOOL_PROFILE,
-	compaction: { implicitResponses: true },
+	toolProfile: CODEX_TOOL_PROFILE,
 	contextWindow: 272_000,
 	maxTokens: 128_000,
 	supportsTextVerbosity: true,
@@ -96,6 +95,7 @@ export const MODEL_REGISTRY = [
 		authProvider: "openai",
 		baseUrl: OPENAI_BASE,
 		...GPT_5_5_MODEL,
+		maintenanceModelRef: "gpt-5.4-mini",
 		cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
 		tags: ["frontier"],
 	},
@@ -107,26 +107,11 @@ export const MODEL_REGISTRY = [
 		baseUrl: OPENAI_BASE,
 		reasoning: true,
 		transport: "responses",
-		toolProfile: APPLY_PATCH_TOOL_PROFILE,
-		compaction: { implicitResponses: true },
+		toolProfile: CODEX_TOOL_PROFILE,
 		contextWindow: 1_050_000,
 		maxTokens: 128_000,
 		cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
 		tags: ["frontier", "pro"],
-	},
-	{
-		id: "gpt-5.4",
-		displayName: "GPT-5.4",
-		provider: "openai",
-		authProvider: "openai",
-		baseUrl: OPENAI_BASE,
-		reasoning: true,
-		transport: "responses",
-		toolProfile: APPLY_PATCH_TOOL_PROFILE,
-		compaction: { implicitResponses: true },
-		contextWindow: 272_000,
-		maxTokens: 128_000,
-		cost: { input: 1.25, output: 10, cacheRead: 0.125, cacheWrite: 0 },
 	},
 	{
 		id: "gpt-5.4-mini",
@@ -136,8 +121,7 @@ export const MODEL_REGISTRY = [
 		baseUrl: OPENAI_BASE,
 		reasoning: true,
 		transport: "responses",
-		toolProfile: APPLY_PATCH_TOOL_PROFILE,
-		compaction: { implicitResponses: true },
+		toolProfile: CODEX_TOOL_PROFILE,
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		baseInstructionsKey: GPT_5_4_MINI_PINANO_INSTRUCTIONS_KEY,
@@ -151,8 +135,7 @@ export const MODEL_REGISTRY = [
 		baseUrl: OPENAI_BASE,
 		reasoning: true,
 		transport: "responses",
-		toolProfile: APPLY_PATCH_TOOL_PROFILE,
-		compaction: { implicitResponses: true },
+		toolProfile: CODEX_TOOL_PROFILE,
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		cost: { input: 0.05, output: 0.4, cacheRead: 0.005, cacheWrite: 0 },
@@ -166,21 +149,7 @@ export const MODEL_REGISTRY = [
 		baseUrl: CODEX_BASE,
 		legacyIds: ["gpt-5.5-codex"],
 		...GPT_5_5_MODEL,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		tags: ["subscription"],
-	},
-	{
-		id: "gpt-5.4",
-		displayName: "GPT-5.4 (subscription)",
-		provider: "openai-codex",
-		authProvider: "openai-codex",
-		baseUrl: CODEX_BASE,
-		legacyIds: ["gpt-5.4-codex"],
-		reasoning: true,
-		toolProfile: APPLY_PATCH_TOOL_PROFILE,
-		compaction: { implicitResponses: true },
-		contextWindow: 272_000,
-		maxTokens: 128_000,
+		maintenanceModelRef: "openai-codex/gpt-5.4-mini",
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		tags: ["subscription"],
 	},
@@ -191,8 +160,7 @@ export const MODEL_REGISTRY = [
 		authProvider: "openai-codex",
 		baseUrl: CODEX_BASE,
 		reasoning: true,
-		toolProfile: APPLY_PATCH_TOOL_PROFILE,
-		compaction: { implicitResponses: true },
+		toolProfile: CODEX_TOOL_PROFILE,
 		contextWindow: 272_000,
 		maxTokens: 128_000,
 		baseInstructionsKey: GPT_5_4_MINI_PINANO_INSTRUCTIONS_KEY,
@@ -380,7 +348,7 @@ function modelTransport(value, fallback) {
 
 /** @param {unknown} value @param {ModelEntry["toolProfile"]} fallback */
 function modelToolProfile(value, fallback) {
-	if (value === APPLY_PATCH_TOOL_PROFILE || value === DEFAULT_TOOL_PROFILE) return value
+	if (value === CODEX_TOOL_PROFILE || value === DEFAULT_TOOL_PROFILE) return value
 	return fallback
 }
 
@@ -424,8 +392,8 @@ function configuredModelEntry(ref, value) {
 		cost: mergeCost(template.cost, config.cost),
 		input: modelInput(config.input, template.input),
 		compat: Object.keys(plainObject(config.compat)).length > 0 ? { ...(template.compat ?? {}), ...plainObject(config.compat) } : template.compat,
-		compaction: Object.keys(plainObject(config.compaction)).length > 0 ? { ...(template.compaction ?? {}), ...plainObject(config.compaction) } : template.compaction,
 		transport: modelTransport(config.transport, template.transport),
+		maintenanceModelRef: typeof config.maintenanceModelRef === "string" && config.maintenanceModelRef ? config.maintenanceModelRef : template.maintenanceModelRef,
 		toolProfile: modelToolProfile(config.toolProfile, template.toolProfile),
 		tags: stringArray(config.tags, template.tags),
 	}
@@ -519,13 +487,13 @@ export function buildModel(entry, overrides = {}) {
 		contextWindow: entry.contextWindow,
 		maxTokens: entry.maxTokens,
 		compat: entry.compat,
-		compaction: entry.compaction ? { ...entry.compaction } : undefined,
 		supportsTextVerbosity: entry.supportsTextVerbosity,
 		defaultTextVerbosity: entry.defaultTextVerbosity,
 		supportsParallelToolCalls: entry.supportsParallelToolCalls,
 		supportedReasoningLevels: entry.supportedReasoningLevels ? [...entry.supportedReasoningLevels] : undefined,
 		defaultReasoningLevel: entry.defaultReasoningLevel,
 		baseInstructionsKey: entry.baseInstructionsKey,
+		maintenanceModelRef: entry.maintenanceModelRef,
 		toolProfile: entry.toolProfile,
 	}
 }
@@ -533,7 +501,7 @@ export function buildModel(entry, overrides = {}) {
 /**
  * Refresh a persisted model object with current registry metadata while keeping
  * the session-selected id/provider/baseUrl. This preserves model locking but
- * lets old sessions pick up new capabilities such as implicit compaction.
+ * lets old sessions pick up new model capabilities.
  *
  * @param {any} model
  * @param {string | undefined} [ref]
@@ -549,6 +517,7 @@ export function refreshModelFromRegistry(model, ref = undefined) {
 	const refreshed = buildModel(entry, { id: model?.id ?? entry.id, baseUrl: model?.baseUrl })
 	const next = { ...model, ...refreshed }
 	delete next.baseInstructions
+	delete next.compaction
 	return next
 }
 

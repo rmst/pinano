@@ -43,7 +43,7 @@ export function createSessionSetTool(options = {}) {
 				state: {
 					type: "string",
 					enum: ["readyForReview", "needs_input", "completed"],
-					description: "Current session state shown in Pinano UI. It automatically resets to readyForReview at the start of every turn. Use needs_input when blocked on the user. Use completed only when it is unlikely that the user will return to the session, e.g. when everything that has ever been discussed has been fully addressed and all changes have been committed/merged and ongoing discussions have been resolved.",
+					description: "Current session state shown in Pinano UI. It automatically resets to readyForReview at the start of every turn. Use needs_input whenever blocked on a user decision, missing information, or other user action before work can continue; otherwise leave state unchanged. Never use completed unless the user explicitly asks you to.",
 				},
 				descriptionInUi: {
 					type: "string",

@@ -49,6 +49,8 @@ import { availableModelEntries, findModelEntry, modelRef, modelRefMatches } from
 import { loadSettings, messageRenderOptionsFromSettings, updateSetting } from "./settings.js"
 import { authFilePath } from "./paths.js"
 import { parseBashShortcut } from "./bash-shortcut.js"
+import { readClipboardImage } from "./clipboard-image.js"
+import { promptImageLabel, promptImagePlaceholders } from "../prompt-images.js"
 import {
 	codexUsageBaseUrlForModel,
 	codexUsageBaseUrlFromSettings,
@@ -64,8 +66,9 @@ import { formatContextReport } from "./context-report.js"
 import { formatSystemReport, projectContextPathsInMessages } from "./project-context-display.js"
 import { editorTheme, theme } from "./theme.js"
 import { isProjectContextMessage } from "./project-context.js"
-import { applySessionEvent, cloneSessionSnapshot, messageKey } from "./session-state.js"
+import { applySessionEvent, cloneSessionSnapshot, eventInvalidatesSessionList, eventInvalidatesSessionSnapshot, messageKey } from "./session-state.js"
 import { overviewRoute, routeToArg, routeToCliArgs, sessionRoute, settingsCredentialsRoute } from "./routes.js"
+import { reexecRuntime } from "./reexec-runtime.js"
 
 
 /** @typedef {import("./stderr-capture.js").StderrCapture} StderrCapture */
@@ -113,6 +116,31 @@ function compactHomePath(p) {
 	if (path === home) return "~"
 	if (path.startsWith(`${home}/`)) return `~${path.slice(home.length)}`
 	return path
+}
+
+function promptAttachmentsForText(promptImages, text) {
+	const byPlaceholder = new Map(promptImages.map((attachment) => [attachment.placeholder, attachment]))
+	const seen = new Set()
+	return promptImagePlaceholders(text).flatMap((item) => {
+		if (seen.has(item.placeholder)) return []
+		const attachment = byPlaceholder.get(item.placeholder)
+		if (!attachment) return []
+		seen.add(item.placeholder)
+		return [attachment]
+	})
+}
+
+function clearPromptImageAttachmentsForText(promptImages, text) {
+	return promptImages.filter((attachment) => !text.includes(attachment.placeholder))
+}
+
+function insertPromptImageAttachment(editor, promptImages, promptImageCounter, image) {
+	const placeholder = promptImageLabel(promptImageCounter + 1)
+	promptImages.push({ placeholder, image })
+	const current = editor.getText()
+	const prefix = current && !/\s$/.test(current) ? " " : ""
+	editor.insertTextAtCursor(`${prefix}${placeholder}`)
+	return promptImageCounter + 1
 }
 
 /** @param {string} text @param {number} width */
@@ -815,12 +843,14 @@ export class OverviewKeyHints {
 		if (state.peeking && state.hasText) return renderKeyHints([
 			["Enter", "reply"],
 			["Ctrl+J", "newline"],
+			["Ctrl+V", "image"],
 			["Esc", "clear"],
 			["/help", "more"],
 		], width)
 		if (state.hasText) return renderKeyHints([
 			["Enter", "dispatch"],
 			["Ctrl+J", "newline"],
+			["Ctrl+V", "image"],
 			["Esc", "clear"],
 			["/help", "more"],
 		], width)
@@ -828,6 +858,7 @@ export class OverviewKeyHints {
 			["Enter/→", "open"],
 			["↑/↓", "move"],
 			["Ctrl+F", "filter"],
+			["Ctrl+V", "image"],
 			["Ctrl+D", "done"],
 			["/help", "more"],
 		], width)
@@ -835,6 +866,7 @@ export class OverviewKeyHints {
 			["Enter/→", "open"],
 			["↑/↓", "move"],
 			["Ctrl+F", "filter"],
+			["Ctrl+V", "image"],
 			["Ctrl+D", "done"],
 			["/help", "more"],
 		], width)
@@ -853,6 +885,7 @@ export class SessionKeyHints {
 		if (state.hasText) return renderKeyHints([
 			["Enter", "send"],
 			["Ctrl+J", "newline"],
+			["Ctrl+V", "image"],
 			["Esc Esc", "clear"],
 			["Ctrl+C", "detach"],
 			["/help", "more"],
@@ -861,14 +894,19 @@ export class SessionKeyHints {
 			["←", "back"],
 		])
 		if (state.interruptible) hints.push(["Esc", "interrupt"])
-		hints.push(["Ctrl+C", "detach"], ["/help", "more"])
+		hints.push(["Ctrl+V", "image"], ["Ctrl+C", "detach"], ["/help", "more"])
 		return renderKeyHints(hints, width)
 	}
 }
 
 /** @param {any} event */
+export function eventIsServiceStreamRecovery(event) {
+	return event?.type === "service_event_stream_reconnected"
+}
+
+/** @param {any} event */
 export function eventNeedsServiceChatSnapshot(event) {
-	return [
+	return eventIsServiceStreamRecovery(event) || eventInvalidatesSessionSnapshot(event) || [
 		"compaction",
 		"error",
 	].includes(event?.type)
@@ -876,7 +914,7 @@ export function eventNeedsServiceChatSnapshot(event) {
 
 /** @param {any} event */
 export function eventNeedsServiceSessionRefresh(event) {
-	return [
+	return eventIsServiceStreamRecovery(event) || eventInvalidatesSessionList(event) || [
 		"agent_start",
 		"agent_end",
 		"agent_view_metadata",
@@ -930,6 +968,7 @@ const OVERVIEW_COMMANDS = [
 	{ name: "hotkeys", description: "show overview hotkeys" },
 	{ name: "web", description: "open Pinano Web overview" },
 	{ name: "usage", description: "show ChatGPT/Codex usage limits" },
+	{ name: "debug-log", description: "show captured stderr; /debug-log clear resets it", takesArgs: true },
 	{ name: "model", description: "select model for new sessions", takesArgs: true },
 	{ name: "credentials", description: "manage ChatGPT/API-key credentials" },
 	{ name: "settings", description: "edit local settings" },
@@ -948,8 +987,6 @@ const SERVICE_CHAT_COMMANDS = [
 	{ name: "help", description: "show service chat commands" },
 	{ name: "hotkeys", description: "show hotkeys" },
 	{ name: "web", description: "open this session in Pinano Web" },
-	{ name: "agents", description: "return to the agents overview" },
-	{ name: "bg", description: "return to the agents overview" },
 	{ name: "branch", description: "create a new session from the current conversation branch" },
 	{ name: "rewind", description: "rewind to a previous user message or switch to a branch tip", rejectArgs: true },
 	{ name: "session", description: "show current session details" },
@@ -961,16 +998,12 @@ const SERVICE_CHAT_COMMANDS = [
 	{ name: "settings", description: "edit local settings" },
 	{ name: "reload", description: "reload settings/auth caches" },
 	{ name: "usage", description: "show ChatGPT/Codex usage limits" },
-	{ name: "log", description: "show captured stderr; /log clear resets it", takesArgs: true },
 	{ name: "continue", description: "resume an interrupted turn, or ask the model to continue" },
 	{ name: "abort", description: "abort the current turn" },
 ]
 
 function serviceChatCommandMap(settings) {
-	return commandMap([
-		...commandsWithWebSetting(SERVICE_CHAT_COMMANDS, settings),
-		{ name: "background" },
-	])
+	return commandMap(commandsWithWebSetting(SERVICE_CHAT_COMMANDS, settings))
 }
 
 function serviceChatCommandsForModel(model, settings) {
@@ -1044,6 +1077,27 @@ async function showCodexUsageModal(tui, baseUrl, onPayload) {
 	} catch (err) {
 		await showTextModal(tui, "Usage error", String(err?.message ?? err))
 	}
+}
+
+async function showDebugLogModal(tui, stderrCapture, arg) {
+	if (!stderrCapture) {
+		await showTextModal(tui, "Debug log", "stderr capture not enabled")
+		return
+	}
+	if (arg === "clear") {
+		stderrCapture.clear()
+		await showTextModal(tui, "Debug log", "debug log cleared")
+		return
+	}
+	const entries = stderrCapture.entries()
+	if (entries.length === 0) {
+		await showTextModal(tui, "Debug log", "no stderr captured")
+		return
+	}
+	await showTextModal(tui, "Debug log", entries.map((entry) => {
+		const time = new Date(entry.time).toISOString().slice(11, 19)
+		return `${time}  ${entry.text}`
+	}).join("\n"))
 }
 
 async function loadSubscriptionProviders() {
@@ -1781,6 +1835,7 @@ function agentAdapterForSnapshot(snapshot) {
 			model: snapshot?.model ?? { id: "?", provider: "unknown", baseUrl: "", contextWindow: 0 },
 			thinkingLevel: reasoningLevelLabel(snapshot?.thinkingLevel),
 			messages: snapshot?.contextMessages ?? snapshot?.messages ?? [],
+			contextStats: snapshot?.contextStats,
 			systemPrompt: snapshot?.systemPrompt ?? "",
 			tools: snapshot?.tools ?? [],
 		},
@@ -1836,16 +1891,21 @@ export class Chat {
 		this.onCodexUsage = opts.onCodexUsage
 		this.getCodexUsageBaseUrl = opts.getCodexUsageBaseUrl
 		this.refreshGlobalAuth = opts.refreshGlobalAuth
+		this.disposed = false
 		this.promptRequestInFlight = false
 		this.interruptRequested = false
 		this.abortPromise = undefined
 		this.promptCancelPromise = undefined
+		this.backgroundMutationRefreshes = new Map()
 		this.submittedPromptText = undefined
+		this.submittedPromptAttachments = []
 		this.draftClientId = randomUUID()
 		this.draftClientSeq = 0
 		this.draftSyncTimer = undefined
 		this.applyingPromptDraft = false
 		this.lastPromptDraftVersion = -1
+		this.promptImages = []
+		this.promptImageCounter = 0
 		this.snapshot = null
 		this.root = new Container()
 		this.chatContainer = new TranscriptContainer()
@@ -1888,19 +1948,22 @@ export class Chat {
 			if (!trimmed) return
 			const commandLine = serviceChatCommandLine(trimmed, { web: this.webEnabled })
 			if (commandLine) {
+				this.clearPromptImagesForText(trimmed)
 				void this.handleSlash(commandLine).catch((err) => this.reportClientError(err, "/cmd error"))
 				return
 			}
 			if (!this.webEnabled && isWebSlashCommand(trimmed)) {
+				this.clearPromptImagesForText(trimmed)
 				this.appendLine(theme.dim("Pinano Web is disabled; set web: true in settings.json to enable /web."))
 				return
 			}
 			const shortcut = parseBashShortcut(trimmed)
 			if (shortcut) {
-				void this.client.bash(this.sessionId, trimmed).then((res) => {
+				this.clearPromptImagesForText(trimmed)
+				void this.client.bash(this.sessionId, trimmed).then(async (res) => {
 					this.appendLine(theme.dim(`$ ${shortcut.command}${shortcut.excludeFromContext ? " (no-ctx)" : ""}`))
 					if (res.result?.output) this.appendLine(res.result.output)
-					if (res.snapshot) this.update(res.snapshot)
+					await this.refreshAfterMutation(res)
 				}).catch((err) => this.reportClientError(err, "bash error"))
 				return
 			}
@@ -1924,6 +1987,7 @@ export class Chat {
 	}
 
 	dispose() {
+		this.disposed = true
 		this.stopStatusAgeTimer()
 		this.hideStatusLoader()
 		if (this.draftSyncTimer) clearTimeout(this.draftSyncTimer)
@@ -2005,16 +2069,22 @@ export class Chat {
 
 	/** @param {string} text @param {"steer" | undefined} [streamingBehavior] */
 	sendPrompt(text, streamingBehavior) {
+		const attachments = this.promptAttachmentsForText(text)
+		const images = attachments.map((attachment) => attachment.image)
 		this.promptRequestInFlight = true
-		if (!streamingBehavior) this.submittedPromptText = text
+		if (!streamingBehavior) {
+			this.submittedPromptText = text
+			this.submittedPromptAttachments = attachments
+		}
 		if (this.draftSyncTimer) {
 			clearTimeout(this.draftSyncTimer)
 			this.draftSyncTimer = undefined
 		}
 		const draftClientSeq = this.nextDraftClientSeq()
-		const request = this.client.prompt(this.sessionId, text, streamingBehavior, { draftClientId: this.draftClientId, draftClientSeq })
-			.then((res) => {
-				if (res?.snapshot) this.update(res.snapshot)
+		const request = this.client.prompt(this.sessionId, text, streamingBehavior, { draftClientId: this.draftClientId, draftClientSeq, images })
+			.then(async (res) => {
+				this.clearPromptImagesForText(text)
+				await this.refreshAfterMutation(res)
 			})
 			.catch((err) => {
 				this.reportClientError(err, "error")
@@ -2036,6 +2106,59 @@ export class Chat {
 		request.catch(() => {})
 	}
 
+	promptAttachmentsForText(text) {
+		return promptAttachmentsForText(this.promptImages, text)
+	}
+
+	promptImagesForText(text) {
+		return this.promptAttachmentsForText(text).map((attachment) => attachment.image)
+	}
+
+	clearPromptImagesForText(text) {
+		this.promptImages = clearPromptImageAttachmentsForText(this.promptImages, text)
+	}
+
+	clearSubmittedPrompt() {
+		this.submittedPromptText = undefined
+		this.submittedPromptAttachments = []
+	}
+
+	restorePromptImagesForText(text, images = []) {
+		const seen = new Set()
+		const placeholders = promptImagePlaceholders(text).filter((item) => {
+			if (seen.has(item.placeholder)) return false
+			seen.add(item.placeholder)
+			return true
+		})
+		if (placeholders.length === 0) return
+		const restored = placeholders.flatMap((item, index) => {
+			const existing = this.submittedPromptAttachments.find((attachment) => attachment.placeholder === item.placeholder)
+				?? this.promptImages.find((attachment) => attachment.placeholder === item.placeholder)
+			const image = existing?.image ?? images[index]
+			return image ? [{ placeholder: item.placeholder, image }] : []
+		})
+		this.promptImages = [
+			...this.promptImages.filter((attachment) => !placeholders.some((item) => item.placeholder === attachment.placeholder)),
+			...restored,
+		]
+		this.promptImageCounter = Math.max(this.promptImageCounter, ...placeholders.map((item) => item.index))
+	}
+
+	insertPromptImage(image) {
+		this.promptImageCounter = insertPromptImageAttachment(this.editor, this.promptImages, this.promptImageCounter, image)
+		this.tui.requestRender()
+	}
+
+	async pasteClipboardImage() {
+		try {
+			const image = await readClipboardImage()
+			this.insertPromptImage(image)
+		} catch (err) {
+			this.appendLine(theme.red(`[image paste error] ${err?.message ?? err}`))
+			this.tui.requestRender()
+		}
+	}
+
 	hasPromptCancelCandidate() {
 		return !!this.submittedPromptText && (this.promptRequestInFlight || this.snapshot?.isStreaming === true)
 	}
@@ -2055,15 +2178,19 @@ export class Chat {
 		this.tui.requestRender()
 		if (this.promptCancelPromise) return this.promptCancelPromise
 		const fallbackText = this.submittedPromptText
+		const fallbackAttachments = this.submittedPromptAttachments
 		this.promptCancelPromise = this.client.cancelPrompt(this.sessionId)
 			.then((res) => {
-				if (res?.snapshot) this.update(res.snapshot)
+				this.settleInterruptLocally()
 				if (res?.cancelled) {
-					this.editor.setText(res.text ?? fallbackText ?? "")
-					this.submittedPromptText = undefined
-				} else if (res?.snapshot?.isStreaming === false) {
-					this.submittedPromptText = undefined
+					const text = res.text ?? fallbackText ?? ""
+					this.restorePromptImagesForText(text, res.images ?? fallbackAttachments.map((attachment) => attachment.image))
+					this.editor.setText(text)
+					this.clearSubmittedPrompt()
+				} else if (this.snapshot?.isStreaming === false) {
+					this.clearSubmittedPrompt()
 				}
+				this.refreshAfterMutationInBackground(res, { errorLabel: "cancel prompt refresh error" })
 			})
 			.catch((err) => this.reportClientError(err, "cancel prompt error"))
 			.finally(() => {
@@ -2085,7 +2212,8 @@ export class Chat {
 		if (this.abortPromise) return this.abortPromise
 		this.abortPromise = this.client.abort(this.sessionId)
 			.then((res) => {
-				if (res?.snapshot) this.update(res.snapshot)
+				this.settleInterruptLocally()
+				this.refreshAfterMutationInBackground(res, { errorLabel: "interrupt refresh error" })
 			})
 			.catch((err) => this.reportClientError(err, "interrupt error"))
 			.finally(() => {
@@ -2202,10 +2330,6 @@ export class Chat {
 	async handleSlash(commandLine) {
 		const [name, ...rest] = commandLine.trim().split(/\s+/)
 		const arg = rest.join(" ").trim()
-		if (name === "agents" || name === "bg" || name === "background") {
-			this.detach()
-			return
-		}
 		if (name === "help") {
 			await this.showModal("Commands", commandHelpBody(serviceChatCommandsForModel(this.snapshot?.model, { web: this.webEnabled }), ["", "!cmd / !!cmd  run shell commands"]))
 			return
@@ -2216,10 +2340,10 @@ export class Chat {
 				"Shift+Enter   newline in prompt",
 				"Ctrl+C        exit this frontend without stopping service sessions",
 				"Left          return to agents overview when the editor is empty",
+				"Ctrl+G        return to agents overview",
 				"Esc           interrupt a running turn",
 				"Esc Esc       open the rewind picker",
 				"Tab           accept autocomplete suggestion",
-				"/agents       return to agents overview",
 			].join("\n"))
 			return
 		}
@@ -2232,13 +2356,13 @@ export class Chat {
 			return
 		}
 		if (name === "abort") {
-			await this.client.abort(this.sessionId)
+			await this.refreshAfterMutation(await this.client.abort(this.sessionId))
 			return
 		}
 		if (name === "continue") {
 			try {
 				const res = await this.client.continueRun(this.sessionId)
-				if (res.snapshot) this.update(res.snapshot)
+				await this.refreshAfterMutation(res)
 			} catch (err) {
 				if ((err?.message ?? String(err)) === "Cannot continue: assistant_complete") {
 					this.appendLine(theme.dim("nothing to resume; sending 'continue' as a prompt"))
@@ -2266,7 +2390,7 @@ export class Chat {
 			const sourceSessionId = this.sessionId
 			const branched = await this.client.branchSession(sourceSessionId)
 			this.sessionId = branched.sessionId
-			this.update(branched.snapshot)
+			await this.refreshAfterMutation(branched, { sessionId: branched.sessionId, replace: true })
 			this.appendSpacer()
 			this.appendLine(theme.dim(`branched into ${branched.sessionId.slice(0, 8)}`))
 			this.appendLine(theme.dim(`open previous branch: ${sessionOpenCommand(sourceSessionId)}`))
@@ -2296,7 +2420,7 @@ export class Chat {
 			}
 			if (match.kind === "leaf") {
 				const res = await this.client.rewind(this.sessionId, match.id, { targetKind: "leaf" })
-				if (res.snapshot) this.update(res.snapshot)
+				await this.refreshAfterMutation(res)
 				this.appendSpacer()
 				this.appendLine(theme.dim(match.active ? "already on that branch tip" : "switched to branch tip"))
 				return
@@ -2321,7 +2445,7 @@ export class Chat {
 					restoreFiles,
 					restoreConversation,
 				})
-				if (res.snapshot) this.update(res.snapshot)
+				await this.refreshAfterMutation(res)
 				return res
 			}
 			const res = mode === "conversation-summary"
@@ -2343,68 +2467,50 @@ export class Chat {
 			const level = await pickReasoningLevel(this.tui, "Session reasoning", "Applied only to this session") ?? undefined
 			if (!level) return
 			const res = await this.client.setThinking(this.sessionId, level)
-			if (res.snapshot) this.update(res.snapshot)
+			await this.refreshAfterMutation(res)
 			this.appendLine(theme.dim(`session reasoning → ${level}`))
 			return
 		}
 		if (name === "fast") {
 			const res = await this.client.setFast(this.sessionId, arg)
-			if (res.snapshot) this.update(res.snapshot)
+			await this.refreshAfterMutation(res)
 			if (res.message) this.appendLine(theme.dim(res.message))
 			return
 		}
 		if (name === "compact") {
 			const res = await this.withStatusLoader("Compacting…", async () => {
 				const compacted = await this.client.compact(this.sessionId)
-				if (compacted.snapshot) this.update(compacted.snapshot)
+				await this.refreshAfterMutation(compacted)
 				return compacted
 			})
 			if (res.result?.removedCount === 0) this.appendLine(theme.dim("nothing to compact yet"))
 			return
 		}
 		if (name === "context") {
-			const lines = formatContextReport({
-				messages: this.snapshot?.contextMessages ?? this.snapshot?.messages ?? [],
-				systemPrompt: this.snapshot?.systemPrompt ?? "",
-				tools: this.snapshot?.tools ?? [],
-				model: this.snapshot?.model,
-			})
+			const lines = this.client.contextReport
+				? await this.client.contextReport(this.sessionId)
+				: formatContextReport({
+					messages: this.snapshot?.contextMessages ?? this.snapshot?.messages ?? [],
+					systemPrompt: this.snapshot?.systemPrompt ?? "",
+					tools: this.snapshot?.tools ?? [],
+					model: this.snapshot?.model,
+				})
 			await this.showModal("Context", lines.join("\n"))
 			return
 		}
 		if (name === "system") {
-			const lines = formatSystemReport({
-				systemPrompt: this.snapshot?.systemPrompt ?? "",
-				tools: this.snapshot?.tools ?? [],
-				messages: this.snapshot?.contextMessages ?? this.snapshot?.messages ?? [],
-			})
+			const lines = this.client.systemReport
+				? await this.client.systemReport(this.sessionId)
+				: formatSystemReport({
+					systemPrompt: this.snapshot?.systemPrompt ?? "",
+					tools: this.snapshot?.tools ?? [],
+					messages: this.snapshot?.contextMessages ?? this.snapshot?.messages ?? [],
+				})
 			await this.showModal("System prompt, tools, and project context", lines.join("\n"))
 			return
 		}
 		if (name === "usage") {
 			await showCodexUsageModal(this.tui, this.getCodexUsageBaseUrl?.(this.snapshot?.model), (payload) => this.onCodexUsage?.(payload))
-			return
-		}
-		if (name === "log") {
-			if (!this.stderrCapture) {
-				await this.showModal("stderr", "stderr capture not enabled")
-				return
-			}
-			if (arg === "clear") {
-				this.stderrCapture.clear()
-				this.footer.update()
-				await this.showModal("stderr", "stderr log cleared")
-				return
-			}
-			const entries = this.stderrCapture.entries()
-			if (entries.length === 0) {
-				await this.showModal("stderr", "no stderr captured")
-				return
-			}
-			await this.showModal("stderr", entries.map((e) => {
-				const t = new Date(e.time).toISOString().slice(11, 19)
-				return `${t}  ${e.text}`
-			}).join("\n"))
 			return
 		}
 		if (name === "settings" && !arg) {
@@ -2451,7 +2557,7 @@ export class Chat {
 	 * @param {{ requestRender?: boolean, remember?: boolean }} [options]
 	 */
 	appendMessage(msg, options = {}) {
-		if (isProjectContextMessage(msg) || msg.pinanoCompactionMemento) return
+		if (isProjectContextMessage(msg) || msg.pinanoCompactionMemento || msg.pinanoCompactionSummary) return
 		if (msg.role === "user") {
 			this.chatContainer.addItem(new UserMessageComponent(msg), "user")
 		} else if (msg.role === "contextLoad") {
@@ -2733,12 +2839,15 @@ export class Chat {
 			this.viewEpoch = undefined
 			this.needsSnapshotRebuild = false
 			this.lastPromptDraftVersion = -1
+			this.promptImages = []
+			this.promptImageCounter = 0
+			this.clearSubmittedPrompt()
 		}
 		const rebuildTranscript = options.rebuildTranscript ?? (sessionChanged || !this.snapshotMatchesRenderedTranscript(next))
 		this.snapshot = next
 		if (next.promptDraft) this.applyPromptDraft(next.promptDraft, { force: firstSnapshot || sessionChanged })
 		if (!next.isStreaming && !this.promptRequestInFlight) this.interruptRequested = false
-		if (!next.isStreaming && !this.promptRequestInFlight && !this.promptCancelPromise) this.submittedPromptText = undefined
+		if (!next.isStreaming && !this.promptRequestInFlight && !this.promptCancelPromise) this.clearSubmittedPrompt()
 		if (typeof next.seq === "number") this.lastSeq = sessionChanged ? next.seq : Math.max(this.lastSeq, next.seq)
 		if (next.viewEpoch !== undefined) this.viewEpoch = next.viewEpoch
 		if (rebuildTranscript) {
@@ -2763,6 +2872,68 @@ export class Chat {
 		const rebuildTranscript = this.needsSnapshotRebuild || !this.snapshotShapeMatchesCurrent(snapshot)
 		this.needsSnapshotRebuild = false
 		this.update(snapshot, { rebuildTranscript })
+	}
+
+	async refreshAfterMutation(result = {}, options = {}) {
+		const id = this.mutationSnapshotSessionId(result, options)
+		if (!id || !this.client.snapshot) {
+			if (result?.snapshot) this.updateFromEventSnapshot(result.snapshot)
+			return result?.snapshot
+		}
+		const snapshot = await this.client.snapshot(id)
+		if (options.replace === true || snapshot.sessionId !== this.snapshot?.sessionId) this.update(snapshot)
+		else this.updateFromEventSnapshot(snapshot)
+		return snapshot
+	}
+
+	mutationSnapshotSessionId(result = {}, options = {}) {
+		return options.sessionId ?? result?.sessionId ?? result?.snapshot?.sessionId ?? this.sessionId
+	}
+
+	refreshAfterMutationInBackground(result = {}, options = {}) {
+		const id = this.mutationSnapshotSessionId(result, options)
+		const sessionIdAtStart = this.sessionId
+		if (!id || !this.client.snapshot) {
+			if (result?.snapshot && !this.disposed && this.sessionId === sessionIdAtStart) this.updateFromEventSnapshot(result.snapshot)
+			return undefined
+		}
+		const key = `${id}:${options.replace === true ? "replace" : "update"}`
+		const promise = this.client.snapshot(id)
+			.then((snapshot) => {
+				if (this.disposed || this.sessionId !== sessionIdAtStart) return snapshot
+				if (options.replace === true || snapshot.sessionId !== this.snapshot?.sessionId) this.update(snapshot)
+				else this.updateFromEventSnapshot(snapshot)
+				return snapshot
+			})
+			.catch((err) => {
+				if (!this.disposed && this.sessionId === sessionIdAtStart) this.reportClientError(err, options.errorLabel ?? "snapshot refresh error")
+			})
+			.finally(() => {
+				if (this.backgroundMutationRefreshes.get(key) === promise) this.backgroundMutationRefreshes.delete(key)
+			})
+		this.backgroundMutationRefreshes.set(key, promise)
+		promise.catch(() => {})
+		return promise
+	}
+
+	settleInterruptLocally() {
+		if (!this.snapshot) {
+			this.hideStatusLoader()
+			this.tui.requestRender()
+			return
+		}
+		this.snapshot = cloneSessionSnapshot({
+			...this.snapshot,
+			isStreaming: false,
+			currentModelRequest: undefined,
+			pendingToolCalls: [],
+			pendingToolCallDetails: [],
+			streamingMessage: null,
+		})
+		this.renderStatus(this.snapshot)
+		this.renderPendingUserMessages(this.snapshot)
+		this.refreshFooter()
+		this.tui.requestRender()
 	}
 
 	/** @param {any} event */
@@ -2888,6 +3059,8 @@ export async function runServiceTuiMode(options) {
 	})
 	let filterMode = false
 	let filterBeforeEdit = ""
+	let overviewPromptImages = []
+	let overviewPromptImageCounter = 0
 	promptLabel = new PromptLabel(() => {
 		if (filterMode) return "Filter agents:"
 		const selected = table.peekSessionId ? table.selected() : undefined
@@ -2916,6 +3089,23 @@ export async function runServiceTuiMode(options) {
 	const requestShellRender = (force = false) => {
 		editor.invalidate()
 		tui.requestRender(force)
+	}
+	const overviewPromptAttachmentsForText = (text) => promptAttachmentsForText(overviewPromptImages, text)
+	const clearOverviewPromptImagesForText = (text) => {
+		overviewPromptImages = clearPromptImageAttachmentsForText(overviewPromptImages, text)
+	}
+	const clearOverviewPromptImages = () => {
+		overviewPromptImages = []
+	}
+	const pasteOverviewClipboardImage = async () => {
+		try {
+			const image = await readClipboardImage()
+			overviewPromptImageCounter = insertPromptImageAttachment(editor, overviewPromptImages, overviewPromptImageCounter, image)
+			requestShellRender()
+		} catch (err) {
+			table.setNotice(`[image paste error] ${err?.message ?? err}`)
+			requestShellRender()
+		}
 	}
 	let currentChat = /** @type {Chat | undefined} */ (undefined)
 	let currentRoute = options.initialRoute ?? overviewRoute
@@ -2968,26 +3158,24 @@ export async function runServiceTuiMode(options) {
 		reexecInProgress = true
 		requestShellRender(true)
 		await new Promise((resolve) => setTimeout(resolve, 50))
+		let tuiStopped = false
 		try {
 			staleRuntimeDesired = staleRuntimeDesired || await options.client.desiredRuntime?.()
 			const runtime = staleRuntimeDesired?.execPath ?? process.execPath
 			const target = staleRuntimeDesired?.mainPath
 			if (!target) throw new Error("desired runtime path unavailable")
 			tui.stop()
-			const child = spawn(runtime, [target, ...staleRuntimeRouteArgs], {
+			tuiStopped = true
+			await reexecRuntime({
+				command: runtime,
+				args: [target, ...staleRuntimeRouteArgs],
 				cwd: options.cwd,
-				env: process.env,
-				stdio: "inherit",
-			})
-			child.on("error", (err) => {
-				console.error(`pinano update failed: ${err?.message ?? err}`)
-				process.exit(1)
-			})
-			child.on("exit", (code, signal) => {
-				if (signal) process.kill(process.pid, signal)
-				else process.exit(code ?? 0)
 			})
 		} catch (err) {
+			if (tuiStopped) {
+				console.error(`pinano update failed: ${err?.message ?? err}`)
+				process.exit(1)
+			}
 			reexecInProgress = false
 			requestShellRender()
 		}
@@ -3124,17 +3312,19 @@ export async function runServiceTuiMode(options) {
 		requestShellRender(true)
 	}
 
-	const dispatchNew = async (text) => {
+	const dispatchNew = async (text, images = []) => {
 		hasModelProvider = await hasAvailableModelProvider()
 		if (!hasModelProvider) throw new Error(NO_MODEL_PROVIDER_OVERVIEW_ERROR)
 		const created = await options.client.createSession()
 		table.setActivity(created.sessionId, "queued")
 		await refreshRowsAndSelect(created.sessionId)
-		void options.client.prompt(created.sessionId, text).catch((err) => {
-			if (showStaleRuntime(err)) return
-			table.setActivity(created.sessionId, `error: ${err?.message ?? err}`)
-			requestShellRender()
-		})
+		void options.client.prompt(created.sessionId, text, undefined, { images })
+			.then(() => clearOverviewPromptImagesForText(text))
+			.catch((err) => {
+				if (showStaleRuntime(err)) return
+				table.setActivity(created.sessionId, `error: ${err?.message ?? err}`)
+				requestShellRender()
+			})
 	}
 
 	const applySelectedStateAction = (selected, targetState) => {
@@ -3143,9 +3333,8 @@ export async function runServiceTuiMode(options) {
 			: targetState === "completed"
 				? options.client.markCompleted(selected.id)
 				: options.client.markDeferred(selected.id)
-		task.then((result) => {
-			table.setSessions(result.sessions ?? table.sessions)
-			requestShellRender()
+		task.then(async () => {
+			await refreshRows()
 		})
 			.catch((err) => {
 				if (showStaleRuntime(err)) return
@@ -3223,6 +3412,7 @@ export async function runServiceTuiMode(options) {
 		try {
 			await showCredentialsSettings(tui, {
 				...credentialsOptions,
+				loginCodex: options.loginCodex,
 				refreshAuthCache: refreshOverviewAuth,
 				onSettingsChanged: applyOverviewSettings,
 				setDefaultModel: setOverviewDefaultModel,
@@ -3264,6 +3454,7 @@ export async function runServiceTuiMode(options) {
 				"Up/Down       move selection",
 				"PgUp/PgDn     move by page",
 				"Ctrl+F        filter sessions",
+				"Ctrl+V        paste image",
 				"Ctrl+D        mark selected session completed",
 				"Ctrl+E        mark selected session deferred",
 				"Ctrl+X        abort running session or delete idle session",
@@ -3282,6 +3473,11 @@ export async function runServiceTuiMode(options) {
 		}
 		if (name === "usage") {
 			await showCodexUsageModal(tui, codexUsageBaseUrlFromSettings(settings), (payload) => applyCodexUsage(payload))
+			return
+		}
+		if (name === "debug-log") {
+			await showDebugLogModal(tui, options.stderrCapture, arg)
+			requestShellRender()
 			return
 		}
 		if (name === "model") {
@@ -3322,6 +3518,7 @@ export async function runServiceTuiMode(options) {
 	}
 
 	const enterFilterMode = () => {
+		clearOverviewPromptImages()
 		filterBeforeEdit = table.filter
 		filterMode = true
 		editor.setText(table.filter)
@@ -3350,6 +3547,7 @@ export async function runServiceTuiMode(options) {
 		if (!trimmed) return
 		const overviewCommand = overviewCommandLine(trimmed, { web: webEnabled })
 		if (overviewCommand) {
+			clearOverviewPromptImages()
 			void handleOverviewCommand(overviewCommand).catch((err) => {
 				if (showStaleRuntime(err)) return
 				table.setNotice(`/${overviewCommand.trim().split(/\s+/, 1)[0]} error: ${err?.message ?? err}`)
@@ -3358,9 +3556,12 @@ export async function runServiceTuiMode(options) {
 			return
 		}
 		if (!webEnabled && isWebSlashCommand(trimmed)) {
+			clearOverviewPromptImages()
 			setOverviewNotice("Pinano Web is disabled; set web: true in settings.json to enable /web.")
 			return
 		}
+		const attachments = overviewPromptAttachmentsForText(trimmed)
+		const images = attachments.map((attachment) => attachment.image)
 		const selected = table.peekSessionId ? table.selected() : undefined
 		const targetId = selected && selected.id === table.peekSessionId ? selected.id : undefined
 		if (targetId) {
@@ -3368,7 +3569,9 @@ export async function runServiceTuiMode(options) {
 				hasModelProvider = await hasAvailableModelProvider()
 				if (!hasModelProvider) throw new Error(NO_MODEL_PROVIDER_OVERVIEW_ERROR)
 				const streaming = selected.runStatus === "running"
-				await options.client.prompt(targetId, trimmed, streaming ? "steer" : undefined)
+				await options.client.prompt(targetId, trimmed, streaming ? "steer" : undefined, { images })
+				clearOverviewPromptImagesForText(trimmed)
+				scheduleRowsRefresh()
 			})().catch((err) => {
 				if (showStaleRuntime(err)) return
 				if (err?.message === NO_MODEL_PROVIDER_OVERVIEW_ERROR) {
@@ -3379,7 +3582,7 @@ export async function runServiceTuiMode(options) {
 				requestShellRender()
 			})
 		} else {
-			void dispatchNew(trimmed).catch((err) => {
+			void dispatchNew(trimmed, images).catch((err) => {
 				if (showStaleRuntime(err)) return
 				if (err?.message === NO_MODEL_PROVIDER_OVERVIEW_ERROR) {
 					highlightEmptyCredentialsGuidance = table.rows().length === 0
@@ -3443,14 +3646,15 @@ export async function runServiceTuiMode(options) {
 			if (currentChat?.sessionId === event.sessionId) {
 				if (event.type === "snapshot" && event.snapshot) currentChat.updateFromEventSnapshot(event.snapshot)
 				else {
-					currentChat.handleEvent(event)
-					if (eventNeedsServiceChatSnapshot(event)) options.client.snapshot(event.sessionId)
-						.then((snapshot) => currentChat?.updateFromEventSnapshot(snapshot))
-						.catch((err) => { showStaleRuntime(err) })
+					if (!eventInvalidatesSessionSnapshot(event, currentChat.sessionId)) currentChat.handleEvent(event)
+					if (eventNeedsServiceChatSnapshot(event)) refreshCurrentChatSnapshot(event.sessionId)
 				}
 			}
 			if (event.type === "agent_end" && subscriptionProviders.has("openai-codex")) scheduleCodexUsageRefresh()
 			if (eventNeedsServiceSessionRefresh(event)) scheduleRowsRefresh(event.type === "agent_end")
+		} else if (eventIsServiceStreamRecovery(event)) {
+			if (currentChat?.sessionId) refreshCurrentChatSnapshot(currentChat.sessionId)
+			scheduleRowsRefresh(false)
 		} else if (event.type === "error") {
 			if (showStaleRuntime(event.error)) return
 			table.setNotice(`service event error: ${event.error}`)
@@ -3478,6 +3682,14 @@ export async function runServiceTuiMode(options) {
 		}
 		if (tui.hasOverlay()) return undefined
 		if (currentChat) {
+			if ((matchesKey(data, "ctrl+v") || matchesKey(data, "ctrl+alt+v")) && !isKeyRelease(data) && currentChat.editor.focused) {
+				void currentChat.pasteClipboardImage()
+				return { consume: true }
+			}
+			if (matchesKey(data, "ctrl+g") && !isKeyRelease(data) && currentChat.editor.focused) {
+				showAgents({ selectSessionId: currentChat.sessionId })
+				return { consume: true }
+			}
 			if (matchesKey(data, "left") && currentChat.editor.focused && currentChat.editor.getText().trim() === "") {
 				showAgents({ selectSessionId: currentChat.sessionId })
 				return { consume: true }
@@ -3487,6 +3699,7 @@ export async function runServiceTuiMode(options) {
 				if (currentChat.editor.getText().trim() !== "") {
 					doubleEscape.reset()
 					if (textDoubleEscape.press()) {
+						currentChat.clearPromptImagesForText(currentChat.editor.getText())
 						currentChat.editor.setText("")
 						currentChat.tui.requestRender()
 						return { consume: true }
@@ -3516,6 +3729,10 @@ export async function runServiceTuiMode(options) {
 		}
 		if (!editor.focused) return undefined
 		if (isKeyRelease(data)) return undefined
+		if (!filterMode && (matchesKey(data, "ctrl+v") || matchesKey(data, "ctrl+alt+v"))) {
+			void pasteOverviewClipboardImage()
+			return { consume: true }
+		}
 		if (matchesKey(data, "ctrl+f")) {
 			if (filterMode) acceptFilterMode()
 			else enterFilterMode()
@@ -3530,6 +3747,7 @@ export async function runServiceTuiMode(options) {
 			return { consume: true }
 		}
 		if (!filterMode && matchesKey(data, "escape") && editor.getText().length > 0 && !editor.isShowingAutocomplete()) {
+			clearOverviewPromptImages()
 			editor.setText("")
 			requestShellRender()
 			return { consume: true }
@@ -3592,9 +3810,8 @@ export async function runServiceTuiMode(options) {
 				const task = selected.runStatus === "running"
 					? options.client.abort(selected.id)
 					: options.client.deleteSession(selected.id)
-				task.then((result) => {
-					if (result?.sessions) table.setSessions(result.sessions)
-					requestShellRender()
+				task.then(async () => {
+					await refreshRows()
 				})
 					.catch((err) => {
 						if (showStaleRuntime(err)) return

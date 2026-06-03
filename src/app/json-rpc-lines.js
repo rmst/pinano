@@ -13,6 +13,7 @@ export class JsonLineRpc {
 	 * @param {(method: string, params: any) => any | Promise<any>} [options.onRequest]
 	 * @param {(method: string, params: any) => void | Promise<void>} [options.onNotification]
 	 * @param {(err: Error) => void} [options.onProtocolError]
+	 * @param {() => void | Promise<void>} [options.onClose]
 	 * @param {boolean} [options.rejectPendingOnClose]
 	 */
 	constructor(options) {
@@ -21,6 +22,7 @@ export class JsonLineRpc {
 		this.onRequest = options.onRequest
 		this.onNotification = options.onNotification
 		this.onProtocolError = options.onProtocolError ?? (() => {})
+		this.onClose = options.onClose
 		this.rejectPendingOnClose = options.rejectPendingOnClose !== false
 		this.nextId = 1
 		/** @type {Map<number, { resolve: (value: any) => void, reject: (err: Error) => void }>} */
@@ -28,7 +30,10 @@ export class JsonLineRpc {
 		this.closed = false
 		this.reader = createInterface({ input: this.input })
 		this.reader.on("line", (line) => this.handleLine(line))
-		this.reader.on("close", () => this.closePending(this.rejectPendingOnClose ? new Error("JSON line RPC closed") : undefined))
+		this.reader.on("close", () => {
+			this.closePending(this.rejectPendingOnClose ? new Error("JSON line RPC closed") : undefined)
+			Promise.resolve(this.onClose?.()).catch((err) => this.onProtocolError(err instanceof Error ? err : new Error(String(err))))
+		})
 	}
 
 	/** @param {string} method @param {any} [params] */

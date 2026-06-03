@@ -1,5 +1,5 @@
-import { lastReportedTokens } from "./compaction.js"
 import { breakdownContext } from "./context-accounting.js"
+import { lastReportedTokens } from "./context-summary.js"
 
 /**
  * @param {number} n
@@ -40,7 +40,13 @@ function roleLabel(role) {
  * @returns {string}
  */
 function entrySummary(entry) {
-	if (entry.kind === "compaction") return `[compaction marker · ${entry.removedCount ?? "?"} → ${entry.keptCount ?? "?"} kept]`
+	if (entry.kind === "compaction") {
+		const parts = [`${entry.removedCount ?? "?"} compacted`]
+		if (typeof entry.mementoCount === "number") parts.push(`${entry.mementoCount} user message${entry.mementoCount === 1 ? "" : "s"} retained`)
+		else if ((entry.keptCount ?? 0) > 0) parts.push(`${entry.keptCount} kept`)
+		if (typeof entry.mementoCount === "number" && (entry.keptCount ?? 0) > 0) parts.push(`${entry.keptCount} provider checkpoint${entry.keptCount === 1 ? "" : "s"}`)
+		return `[compaction marker · ${parts.join(" · ")}]`
+	}
 	if (entry.kind === "compactionMemento") return "[retained user memento]"
 	if (entry.kind === "branchSummary") return "[branch summary]"
 	if (entry.kind === "projectContext") return "[AGENTS.md / CLAUDE.md]"

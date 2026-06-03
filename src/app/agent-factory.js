@@ -4,12 +4,14 @@ import { normalizeReasoningLevel } from "../reasoning.js"
 import { createDefaultTools } from "../tools/index.js"
 import { makeAutoCompactTransform } from "./auto-compact.js"
 import { resolveModelStreamOptions } from "./model-auth.js"
-import { LazyContextLoader, formatLazyContextNotice, extractToolPath } from "./lazy-context.js"
+import { LazyContextLoader, formatLazyContextNotice, extractToolPaths } from "./lazy-context.js"
 import { activeContextFiles } from "./session-context.js"
 import { recordFileCheckpoint } from "./file-checkpoints.js"
 import { createSessionSetTool } from "./session-set-tool.js"
 import { createExecutorProxyTools } from "./tool-executor-tools.js"
 import { baseInstructionsForModel, toolProfileForModel } from "./model-instructions.js"
+import { prependEnvironmentContext } from "./environment-context.js"
+import { getEffectiveSessionProperties } from "./session-properties.js"
 
 
 /**
@@ -36,19 +38,35 @@ export function buildWorkerStreamFn(startModelStream) {
 
 // Keep the fallback global prompt small. Concrete tool capabilities and
 // argument contracts are supplied separately through the model API tool definitions.
-const DEFAULT_BASE_INSTRUCTIONS = `You are an expert coding assistant operating inside pinano, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+const DEFAULT_BASE_INSTRUCTIONS_PREFIX = `You are an expert coding assistant operating inside pinano, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.`
 
-Guidelines:
-- Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)
+const DEFAULT_DIRECT_TOOL_INSTRUCTIONS = `- Prefer grep/find/ls tools over shell commands for file exploration (faster, respects .gitignore)
 - Use read to examine files instead of cat or sed.
 - Use direct tools for file reads/searches, file mutations, and shell commands.
 - Use write for new files or full-file rewrites.
 - Use edit for precise changes to existing files (edits[].oldText must match exactly).
 - When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls
 - Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.
-- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.
-- Be concise in your responses
+- Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.`
+
+const CODEX_TOOL_INSTRUCTIONS = `- Use exec_command for text file reads, file searches, directory listing, shell commands, long-running processes, stdin/EOF, polling, and process-group signals.
+- Use view_image to inspect local image files.
+- Use apply_patch for file mutations.
+- Prefer rg or rg --files for searching when using shell commands.`
+
+const DEFAULT_BASE_INSTRUCTIONS_SUFFIX = `- Be concise in your responses
 - For reversible actions (reads, edits to tracked files, running tests) be proactive. Save confirmation for actions that can't be cleanly undone: destructive deletes, \`git reset --hard\`, force-push, pushing to remotes, modifying CI/CD, dropping data.`
+
+function fallbackBaseInstructionsForToolProfile(toolProfile) {
+	const toolInstructions = toolProfile === "codex" ? CODEX_TOOL_INSTRUCTIONS
+		: DEFAULT_DIRECT_TOOL_INSTRUCTIONS
+	return `${DEFAULT_BASE_INSTRUCTIONS_PREFIX}
+
+Guidelines:
+${toolInstructions}
+${DEFAULT_BASE_INSTRUCTIONS_SUFFIX}`
+}
+
 /**
  * @param {string} cwd
  * @param {{ baseInstructionsKey?: string, baseInstructions?: string }} [model]
@@ -56,12 +74,28 @@ Guidelines:
 export function systemPromptFor(cwd, model = undefined) {
 	const now = new Date()
 	const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`
-	const base = baseInstructionsForModel(model) ?? DEFAULT_BASE_INSTRUCTIONS
+	const base = baseInstructionsForModel(model) ?? fallbackBaseInstructionsForToolProfile(toolProfileForModel(model))
 
 	let prompt = base
 	prompt += `\n\nCurrent date: ${date}`
 	prompt += `\nInitial working directory: ${cwd} (change when convenient)`
 	return prompt
+}
+
+function effectiveSessionCwd(agent, fallback) {
+	return agent?.session ? getEffectiveSessionProperties(agent.session).cwd ?? fallback : fallback
+}
+
+function environmentContextProvider(value) {
+	if (!value) return undefined
+	return typeof value === "function" ? value : () => value
+}
+
+function withEnvironmentContextTransform(getEnvironmentContext, transformContext) {
+	return async (messages, signal) => {
+		const transformed = transformContext ? await transformContext(messages, signal) : messages
+		return prependEnvironmentContext(getEnvironmentContext?.(), transformed)
+	}
 }
 
 /**
@@ -72,7 +106,8 @@ export function systemPromptFor(cwd, model = undefined) {
  * @param {boolean} [options.noContextFiles]
  * @param {Iterable<string>} [options.alreadyLoadedContextPaths]
  * @param {any} [options.streamFn]
- * @param {{ executeTool: (name: string, id: string, args: any, signal?: AbortSignal, onUpdate?: (update: any) => void, options?: { scope?: any, toolProfile?: "default" | "apply_patch" }) => Promise<any>, dispose?: () => void, isDead?: boolean }} [options.toolExecutor]
+ * @param {string | (() => string | undefined)} [options.environmentContext]
+ * @param {{ executeTool: (name: string, id: string, args: any, signal?: AbortSignal, onUpdate?: (update: any) => void, options?: { scope?: any, toolProfile?: "default" | "codex" }) => Promise<any>, dispose?: () => void, isDead?: boolean }} [options.toolExecutor]
  * @param {(info: { absolutePath: string }, agent: Agent) => Promise<any>} [options.beforeFileMutation]
  */
 export function createPinanoAgent(options) {
@@ -82,6 +117,7 @@ export function createPinanoAgent(options) {
 	})
 	/** @type {Agent} */
 	let agent
+	const initialEnvironmentContext = environmentContextProvider(options.environmentContext)
 	const beforeFileMutation = async (/** @type {{ absolutePath: string }} */ info) => {
 		if (options.beforeFileMutation) return options.beforeFileMutation(info, agent)
 		return recordFileCheckpoint(agent?.session, info.absolutePath)
@@ -112,7 +148,10 @@ export function createPinanoAgent(options) {
 		},
 		streamFn,
 		// Auto-compact older messages just before each LLM call when usage is high.
-		transformContext: makeAutoCompactTransform(() => agent, () => options.settings.autocompactThreshold),
+		transformContext: withEnvironmentContextTransform(
+			() => agent?.pinanoEnvironmentContext?.(),
+			makeAutoCompactTransform(() => agent, () => options.settings.autocompactThreshold),
+		),
 		afterToolCall: async (ctx) => {
 			if (agent.contextFilesDisabled || options.noContextFiles || agent.session?.getSessionConfig?.().noContextFiles) return undefined
 			if (agent.session?.getContextLoads) lazyContext.markLoaded(activeContextFiles(agent.session).map((file) => file.path))
@@ -121,12 +160,14 @@ export function createPinanoAgent(options) {
 				// context notices already present in the replayed message list.
 				lazyContext.hydrateFromMessages(ctx.context.messages)
 			}
-			const path = extractToolPath(ctx.toolCall.name, ctx.args)
-			if (!path) return undefined
-			const newFiles = lazyContext.loadForPath(path)
+			const cwd = effectiveSessionCwd(agent, options.cwd)
+			lazyContext.setCwd(cwd)
+			const extracted = extractToolPaths(ctx.toolCall.name, ctx.args, cwd, ctx.isError ? undefined : ctx.result)
+			lazyContext.markLoaded(extracted.manuallyLoadedContextPaths)
+			const newFiles = extracted.paths.flatMap((path) => lazyContext.loadForPath(path))
 			if (newFiles.length === 0) return undefined
 			if (agent.session?.appendContextLoad) {
-				const load = { source: "lazy", cwd: options.cwd, loadedAt: new Date().toISOString(), files: newFiles }
+				const load = { source: "lazy", cwd, loadedAt: new Date().toISOString(), files: newFiles }
 				const entryId = await agent.session.appendContextLoad(load)
 				await agent.onContextLoad?.({ entryId, timestamp: load.loadedAt, contextLoad: load })
 				return undefined
@@ -139,6 +180,7 @@ export function createPinanoAgent(options) {
 			}
 		},
 	})
+	agent.pinanoEnvironmentContext = initialEnvironmentContext
 	agent.contextFilesDisabled = options.noContextFiles === true
 	agent.activeContextSnapshotFiles = []
 	agent.markContextFilesLoaded = (paths) => lazyContext.markLoaded(paths)
@@ -184,6 +226,7 @@ export function createPinanoSidecarAgent(options) {
 	sidecar.state.thinkingLevel = base.state.thinkingLevel
 	sidecar.state.serviceTier = base.state.serviceTier
 	sidecar.state.messages = options.messages
+	sidecar.pinanoEnvironmentContext = base.pinanoEnvironmentContext
 	sidecar.sessionId = base.sessionId
 	sidecar.session = base.session
 	sidecar.toolExecution = base.toolExecution
@@ -191,8 +234,12 @@ export function createPinanoSidecarAgent(options) {
 	sidecar.getApiKey = base.getApiKey
 	sidecar.onPayload = base.onPayload
 	sidecar.onResponse = base.onResponse
+	sidecar.modelForRequest = base.modelForRequest
 	sidecar.beforeToolCall = base.beforeToolCall
 	sidecar.afterToolCall = options.afterToolCall
-	sidecar.transformContext = options.transformContext
+	sidecar.transformContext = withEnvironmentContextTransform(
+		() => sidecar.pinanoEnvironmentContext?.(),
+		options.transformContext,
+	)
 	return sidecar
 }

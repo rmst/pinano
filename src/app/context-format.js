@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto"
 import { dirname } from "node:path"
 
+export { hasProjectContextMessage, isProjectContextMessage } from "./project-context-message.js"
+
 /** Heading used in the synthetic project-context user message. */
 export const PROJECT_CONTEXT_HEADING = "# AGENTS.md / CLAUDE.md context"
 
@@ -62,15 +64,4 @@ export function messageTextBlocks(message) {
 	}
 	if (typeof content === "string") return [content]
 	return []
-}
-
-/** @param {any} m @returns {boolean} */
-export function isProjectContextMessage(m) {
-	if (m?.role !== "user") return false
-	return messageTextBlocks(m).some((text) => text.includes(PROJECT_CONTEXT_HEADING))
-}
-
-/** @param {ReadonlyArray<any>} messages @returns {boolean} */
-export function hasProjectContextMessage(messages) {
-	return messages.some(isProjectContextMessage)
 }

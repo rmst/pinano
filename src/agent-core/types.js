@@ -107,6 +107,13 @@
  */
 
 /**
+ * @typedef {object} ModelRequestContext
+ * @property {Model} model
+ * @property {AgentContext} context
+ * @property {AgentMessage[]} newMessages
+ */
+
+/**
  * @typedef {object} AgentLoopConfig
  * @property {Model} model
  * @property {ThinkingLevel} [reasoning]
@@ -121,6 +128,7 @@
  * @property {(messages: AgentMessage[]) => Message[] | Promise<Message[]>} convertToLlm
  * @property {(messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>} [transformContext]
  * @property {(provider: string) => Promise<string | undefined> | string | undefined} [getApiKey]
+ * @property {(context: ModelRequestContext) => Model | undefined | Promise<Model | undefined>} [modelForRequest]
  * @property {(context: ShouldStopBeforeToolCallsContext) => boolean | Promise<boolean>} [shouldStopBeforeToolCalls]
  * @property {(context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>} [shouldStopAfterTurn]
  * @property {() => Promise<AgentMessage[]>} [getSteeringMessages]

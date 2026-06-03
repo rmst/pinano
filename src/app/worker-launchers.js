@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from "node:crypto"
-import { spawn } from "node:child_process"
-import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rm } from "node:fs/promises"
-import { dirname, join, relative, resolve } from "node:path"
+import { spawn, spawnSync } from "node:child_process"
+import { existsSync, realpathSync } from "node:fs"
+import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rm, stat } from "node:fs/promises"
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
 
+import { createSeatbeltSandboxArgs } from "./seatbelt-sandbox.js"
+import { environmentHomePath } from "./paths.js"
 import { configuredWorkerSpec } from "./service-config.js"
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -13,7 +16,20 @@ const defaultWorkerPath = join(here, "tool-worker.js")
 const defaultWorkerEntry = "src/app/tool-worker.js"
 const MIN_NODE_VERSION = [22, 6, 0]
 const defaultRemoteSourceRootProbe = "printf %s \"${HOME:-/tmp}/.pinano/workers/source\""
+const defaultContainerSourceRootProbe = "printf %s \"${TMPDIR:-/tmp}/.pinano/workers/source\""
 const sourceSnapshotVersion = "pinano-source-v2"
+const defaultManagedContainerImage = "docker.io/library/node:22-alpine"
+const managedContainerEngines = ["podman", "docker"]
+const containerWorkerStopGraceMs = 1000
+const bubblewrapProbeArgs = [
+	"--die-with-parent",
+	"--ro-bind", "/", "/",
+	"--dev", "/dev",
+	"--proc", "/proc",
+	"--tmpfs", "/tmp",
+	"--chdir", "/",
+	"/bin/sh", "-c", "true",
+]
 
 /** @param {string} s */
 export function shellQuote(s) {
@@ -78,6 +94,53 @@ function run(command, args, options = {}) {
 function spawnRpc(command, args, options = {}) {
 	return spawn(command, args, { ...options, stdio: ["pipe", "pipe", "pipe"] })
 }
+
+function localWorkerEnv(options = {}) {
+	return {
+		...process.env,
+		NODE_NO_WARNINGS: process.env.NODE_NO_WARNINGS ?? "1",
+		...(options.toolHome ? toolHomeEnv(options.toolHome) : {}),
+	}
+}
+
+function toolHomeEnv(home) {
+	const tmp = join(home, ".tmp")
+	const cache = join(home, ".cache")
+	return {
+		HOME: home,
+		XDG_CONFIG_HOME: join(home, ".config"),
+		XDG_CACHE_HOME: cache,
+		XDG_DATA_HOME: join(home, ".local", "share"),
+		XDG_STATE_HOME: join(home, ".local", "state"),
+		TMPDIR: tmp,
+		TEMP: tmp,
+		TMP: tmp,
+		DARWIN_USER_CACHE_DIR: `${join(cache, "darwin")}/`,
+		DARWIN_USER_TEMP_DIR: `${tmp}/`,
+		GIT_OPTIONAL_LOCKS: "0",
+		PINANO_FALLBACK_TOOLS_TMPDIR: tmp,
+	}
+}
+
+function toolHomeDirs(home) {
+	const env = toolHomeEnv(home)
+	return [
+		home,
+		env.XDG_CONFIG_HOME,
+		env.XDG_CACHE_HOME,
+		env.XDG_DATA_HOME,
+		env.XDG_STATE_HOME,
+		env.TMPDIR,
+		env.DARWIN_USER_CACHE_DIR,
+	]
+}
+
+async function prepareToolHome(home) {
+	const dirs = [...new Set([dirname(dirname(home)), dirname(home), ...toolHomeDirs(home)])]
+	await Promise.all(dirs.map((dir) => mkdir(dir, { recursive: true })))
+	await Promise.all(dirs.map((dir) => chmod(dir, 0o700)))
+}
+
 
 async function sourceEntries(dir = repoRoot, prefix = "") {
 	const entries = await readdir(dir, { withFileTypes: true })
@@ -161,9 +224,287 @@ export class LocalWorkerLauncher {
 	async start(options) {
 		const child = spawnRpc(process.execPath, [options.workerPath ?? defaultWorkerPath], {
 			...(options.cwd ? { cwd: options.cwd } : {}),
-			env: { ...process.env, NODE_NO_WARNINGS: process.env.NODE_NO_WARNINGS ?? "1" },
+			env: localWorkerEnv(),
 		})
 		return { child, stop: () => child.kill("SIGTERM") }
+	}
+}
+
+function tmpfsDestinationDirs(path, bases) {
+	const base = bases.find((item) => path === item || path.startsWith(`${item}/`))
+	if (!base || path === base) return []
+	const dirs = []
+	let current = path
+	while (current !== base && current !== "/") {
+		dirs.unshift(current)
+		current = dirname(current)
+	}
+	return dirs
+}
+
+function hiddenHomeMounts() {
+	const envHome = process.env.HOME && isAbsolute(process.env.HOME) ? resolve(process.env.HOME) : undefined
+	const envHomeMount = envHome === "/root" ? envHome : envHome ? dirname(envHome) : undefined
+	return [...new Set(["/home", "/Users", "/root", "/var/home", envHomeMount].filter((path) =>
+		path && path !== "/" && existsSync(path) && !pathIsWithin("/tmp", path) && !pathIsWithin("/var/tmp", path)
+	))]
+}
+
+function bubblewrapArgs({ workdir, roots, writableRoots = [], readableRoots = [], command }) {
+	const tmpfsMounts = ["/tmp", "/var/tmp", ...hiddenHomeMounts()]
+	const readRoots = [...new Set(readableRoots.map((root) => resolve(root)).filter((root) => root !== "/"))]
+	const writeRoots = [...new Set([...roots, ...writableRoots].map((root) => resolve(root)))]
+	const tmpfsDirs = [...new Set([...writeRoots, ...readRoots].flatMap((root) => tmpfsDestinationDirs(root, tmpfsMounts)))]
+	return [
+		"--die-with-parent",
+		"--ro-bind", "/", "/",
+		"--dev", "/dev",
+		"--proc", "/proc",
+		...tmpfsMounts.flatMap((dir) => ["--tmpfs", dir]),
+		...tmpfsDirs.flatMap((dir) => ["--dir", dir]),
+		...readRoots.flatMap((root) => ["--ro-bind", root, root]),
+		...writeRoots.flatMap((root) => ["--bind", root, root]),
+		"--chdir", workdir,
+		...command,
+	]
+}
+
+function absolutePathVariants(path) {
+	if (!path || !isAbsolute(path)) return []
+	const resolved = resolve(path)
+	const variants = [resolved]
+	try {
+		variants.push(resolve(realpathSync(resolved)))
+	} catch {}
+	return variants
+}
+
+function absolutePathVariantSet(paths) {
+	return [...new Set(paths.flatMap((path) => absolutePathVariants(path)))]
+}
+
+function absolutePathParentVariants(path) {
+	if (!path || !isAbsolute(path)) return []
+	const resolved = resolve(path)
+	const variants = [dirname(resolved)]
+	try {
+		variants.push(dirname(resolve(realpathSync(resolved))))
+	} catch {}
+	return absolutePathVariantSet(variants)
+}
+
+function runtimeRootVariants(path) {
+	const parentDirs = absolutePathParentVariants(path)
+	return absolutePathVariantSet([
+		...parentDirs,
+		...parentDirs.filter((parent) => basename(parent) === "bin").map(dirname),
+	])
+}
+
+function macosSeatbeltTempRoots() {
+	return absolutePathVariantSet([
+		tmpdir(),
+		process.env.TMPDIR,
+		process.env.DARWIN_USER_CACHE_DIR,
+		process.env.DARWIN_USER_TEMP_DIR,
+	])
+}
+
+function macosSeatbeltReadableRoots(roots, workerPath) {
+	return absolutePathVariantSet([...roots, repoRoot, dirname(resolve(workerPath)), dirname(resolve(process.execPath))])
+}
+
+function linuxBubblewrapReadableRoots(workerPath) {
+	return absolutePathVariantSet([
+		repoRoot,
+		...absolutePathParentVariants(workerPath),
+		...runtimeRootVariants(process.execPath),
+	])
+}
+
+async function assertNativeSandboxCommand(command, args, message) {
+	try {
+		await run(command, args)
+	} catch (err) {
+		throw new Error(`${message} Pinano will not fall back to unsandboxed execution automatically. To run tools unsandboxed anyway, set "sandbox": { "type": "none" } for this environment in environments.json.\n${err?.message ?? err}`)
+	}
+}
+
+export class NativeSandboxWorkerLauncher {
+	/** @param {{ platform?: string, paths?: string[], sandboxExecCommand?: string, bwrapCommand?: string }} [options] */
+	constructor(options = {}) {
+		this.platform = options.platform ?? process.platform
+		this.paths = options.paths ?? ["."]
+		this.sandboxExecCommand = options.sandboxExecCommand ?? "/usr/bin/sandbox-exec"
+		this.bwrapCommand = options.bwrapCommand ?? "bwrap"
+	}
+
+	/** @param {{ cwd?: string, environmentId?: string, workerPath?: string }} options */
+	async start(options) {
+		const workdir = options.cwd
+		const roots = resolveSandboxRoots(workdir, this.paths, "Native sandbox worker")
+		await assertDirectory(workdir, "Native sandbox working directory")
+		for (const root of roots) await assertDirectory(root, "Native sandbox path")
+		const workerPath = options.workerPath ?? defaultWorkerPath
+		const toolHome = environmentHomePath(options.environmentId)
+		let command
+		let args
+		if (this.platform === "darwin") {
+			await assertNativeSandboxCommand(
+				this.sandboxExecCommand,
+				["-p", "(version 1)\n(allow default)", "/usr/bin/true"],
+				`Native macOS sandboxing requires sandbox-exec.`,
+			)
+			await prepareToolHome(toolHome)
+			command = this.sandboxExecCommand
+			args = createSeatbeltSandboxArgs({
+				command: [process.execPath, workerPath],
+				readableRoots: macosSeatbeltReadableRoots(roots, workerPath),
+				writableRoots: absolutePathVariantSet([...roots, toolHome, ...macosSeatbeltTempRoots()]),
+			})
+		} else if (this.platform === "linux") {
+			await assertNativeSandboxCommand(
+				this.bwrapCommand,
+				bubblewrapProbeArgs,
+				`Native Linux sandboxing requires a working bubblewrap (bwrap). Install bubblewrap, enable unprivileged user namespaces if your distro requires it, or choose unsandboxed execution explicitly.`,
+			)
+			await prepareToolHome(toolHome)
+			command = this.bwrapCommand
+			args = bubblewrapArgs({
+				workdir,
+				roots,
+				writableRoots: [toolHome],
+				readableRoots: linuxBubblewrapReadableRoots(workerPath),
+				command: [process.execPath, workerPath],
+			})
+		} else {
+			throw new Error(`Native sandbox workers are not supported on ${this.platform}. Configure sandbox.type "container" or explicitly configure sandbox.type "none".`)
+		}
+		const child = spawnRpc(command, args, {
+			cwd: workdir,
+			env: localWorkerEnv({ toolHome }),
+		})
+		return {
+			child,
+			assertCwdAllowed: (cwd) => assertCwdAllowedByRoots(roots, cwd, "Native sandbox worker"),
+			stop: () => child.kill("SIGTERM"),
+		}
+	}
+}
+
+function processUserArg() {
+	if (typeof process.getuid !== "function" || typeof process.getgid !== "function") return []
+	return ["--user", `${process.getuid()}:${process.getgid()}`]
+}
+
+function pathIsWithin(root, path) {
+	const rel = relative(root, path)
+	return rel === "" || (!!rel && !rel.startsWith("..") && !isAbsolute(rel))
+}
+
+function resolveSandboxRoots(cwd, paths = ["."], context = "Sandbox") {
+	if (!cwd || !isAbsolute(cwd)) throw new Error(`${context} requires an absolute cwd, got: ${cwd || "(empty)"}`)
+	const roots = paths.map((path) => isAbsolute(path) ? resolve(path) : resolve(cwd, path))
+	const uniqueRoots = [...new Set(roots)]
+	if (!uniqueRoots.some((root) => pathIsWithin(root, cwd))) {
+		throw new Error(`${context} cwd must be inside one of the configured sandbox paths: ${cwd}`)
+	}
+	return uniqueRoots
+}
+
+function assertCwdAllowedByRoots(roots, cwd, context = "Sandbox") {
+	if (!roots.some((root) => pathIsWithin(root, cwd))) {
+		throw new Error(`${context} is mounted at ${roots.join(", ")}; cwd is outside configured sandbox paths: ${cwd}`)
+	}
+}
+
+async function assertDirectory(path, context) {
+	let info
+	try {
+		info = await stat(path)
+	} catch (err) {
+		if (err?.code === "ENOENT") throw new Error(`${context} does not exist: ${path}`)
+		throw err
+	}
+	if (!info.isDirectory()) throw new Error(`${context} must be a directory: ${path}`)
+}
+
+async function detectManagedContainerEngine(preferred) {
+	const candidates = preferred ? [preferred] : managedContainerEngines
+	const failures = []
+	for (const engine of candidates) {
+		try {
+			await run(engine, ["info"])
+			return engine
+		} catch (err) {
+			failures.push(`${engine}: ${err?.message ?? err}`)
+		}
+	}
+	const detail = failures.length > 0 ? `\n${failures.join("\n")}` : ""
+	throw new Error(`No usable container engine found for Pinano's managed tool sandbox. Install and start Podman or Docker, or explicitly configure sandbox.type "none".${detail}`)
+}
+
+async function startManagedContainer({ engine, image, workdir, mountRoots }) {
+	if (!workdir || !isAbsolute(workdir)) throw new Error(`Managed container worker requires an absolute cwd, got: ${workdir || "(empty)"}`)
+	await assertDirectory(workdir, "Managed container working directory")
+	for (const root of mountRoots) await assertDirectory(root, "Managed container mount root")
+	const name = `pinano-worker-${randomUUID()}`
+	await run(engine, [
+		"run",
+		"-d",
+		"--name", name,
+		"--label", "com.pinano.managed=true",
+		"--label", `com.pinano.mount-roots=${mountRoots.join(":")}`,
+		"--workdir", workdir,
+		...processUserArg(),
+		...mountRoots.flatMap((root) => ["--volume", `${root}:${root}:rw`]),
+		image,
+		"sh",
+		"-lc",
+		"trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done",
+	])
+	return name
+}
+
+function removeContainer(engine, container) {
+	spawnSync(engine, ["rm", "-f", container], { stdio: "ignore" })
+}
+
+function workerPidFile(sourceRoot, runId) {
+	return `${sourceRoot.replace(/\/$/, "")}/.pinano-worker-${runId}.pid`
+}
+
+function containerWorkerSignalScript({ pidFile, runId, signal }) {
+	return [
+		`pid_file=${shellQuote(pidFile)}`,
+		`run_id=${shellQuote(runId)}`,
+		`if ! test -f "$pid_file"; then exit 0; fi`,
+		`pid=$(cat "$pid_file" 2>/dev/null || true)`,
+		`case "$pid" in ''|*[!0-9]*) exit 0;; esac`,
+		`cmd=$(tr '\\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || ps -p "$pid" -o args= 2>/dev/null || true)`,
+		`case "$cmd" in *"$run_id"*) kill -${signal} "$pid" 2>/dev/null || true;; *) exit 0;; esac`,
+	].join("\n")
+}
+
+function signalContainerWorker(engine, container, pidFile, runId, signal) {
+	spawnSync(engine, ["exec", "-u", "0", container, "sh", "-lc", containerWorkerSignalScript({ pidFile, runId, signal })], { stdio: "ignore", timeout: 1000 })
+}
+
+function stopContainerExecWorker({ engine, container, child, pidFile, runId }) {
+	let stopped = false
+	return () => {
+		if (stopped) return
+		stopped = true
+		signalContainerWorker(engine, container, pidFile, runId, "TERM")
+		try {
+			if (child.stdin && !child.stdin.destroyed) child.stdin.end()
+		} catch {}
+		child.kill("SIGTERM")
+		const killTimer = setTimeout(() => {
+			signalContainerWorker(engine, container, pidFile, runId, "KILL")
+			if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
+		}, containerWorkerStopGraceMs)
+		killTimer.unref?.()
 	}
 }
 
@@ -248,45 +589,48 @@ export class SshWorkerLauncher {
 	}
 }
 
-export class DockerWorkerLauncher {
-	/** @param {{ container: string, remoteRoot?: string }} options */
+class ContainerExecWorkerLauncher {
+	/** @param {{ engine: string, container: string, remoteRoot?: string, paths?: string[] }} options */
 	constructor(options) {
-		if (!options.container) throw new Error("worker=docker:<container> requires a running container name or id")
+		if (!options.container) throw new Error("Container worker requires a running container name or id")
+		this.engine = options.engine
 		this.container = options.container
 		this.remoteRoot = options.remoteRoot
+		this.paths = options.paths
 	}
 
 	async sourceRoot() {
-		return this.remoteRoot ?? (await run("docker", ["exec", this.container, "sh", "-lc", defaultRemoteSourceRootProbe])).stdout.trim()
+		return this.remoteRoot ?? (await run(this.engine, ["exec", this.container, "sh", "-lc", defaultContainerSourceRootProbe])).stdout.trim()
 	}
 
 	remotePath(root, name) {
 		return `${root.replace(/\/$/, "")}/${name}`
 	}
 
-	/** @param {{ cwd?: string, workerPath?: string }} options */
+	/** @param {{ cwd?: string, environmentId?: string, workerPath?: string }} options */
 	async start(options) {
 		const snapshot = await createSourceSnapshot()
+		const allowedRoots = this.paths ? resolveSandboxRoots(options.cwd, this.paths, "Container worker") : undefined
 		try {
-			const runtime = parseRuntime((await run("docker", ["exec", this.container, "sh", "-lc", runtimeProbe])).stdout)
+			const runtime = parseRuntime((await run(this.engine, ["exec", this.container, "sh", "-lc", runtimeProbe])).stdout)
 			const sourceRoot = await this.sourceRoot()
 			const remoteSource = await deploySourceSnapshot(snapshot, {
 				exists: async (hash) => {
 					const path = this.remotePath(sourceRoot, hash)
-					const result = await run("docker", ["exec", this.container, "sh", "-lc", `${sourceReadyCheck(path)} && printf %s ${shellQuote(path)}`]).catch(() => undefined)
+					const result = await run(this.engine, ["exec", this.container, "sh", "-lc", `${sourceReadyCheck(path)} && printf %s ${shellQuote(path)}`]).catch(() => undefined)
 					return result?.stdout || undefined
 				},
 				copy: async (sourceDir, tempName) => {
 					const tempPath = this.remotePath(sourceRoot, tempName)
-					await run("docker", ["exec", "-u", "0", this.container, "rm", "-rf", tempPath])
-					await run("docker", ["exec", this.container, "mkdir", "-p", tempPath])
-					await run("docker", ["cp", `${sourceDir}/.`, `${this.container}:${tempPath}/`])
-					await run("docker", ["exec", "-u", "0", this.container, "sh", "-lc", `chmod -R a+rX ${shellQuote(tempPath)}`])
+					await run(this.engine, ["exec", "-u", "0", this.container, "rm", "-rf", tempPath])
+					await run(this.engine, ["exec", this.container, "mkdir", "-p", tempPath])
+					await run(this.engine, ["cp", `${sourceDir}/.`, `${this.container}:${tempPath}/`])
+					await run(this.engine, ["exec", "-u", "0", this.container, "sh", "-lc", `chmod -R a+rX ${shellQuote(tempPath)}`])
 				},
 				install: async (hash, tempName) => {
 					const tempPath = tempName ? this.remotePath(sourceRoot, tempName) : undefined
 					if (!hash) {
-						if (tempPath) await run("docker", ["exec", "-u", "0", this.container, "rm", "-rf", tempPath]).catch(() => {})
+						if (tempPath) await run(this.engine, ["exec", "-u", "0", this.container, "rm", "-rf", tempPath]).catch(() => {})
 						return undefined
 					}
 					const finalPath = this.remotePath(sourceRoot, hash)
@@ -302,13 +646,28 @@ export class DockerWorkerLauncher {
 						`echo 'failed to install pinano source snapshot' >&2`,
 						`exit 1`,
 					].join("\n")
-					return (await run("docker", ["exec", "-u", "0", this.container, "sh", "-lc", script])).stdout
+					return (await run(this.engine, ["exec", "-u", "0", this.container, "sh", "-lc", script])).stdout
 				},
 			})
 			const workdirArgs = options.cwd ? ["-w", options.cwd] : []
-			const child = spawnRpc("docker", ["exec", "-i", ...workdirArgs, this.container, runtime.command, `${remoteSource}/${sourceWorkerEntry(options.workerPath)}`])
+			const runId = `pinano-worker-${randomUUID()}`
+			const pidFile = workerPidFile(sourceRoot, runId)
+			const child = spawnRpc(this.engine, [
+				"exec",
+				"-i",
+				...workdirArgs,
+				"--env", `PINANO_WORKER_PID_FILE=${pidFile}`,
+				this.container,
+				runtime.command,
+				`${remoteSource}/${sourceWorkerEntry(options.workerPath)}`,
+				`--pinano-worker-run-id=${runId}`,
+			])
 			child.once("exit", () => rm(snapshot.dir, { recursive: true, force: true }).catch(() => {}))
-			return { child, stop: () => child.kill("SIGTERM") }
+			return {
+				child,
+				...(allowedRoots ? { assertCwdAllowed: (cwd) => assertCwdAllowedByRoots(allowedRoots, cwd, "Container worker") } : {}),
+				stop: stopContainerExecWorker({ engine: this.engine, container: this.container, child, pidFile, runId }),
+			}
 		} catch (err) {
 			await rm(snapshot.dir, { recursive: true, force: true }).catch(() => {})
 			throw err
@@ -316,9 +675,56 @@ export class DockerWorkerLauncher {
 	}
 }
 
+export class DockerWorkerLauncher extends ContainerExecWorkerLauncher {
+	/** @param {{ container: string, remoteRoot?: string }} options */
+	constructor(options) {
+		super({ ...options, engine: "docker" })
+	}
+}
+
+export class ManagedContainerWorkerLauncher {
+	/** @param {{ engine?: string, image?: string, remoteRoot?: string, paths?: string[] }} [options] */
+	constructor(options = {}) {
+		this.engine = options.engine
+		this.image = options.image ?? defaultManagedContainerImage
+		this.remoteRoot = options.remoteRoot
+		this.paths = options.paths ?? ["."]
+	}
+
+	/** @param {{ cwd?: string, environmentId?: string, workerPath?: string }} options */
+	async start(options) {
+		const workdir = options.cwd
+		const mountRoots = resolveSandboxRoots(workdir, this.paths, "Managed container worker")
+		const engine = await detectManagedContainerEngine(this.engine)
+		const container = await startManagedContainer({ engine, image: this.image, workdir, mountRoots })
+		let cleaned = false
+		const cleanup = () => {
+			if (cleaned) return
+			cleaned = true
+			removeContainer(engine, container)
+		}
+		try {
+			const handle = await new ContainerExecWorkerLauncher({ engine, container, remoteRoot: this.remoteRoot, paths: this.paths }).start(options)
+			handle.child.once("exit", cleanup)
+			return {
+				child: handle.child,
+				assertCwdAllowed: (cwd) => assertCwdAllowedByRoots(mountRoots, cwd, "Managed container worker"),
+				stop: () => {
+					handle.stop?.()
+					cleanup()
+				},
+			}
+		} catch (err) {
+			cleanup()
+			throw err
+		}
+	}
+}
+
 /** @param {string | undefined} spec */
 export function parseWorkerSpec(spec) {
-	if (!spec || spec === "local") return { type: "local" }
+	if (!spec || spec === "container") return { type: "container" }
+	if (spec === "local") return { type: "local" }
 	if (spec.startsWith("docker:")) {
 		const container = spec.slice("docker:".length)
 		if (!container || container.includes(":")) throw new Error(`Invalid docker worker spec: ${spec}`)
@@ -329,14 +735,44 @@ export function parseWorkerSpec(spec) {
 		if (!target || target.includes("/")) throw new Error(`Invalid ssh worker spec: ${spec}`)
 		return { type: "ssh", target }
 	}
-	throw new Error(`Invalid worker spec: ${spec}. Use local, docker:<container>, or ssh:<target>.`)
+	throw new Error(`Invalid worker spec: ${spec}. Use container, local, docker:<container>, or ssh:<target>.`)
 }
 
-/** @param {string | undefined} spec */
-export function createWorkerLauncher(spec = configuredWorkerSpec()) {
+/** @param {string | { target: any, sandbox: any } | undefined} spec @param {{ image?: string, paths?: string[] }} [options] */
+export function createWorkerLauncher(spec = configuredWorkerSpec(), options = {}) {
+	if (spec && typeof spec === "object") return createEnvironmentWorkerLauncher(spec)
 	const parsed = parseWorkerSpec(spec)
+	if (parsed.type === "container") return new ManagedContainerWorkerLauncher({ image: options.image, paths: options.paths })
 	if (parsed.type === "local") return new LocalWorkerLauncher()
 	if (parsed.type === "docker") return new DockerWorkerLauncher({ container: parsed.container })
 	if (parsed.type === "ssh") return new SshWorkerLauncher({ target: parsed.target })
 	throw new Error(`Unsupported worker launcher type: ${parsed.type}`)
+}
+
+/** @param {{ target: any, sandbox: any }} environment */
+export function createEnvironmentWorkerLauncher(environment) {
+	const target = environment.target ?? { type: "local" }
+	const sandbox = environment.sandbox ?? { type: "none" }
+	if (target.type === "ssh") {
+		if (sandbox.type === "none") return new SshWorkerLauncher({ target: target.host })
+		throw new Error(`Sandbox type "${sandbox.type}" for ssh targets is not implemented yet`)
+	}
+	if (target.type !== "local") throw new Error(`Unsupported environment target type: ${target.type}`)
+	if (sandbox.type === "none") return new LocalWorkerLauncher()
+	if (sandbox.type === "native") return new NativeSandboxWorkerLauncher({ paths: sandbox.paths })
+	if (sandbox.type === "container") {
+		if (sandbox.container) {
+			return new ContainerExecWorkerLauncher({
+				engine: sandbox.engine ?? "docker",
+				container: sandbox.container,
+				paths: sandbox.paths,
+			})
+		}
+		return new ManagedContainerWorkerLauncher({
+			engine: sandbox.engine,
+			image: sandbox.image,
+			paths: sandbox.paths,
+		})
+	}
+	throw new Error(`Unsupported sandbox type: ${sandbox.type}`)
 }

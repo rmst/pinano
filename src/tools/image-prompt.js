@@ -168,6 +168,7 @@ export function createPromptImageContent(buffer, options = {}) {
 	if (detail === "high") {
 		const maxDimension = Math.max(dimensions.widthPx, dimensions.heightPx)
 		if (maxDimension > MAX_HIGH_DETAIL_IMAGE_DIMENSION) {
+			// TODO: Match Codex's default high-detail behavior by resizing prompt images to fit within 2048x2048 before sending them. Pinano rejects oversized high-detail images for now because we do not want to add image-processing dependencies just for clipboard paste.
 			throw new Error(
 				`Image${path} is ${dimensions.widthPx}×${dimensions.heightPx}px, which exceeds the ${MAX_HIGH_DETAIL_IMAGE_DIMENSION}px high-detail prompt limit. Pinano does not resize images yet; resize it first or request detail="original" if supported by the target model.`,
 			)

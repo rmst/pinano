@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto"
 
 import { Session, SqliteSessionStorage } from "../session-manager/index.js"
 import { serverDbPath } from "./paths.js"
-import { PROJECT_CONTEXT_HEADING, isProjectContextMessage } from "./project-context.js"
+import { isProjectContextMessage } from "./project-context.js"
 import { openServerDb } from "./server-db.js"
 import { sessionActivityAt } from "./session-activity.js"
 import { deleteFileCheckpoints } from "./file-checkpoints.js"
@@ -74,7 +74,7 @@ function flattenMessageContent(content) {
  */
 export function sessionPreviewFromMessages(messages) {
 	messages = messages
-		.filter((/** @type {any} */ e) => !isProjectContextMessage({ role: e.role, content: e.content }))
+		.filter((/** @type {any} */ e) => !isProjectContextMessage(e))
 	const firstEntry = messages.find((/** @type {any} */ e) => e.previewKind === "first")
 	const lastUserEntry = messages.find((/** @type {any} */ e) => e.previewKind === "lastUser")
 	/** @type {SessionPreview} */
@@ -105,7 +105,7 @@ export function sessionPreviewFromMessages(messages) {
  */
 export async function loadSessionPreview(id) {
 	const db = await getMetadataDb()
-	return sessionPreviewFromMessages(db.loadSessionPreviewMessages(id, PROJECT_CONTEXT_HEADING))
+	return sessionPreviewFromMessages(db.loadSessionPreviewMessages(id))
 }
 
 /**
@@ -116,7 +116,7 @@ export async function loadSessionPreviews(ids) {
 	const db = await getMetadataDb()
 	/** @type {Map<string, Array<{ previewKind: "first" | "lastUser", timestamp: string, role: string, content: string | any[] }>>} */
 	const messagesBySessionId = new Map()
-	for (const row of db.loadSessionPreviewMessagesForSessions(ids, PROJECT_CONTEXT_HEADING)) {
+	for (const row of db.loadSessionPreviewMessagesForSessions(ids)) {
 		const messages = messagesBySessionId.get(row.sessionId) ?? []
 		messages.push(row)
 		messagesBySessionId.set(row.sessionId, messages)

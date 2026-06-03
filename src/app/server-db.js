@@ -17,7 +17,7 @@ import {
 	SESSION_CUSTOM_TYPE_REWIND,
 } from "./session-custom-types.js"
 
-const SCHEMA_VERSION = 20
+const SCHEMA_VERSION = 22
 const SESSION_PREVIEW_BATCH_SIZE = 200
 
 const HIDDEN_MESSAGE_EXTRA_SQL = `
@@ -27,8 +27,16 @@ const HIDDEN_MESSAGE_EXTRA_SQL = `
 		COALESCE(json_extract(em.extra_json, '$.pinanoAutomated'), 0) = 1
 		OR COALESCE(json_extract(em.extra_json, '$.pinanoHidden'), 0) = 1
 		OR COALESCE(json_extract(em.extra_json, '$.pinanoCompactionMemento'), 0) = 1
+		OR COALESCE(json_extract(em.extra_json, '$.pinanoCompactionSummary'), 0) = 1
 		OR json_type(em.extra_json, '$.pinanoMaintenance') IS NOT NULL
 	)
+`
+
+const PROJECT_CONTEXT_EXTRA_SQL = `
+	em.role = 'user'
+	AND em.extra_json IS NOT NULL
+	AND json_valid(em.extra_json)
+	AND COALESCE(json_extract(em.extra_json, '$.projectContext'), 0) = 1
 `
 
 const migrations = [
@@ -745,6 +753,53 @@ const migrations = [
 			db.exec("ALTER TABLE service_runs DROP COLUMN socket_path")
 		}
 	},
+	// v20 → v21: identify legacy generated AGENTS.md/CLAUDE.md context messages structurally.
+	(db) => {
+		db.exec(`
+			UPDATE entry_messages AS em
+			SET extra_json = json_set(
+				CASE
+					WHEN em.extra_json IS NOT NULL AND json_valid(em.extra_json) AND json_type(em.extra_json) = 'object' THEN em.extra_json
+					ELSE '{}'
+				END,
+				'$.projectContext',
+				json('true')
+			)
+			WHERE em.role = 'user'
+				AND (
+					CASE
+						WHEN em.extra_json IS NOT NULL AND json_valid(em.extra_json) AND json_type(em.extra_json) = 'object'
+							THEN COALESCE(json_extract(em.extra_json, '$.projectContext'), 0)
+						ELSE 0
+					END
+				) != 1
+				AND EXISTS (
+					SELECT 1
+					FROM entry_message_blocks mb
+					WHERE mb.global_id = em.global_id
+						AND mb.type = 'text'
+						AND mb.ordinal = 0
+						AND mb.text LIKE '# AGENTS.md / CLAUDE.md context for %'
+						AND mb.text LIKE '%<INSTRUCTIONS>%'
+						AND mb.text LIKE '%</INSTRUCTIONS>%'
+						AND (
+							mb.text LIKE '%' || char(10) || '## /%AGENTS.md%'
+							OR mb.text LIKE '%' || char(10) || '## /%AGENTS.MD%'
+							OR mb.text LIKE '%' || char(10) || '## /%CLAUDE.md%'
+							OR mb.text LIKE '%' || char(10) || '## /%CLAUDE.MD%'
+						)
+				)
+		`)
+		if (tableExists(db, "session_overviews")) db.exec("DELETE FROM session_overviews")
+	},
+	// v21 → v22: DB-owned session mutation ownership. Services/runtimes may cache
+	// sessions, but a durable append must prove it is based on the loaded session
+	// version, and active agent turns must own the session through their run id.
+	(db) => {
+		const columns = tableColumns(db, "sessions")
+		if (!columns.has("mutation_version")) db.exec("ALTER TABLE sessions ADD COLUMN mutation_version INTEGER NOT NULL DEFAULT 0")
+		if (!columns.has("mutation_run_id")) db.exec("ALTER TABLE sessions ADD COLUMN mutation_run_id TEXT")
+	},
 ]
 
 function tableExists(db, name) {
@@ -915,14 +970,14 @@ function migrateDb(db) {
  * @property {(id: string) => PromptDraft} getPromptDraft
  * @property {(id: string, text: string, options?: { clientId?: string, clientSeq?: number }) => PromptDraft} setPromptDraft
  * @property {(cwd?: string) => ServerDbSession[]} listSessions
- * @property {(id: string, projectContextMarker: string) => Array<{ previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string | any[] }>} loadSessionPreviewMessages
- * @property {(ids: string[], projectContextMarker: string) => Array<{ sessionId: string, previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string | any[] }>} loadSessionPreviewMessagesForSessions
- * @property {(ids: string[], projectContextMarker: string) => Array<{ sessionId: string, previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string }>} loadSessionOverviewPreviewMessagesForSessions
+ * @property {(id: string) => Array<{ previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string | any[] }>} loadSessionPreviewMessages
+ * @property {(ids: string[]) => Array<{ sessionId: string, previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string | any[] }>} loadSessionPreviewMessagesForSessions
+ * @property {(ids: string[]) => Array<{ sessionId: string, previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string }>} loadSessionOverviewPreviewMessagesForSessions
  * @property {(cwd: string) => string | undefined} latestSessionForCwd
  * @property {(prefix: string) => string[]} findSessionIdsByPrefix
  * @property {(sessions: Array<{ id: string, cwd: string, createdAt?: string, updatedAt?: string }>) => void} replaceSessions
  * @property {() => number} sessionCount
- * @property {(run: { id: string, sessionId: string, startedAt?: string }) => void} startRun
+ * @property {(run: { id: string, sessionId: string, startedAt?: string, expectedMutationVersion: number }) => void} startRun
  * @property {(id: string, update: { status: string, error?: string, stopReason?: string, endedAt?: string }) => void} finishRun
  * @property {(sessionId: string, update: { status: string, error?: string, stopReason?: string, endedAt?: string }) => boolean} finishLatestInterruptedRunForSession
  * @property {() => number} interruptRunningRuns
@@ -948,6 +1003,12 @@ function normalizeRunStatus(status) {
 	if (status === "aborted") return "aborted"
 	if (status === "interrupted") return "interrupted"
 	return "idle"
+}
+
+function mutationError(message, code) {
+	const err = new Error(message)
+	err.code = code
+	return err
 }
 
 function promptDraftFromRow(row, overrides = {}) {
@@ -1190,15 +1251,7 @@ export function openServerDb(options = {}) {
 					em.role AS role,
 					em.content_format AS contentFormat,
 					CASE WHEN ${HIDDEN_MESSAGE_EXTRA_SQL} THEN 1 ELSE 0 END AS hasHiddenMessageMarker,
-					(
-						SELECT group_concat(mb.text, ' ')
-						FROM (
-							SELECT text
-							FROM entry_message_blocks
-							WHERE global_id = branch.global_id AND type = 'text'
-							ORDER BY ordinal ASC
-						) mb
-					) AS textContent,
+					CASE WHEN ${PROJECT_CONTEXT_EXTRA_SQL} THEN 1 ELSE 0 END AS hasProjectContextMarker,
 					(
 						SELECT json_group_array(json_object(
 							'type', mb.type,
@@ -1220,7 +1273,7 @@ export function openServerDb(options = {}) {
 				SELECT *
 				FROM branch_messages
 				WHERE hasHiddenMessageMarker = 0
-					AND (role != 'user' OR COALESCE(textContent, '') NOT LIKE '%' || ? || '%')
+					AND hasProjectContextMarker = 0
 			)
 		SELECT * FROM (
 			SELECT
@@ -1249,7 +1302,7 @@ export function openServerDb(options = {}) {
 			LIMIT 1
 		)
 	`)
-	const loadSessionPreviewMessagesForSessionBatch = (ids, projectContextMarker) => {
+	const loadSessionPreviewMessagesForSessionBatch = (ids) => {
 		if (ids.length === 0) return []
 		const values = ids.map(() => "(?)").join(", ")
 		const stmt = db.prepare(`
@@ -1297,15 +1350,7 @@ export function openServerDb(options = {}) {
 						em.role AS role,
 						em.content_format AS contentFormat,
 						CASE WHEN ${HIDDEN_MESSAGE_EXTRA_SQL} THEN 1 ELSE 0 END AS hasHiddenMessageMarker,
-						CASE WHEN em.role = 'user' THEN EXISTS (
-								SELECT 1
-								FROM entry_message_blocks mb
-								WHERE mb.global_id = branch.global_id
-									AND mb.type = 'text'
-									AND mb.text LIKE '%' || ? || '%'
-							)
-							ELSE 0
-						END AS hasProjectContextMarker
+						CASE WHEN ${PROJECT_CONTEXT_EXTRA_SQL} THEN 1 ELSE 0 END AS hasProjectContextMarker
 					FROM branch
 					JOIN conversation_entries ce ON ce.global_id = branch.global_id
 					JOIN entry_messages em ON em.global_id = branch.global_id
@@ -1378,11 +1423,11 @@ export function openServerDb(options = {}) {
 				) AS blocksJson
 			FROM preview_entries
 		`)
-		return stmt.all(...ids, projectContextMarker).map(previewMessageFromRow)
+		return stmt.all(...ids).map(previewMessageFromRow)
 	}
-	const loadSessionPreviewMessagesForSessions = (ids, projectContextMarker) => ids
+	const loadSessionPreviewMessagesForSessions = (ids) => ids
 		.flatMap((_, i) => i % SESSION_PREVIEW_BATCH_SIZE === 0
-			? loadSessionPreviewMessagesForSessionBatch(ids.slice(i, i + SESSION_PREVIEW_BATCH_SIZE), projectContextMarker)
+			? loadSessionPreviewMessagesForSessionBatch(ids.slice(i, i + SESSION_PREVIEW_BATCH_SIZE))
 			: [])
 	const overviewLeavesForSessionBatch = (ids) => {
 		if (ids.length === 0) return []
@@ -1532,24 +1577,51 @@ export function openServerDb(options = {}) {
 		ORDER BY updated_at DESC
 	`)
 	const sessionCountStmt = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE deleted_at IS NULL")
+	const getSessionMutationStmt = db.prepare(`
+		SELECT mutation_version AS mutationVersion, mutation_run_id AS mutationRunId
+		FROM sessions
+		WHERE id = ? AND deleted_at IS NULL
+	`)
 	const startRunStmt = db.prepare(`
 		INSERT INTO runs (id, session_id, status, started_at)
 		VALUES (?, ?, 'running', ?)
 	`)
-	const startRunSessionStateStmt = db.prepare("UPDATE sessions SET runtime_state = 'running', runtime_state_updated_at = ? WHERE id = ? AND deleted_at IS NULL")
+	const startRunSessionStateStmt = db.prepare(`
+		UPDATE sessions
+		SET runtime_state = 'running',
+			runtime_state_updated_at = ?,
+			mutation_run_id = ?
+		WHERE id = ? AND deleted_at IS NULL
+			AND mutation_run_id IS NULL
+			AND mutation_version = ?
+	`)
 	const finishRunStmt = db.prepare(`
 		UPDATE runs
 		SET status = ?, ended_at = ?, error = ?, stop_reason = ?
 		WHERE id = ?
 	`)
-	const finishRunSessionStateStmt = db.prepare("UPDATE sessions SET runtime_state = ?, runtime_state_updated_at = ? WHERE id = (SELECT session_id FROM runs WHERE id = ?) AND deleted_at IS NULL")
+	const finishRunSessionStateStmt = db.prepare(`
+		UPDATE sessions
+		SET runtime_state = ?,
+			runtime_state_updated_at = ?,
+			mutation_run_id = CASE WHEN mutation_run_id = ? THEN NULL ELSE mutation_run_id END
+		WHERE id = (SELECT session_id FROM runs WHERE id = ?) AND deleted_at IS NULL
+			AND (mutation_run_id IS NULL OR mutation_run_id = ?)
+	`)
 	const latestInterruptedRunForSessionStmt = db.prepare(`
 		SELECT id FROM runs
 		WHERE session_id = ? AND status = 'interrupted'
 		ORDER BY started_at DESC
 		LIMIT 1
 	`)
-	const finishLatestInterruptedRunSessionStateStmt = db.prepare("UPDATE sessions SET runtime_state = ?, runtime_state_updated_at = ? WHERE id = ? AND deleted_at IS NULL")
+	const finishLatestInterruptedRunSessionStateStmt = db.prepare(`
+		UPDATE sessions
+		SET runtime_state = ?,
+			runtime_state_updated_at = ?,
+			mutation_run_id = CASE WHEN mutation_run_id = ? THEN NULL ELSE mutation_run_id END
+		WHERE id = ? AND deleted_at IS NULL
+			AND (mutation_run_id IS NULL OR mutation_run_id = ?)
+	`)
 	const interruptRunningStmt = db.prepare(`
 		UPDATE runs
 		SET status = 'interrupted', ended_at = ?, error = COALESCE(error, 'Pinano server stopped before this run finished.'), stop_reason = 'interrupted'
@@ -1557,7 +1629,9 @@ export function openServerDb(options = {}) {
 	`)
 	const interruptRunningSessionsStmt = db.prepare(`
 		UPDATE sessions
-		SET runtime_state = 'interrupted', runtime_state_updated_at = ?
+		SET runtime_state = 'interrupted',
+			runtime_state_updated_at = ?,
+			mutation_run_id = NULL
 		WHERE id IN (
 			SELECT DISTINCT session_id
 			FROM runs
@@ -1721,13 +1795,13 @@ export function openServerDb(options = {}) {
 				} : undefined,
 			}))
 		},
-		loadSessionPreviewMessages(id, projectContextMarker) {
-			return previewMessagesStmt.all(id, projectContextMarker).map(previewMessageFromRow)
+		loadSessionPreviewMessages(id) {
+			return previewMessagesStmt.all(id).map(previewMessageFromRow)
 		},
-		loadSessionPreviewMessagesForSessions(ids, projectContextMarker) {
-			return loadSessionPreviewMessagesForSessions(ids, projectContextMarker)
+		loadSessionPreviewMessagesForSessions(ids) {
+			return loadSessionPreviewMessagesForSessions(ids)
 		},
-		loadSessionOverviewPreviewMessagesForSessions(ids, projectContextMarker) {
+		loadSessionOverviewPreviewMessagesForSessions(ids) {
 			if (ids.length === 0) return []
 			const cachedBySessionId = new Map(cachedOverviewsForSessions(ids).map((row) => [row.sessionId, row]))
 			const leaves = overviewLeavesForSessions(ids)
@@ -1735,7 +1809,7 @@ export function openServerDb(options = {}) {
 			if (staleLeaves.length > 0) {
 				const staleIds = staleLeaves.map((row) => row.sessionId)
 				const messagesBySessionId = new Map()
-				for (const row of loadSessionPreviewMessagesForSessions(staleIds, projectContextMarker)) {
+				for (const row of loadSessionPreviewMessagesForSessions(staleIds)) {
 					const messages = messagesBySessionId.get(row.sessionId) ?? []
 					messages.push(row)
 					messagesBySessionId.set(row.sessionId, messages)
@@ -1774,41 +1848,85 @@ export function openServerDb(options = {}) {
 		},
 		startRun(run) {
 			const at = run.startedAt ?? nowIso()
-			startRunStmt.run(run.id, run.sessionId, at)
-			startRunSessionStateStmt.run(at, run.sessionId)
+			if (!Number.isInteger(run.expectedMutationVersion)) {
+				throw mutationError("A session mutation version is required to start a run.", "PINANO_SESSION_MUTATION_VERSION_REQUIRED")
+			}
+			db.exec("BEGIN IMMEDIATE")
+			try {
+				startRunStmt.run(run.id, run.sessionId, at)
+				const claimed = startRunSessionStateStmt.run(
+					at,
+					run.id,
+					run.sessionId,
+					run.expectedMutationVersion,
+				)
+				if (Number(claimed.changes ?? 0) !== 1) {
+					const current = getSessionMutationStmt.get(run.sessionId)
+					if (!current) throw mutationError(`Session not found: ${run.sessionId}`, "PINANO_SESSION_NOT_FOUND")
+					if (current.mutationRunId) {
+						throw mutationError(`Session ${run.sessionId} is already being mutated by run ${current.mutationRunId}.`, "PINANO_SESSION_MUTATION_BUSY")
+					}
+					throw mutationError(`Session ${run.sessionId} changed in the database; reopen it before starting a run.`, "PINANO_SESSION_STALE")
+				}
+				db.exec("COMMIT")
+			} catch (err) {
+				db.exec("ROLLBACK")
+				throw err
+			}
 		},
 		finishRun(id, update) {
 			const at = update.endedAt ?? nowIso()
-			finishRunStmt.run(
-				update.status,
-				at,
-				update.error ?? null,
-				update.stopReason ?? null,
-				id,
-			)
-			const state = update.status === "completed" ? "idle" : normalizeRunStatus(update.status)
-			finishRunSessionStateStmt.run(state, at, id)
+			db.exec("BEGIN IMMEDIATE")
+			try {
+				finishRunStmt.run(
+					update.status,
+					at,
+					update.error ?? null,
+					update.stopReason ?? null,
+					id,
+				)
+				const state = update.status === "completed" ? "idle" : normalizeRunStatus(update.status)
+				finishRunSessionStateStmt.run(state, at, id, id, id)
+				db.exec("COMMIT")
+			} catch (err) {
+				db.exec("ROLLBACK")
+				throw err
+			}
 		},
 		finishLatestInterruptedRunForSession(sessionId, update) {
 			const row = latestInterruptedRunForSessionStmt.get(sessionId)
 			if (!row?.id) return false
 			const at = update.endedAt ?? nowIso()
-			finishRunStmt.run(
-				update.status,
-				at,
-				update.error ?? null,
-				update.stopReason ?? null,
-				row.id,
-			)
-			const state = update.status === "completed" ? "idle" : normalizeRunStatus(update.status)
-			finishLatestInterruptedRunSessionStateStmt.run(state, at, sessionId)
-			return true
+			db.exec("BEGIN IMMEDIATE")
+			try {
+				finishRunStmt.run(
+					update.status,
+					at,
+					update.error ?? null,
+					update.stopReason ?? null,
+					row.id,
+				)
+				const state = update.status === "completed" ? "idle" : normalizeRunStatus(update.status)
+				finishLatestInterruptedRunSessionStateStmt.run(state, at, row.id, sessionId, row.id)
+				db.exec("COMMIT")
+				return true
+			} catch (err) {
+				db.exec("ROLLBACK")
+				throw err
+			}
 		},
 		interruptRunningRuns() {
 			const at = nowIso()
-			const changes = Number(interruptRunningStmt.run(at).changes ?? 0)
-			if (changes > 0) interruptRunningSessionsStmt.run(at, at)
-			return changes
+			db.exec("BEGIN IMMEDIATE")
+			try {
+				const changes = Number(interruptRunningStmt.run(at).changes ?? 0)
+				if (changes > 0) interruptRunningSessionsStmt.run(at, at)
+				db.exec("COMMIT")
+				return changes
+			} catch (err) {
+				db.exec("ROLLBACK")
+				throw err
+			}
 		},
 		startServiceRun(run) {
 			startServiceRunStmt.run(

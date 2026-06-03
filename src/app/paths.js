@@ -1,6 +1,6 @@
 // Centralized path resolution for pinano on-disk state.
 //
-// Defaults to ~/.pinano. Override the entire config/data root with
+// Defaults to ~/.pinano. Override the entire config/data/environment root with
 // $PINANO_HOME — useful for tests and custom installs.
 
 import { homedir } from "node:os"
@@ -8,6 +8,10 @@ import { join, resolve } from "node:path"
 
 function pinanoHome() {
 	return process.env.PINANO_HOME || join(homedir(), ".pinano")
+}
+
+function safePathComponent(value) {
+	return String(value || "local").replace(/[^A-Za-z0-9_-]/g, "_")
 }
 
 export function isPinanoTestProcess() {
@@ -39,6 +43,21 @@ export function configRoot() {
 export function dataRoot() {
 	assertSafeTestHome()
 	return join(pinanoHome(), "data")
+}
+
+/** @returns {string} */
+export function environmentsRoot() {
+	assertSafeTestHome()
+	return join(pinanoHome(), "environments")
+}
+
+/**
+ * Writable native-sandbox home for tools belonging to one configured environment.
+ * @param {string | undefined} environmentId
+ * @returns {string}
+ */
+export function environmentHomePath(environmentId) {
+	return join(environmentsRoot(), safePathComponent(environmentId), "home")
 }
 
 /** @returns {string} */

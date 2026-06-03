@@ -215,7 +215,7 @@ async function runLoop(currentContext, newMessages, config, signal, emit, stream
 				pendingAction = undefined
 			} else {
 				pendingAction = undefined
-				message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn)
+				message = await streamAssistantResponse(currentContext, newMessages, config, signal, emit, streamFn)
 				newMessages.push(message)
 			}
 
@@ -296,6 +296,12 @@ function serviceTierForModel(model, serviceTier) {
 	return model?.provider === "openai-codex" && model?.id === "gpt-5.5" ? serviceTier : undefined
 }
 
+function modelForRequest(context, newMessages, config) {
+	const requested = config.modelForRequest?.({ model: config.model, context, newMessages })
+	if (requested && typeof requested.then === "function") return requested.then((model) => model ?? config.model)
+	return requested ?? config.model
+}
+
 const ABORTED_STREAM = Symbol("aborted-stream")
 const EMPTY_USAGE = {
 	input: 0,
@@ -321,12 +327,12 @@ function cloneJson(value, fallback) {
 	}
 }
 
-function abortedAssistantMessage(config, partialMessage) {
+function abortedAssistantMessage(config, requestModel, partialMessage) {
 	return {
 		role: "assistant",
 		content: cloneJson(partialMessage?.content, []),
-		provider: partialMessage?.provider ?? config.model?.provider,
-		model: partialMessage?.model ?? config.model?.id,
+		provider: partialMessage?.provider ?? requestModel?.provider ?? config.model?.provider,
+		model: partialMessage?.model ?? requestModel?.id ?? config.model?.id,
 		auth: cloneJson(partialMessage?.auth, partialMessage?.auth),
 		usage: cloneJson(partialMessage?.usage, EMPTY_USAGE),
 		stopReason: "aborted",
@@ -357,8 +363,8 @@ async function nextStreamEvent(iterator, signal) {
 	return abortable(iterator.next(), signal)
 }
 
-async function finishAbortedAssistantResponse(context, config, response, partialMessage, addedPartial, emit) {
-	const finalMessage = abortedAssistantMessage(config, partialMessage)
+async function finishAbortedAssistantResponse(context, config, requestModel, response, partialMessage, addedPartial, emit) {
+	const finalMessage = abortedAssistantMessage(config, requestModel, partialMessage)
 	closeDetachedModelStream(response, finalMessage)
 	if (addedPartial) {
 		context.messages[context.messages.length - 1] = finalMessage
@@ -370,11 +376,13 @@ async function finishAbortedAssistantResponse(context, config, response, partial
 	return finalMessage
 }
 
-async function streamAssistantResponse(context, config, signal, emit, streamFn) {
+async function streamAssistantResponse(context, newMessages, config, signal, emit, streamFn) {
 	let messages = context.messages
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal)
 	}
+	const selectedModel = modelForRequest(context, newMessages, config)
+	const requestModel = selectedModel && typeof selectedModel.then === "function" ? await selectedModel : selectedModel
 	const llmMessages = await config.convertToLlm(messages)
 	const llmContext = {
 		systemPrompt: context.systemPrompt,
@@ -383,13 +391,13 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
 	}
 	const fn = streamFn || defaultStreamFn
 	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey
+		(config.getApiKey ? await config.getApiKey(requestModel.provider) : undefined) || config.apiKey
 
 	const modelRequest = {
 		startedAt: new Date().toISOString(),
-		provider: config.model?.provider,
-		model: config.model?.id,
-		transport: config.model?.transport,
+		provider: requestModel?.provider,
+		model: requestModel?.id,
+		transport: requestModel?.transport,
 	}
 	await emit({ type: "model_request_start", request: modelRequest })
 
@@ -399,9 +407,9 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
 	let response
 
 	try {
-		const streamResult = fn(config.model, llmContext, {
+		const streamResult = fn(requestModel, llmContext, {
 			reasoning: config.reasoning,
-			serviceTier: serviceTierForModel(config.model, config.serviceTier),
+			serviceTier: serviceTierForModel(requestModel, config.serviceTier),
 			sessionId: config.sessionId,
 			auth: config.auth,
 			onPayload: config.onPayload,
@@ -414,12 +422,12 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
 			? streamResult
 			: await abortable(streamPromise, signal)
 		if (response === ABORTED_STREAM) {
-			finalMessage = await finishAbortedAssistantResponse(context, config, undefined, partialMessage, addedPartial, emit)
+			finalMessage = await finishAbortedAssistantResponse(context, config, requestModel, undefined, partialMessage, addedPartial, emit)
 			streamPromise.then((lateResponse) => closeDetachedModelStream(lateResponse, finalMessage)).catch(() => {})
 			return finalMessage
 		}
 		if (signal?.aborted === true) {
-			finalMessage = await finishAbortedAssistantResponse(context, config, response, partialMessage, addedPartial, emit)
+			finalMessage = await finishAbortedAssistantResponse(context, config, requestModel, response, partialMessage, addedPartial, emit)
 			return finalMessage
 		}
 
@@ -427,7 +435,7 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
 		while (true) {
 			const next = await nextStreamEvent(iterator, signal)
 			if (next === ABORTED_STREAM) {
-				finalMessage = await finishAbortedAssistantResponse(context, config, response, partialMessage, addedPartial, emit)
+				finalMessage = await finishAbortedAssistantResponse(context, config, requestModel, response, partialMessage, addedPartial, emit)
 				return finalMessage
 			}
 			if (next.done) break
@@ -479,7 +487,7 @@ async function streamAssistantResponse(context, config, signal, emit, streamFn) 
 		}
 
 		if (signal?.aborted === true) {
-			finalMessage = await finishAbortedAssistantResponse(context, config, response, partialMessage, addedPartial, emit)
+			finalMessage = await finishAbortedAssistantResponse(context, config, requestModel, response, partialMessage, addedPartial, emit)
 			return finalMessage
 		}
 		finalMessage = await response.result()

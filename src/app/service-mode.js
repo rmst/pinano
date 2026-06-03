@@ -13,14 +13,16 @@ import { createInterface } from "node:readline/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { normalizeReasoningLevel } from "../reasoning.js"
 import { dataRoot } from "./paths.js"
-import { parseBashShortcut, runBashShortcut, recordBashShortcut } from "./bash-shortcut.js"
 import { loadSettings, updateSetting } from "./settings.js"
 import { RuntimeManager } from "./server-runtime.js"
 import { authenticateRequest } from "./http-auth.js"
 import { configuredServiceDiagnostics, configuredServiceEndpointDefaults, configuredServiceToken, configuredWebDefaults } from "./service-config.js"
 import { createServiceDiagnostics } from "./service-diagnostics.js"
+import { WebRouter } from "./web-router.js"
+import { createManagerClientApi, json, jsonBody, registerClientApiRoutes, routeError } from "./client-api.js"
+import { writeResponseBody } from "./http-response.js"
+import { createEventHub } from "./sse-event-hub.js"
 
 /** @typedef {import("./agent-runtime.js").AgentRuntime} Agent */
 
@@ -31,13 +33,17 @@ const DESIRED_RUNTIME_LOCK_TTL_MS = 10000
 const DESIRED_RUNTIME_LOCK_TIMEOUT_MS = DESIRED_RUNTIME_LOCK_TTL_MS + 2000
 const SERVICE_UPGRADE_SOFT_WAIT_MS = 5000
 const SERVICE_UPGRADE_BLOCKED_POLL_MS = 1000
+const SERVICE_CONNECTIVITY_TIMEOUT_MS = 1500
+const SERVICE_REQUEST_TIMEOUT_MS = 30000
+const SERVICE_EVENT_HEARTBEAT_INTERVAL_MS = 10000
+const SERVICE_EVENT_STALL_TIMEOUT_MS = 30000
+const SERVICE_SSE_PARSE_ERROR_CODE = "PINANO_SERVICE_SSE_PARSE_ERROR"
 const processStartedAtMs = Date.now()
 
 const here = dirname(fileURLToPath(import.meta.url))
 const sourceRoot = join(here, "..")
 const packageRoot = join(sourceRoot, "..")
 const mainPath = join(here, "main.js")
-const encoder = new TextEncoder()
 const INFO_PATH = Symbol("serviceInfoPath")
 
 function configuredServiceDir() {
@@ -119,13 +125,6 @@ async function terminateProcess(pid) {
 	if (await waitForProcessExit(pid, 2000)) return true
 	try { process.kill(pid, "SIGKILL") } catch {}
 	return waitForProcessExit(pid, 1000)
-}
-
-function json(data, status = 200) {
-	return new Response(JSON.stringify(data), {
-		status,
-		headers: { "content-type": "application/json; charset=utf-8" },
-	})
 }
 
 function authError(auth) {
@@ -469,6 +468,7 @@ export async function claimCurrentRuntimeIdentity() {
 	const identity = await processRuntimeIdentity()
 	return withDesiredRuntimeLock(async () => {
 		const desired = await readDesiredRuntimeIdentityUnlocked()
+		if (runtimeIdentityMatches(desired, identity) && desiredHasRuntimeState(desired) && desired.claimId) return { ...identity, claimId: desired.claimId }
 		const decision = runtimeActivationDecision(identity, desired)
 		if (!decision.ok) throw staleRuntimeError(decision.desired ?? desired, decision.reason)
 		const claimId = randomUUID()
@@ -490,79 +490,7 @@ async function ensureCurrentRuntimeIsDesired(identity, expectedClaimId) {
 			await writeDesiredRuntimeIdentityUnlocked(identity, expectedClaimId ? { claimId: expectedClaimId } : {}, desired)
 			return
 		}
-		if (expectedClaimId && desired.claimId && desired.claimId !== expectedClaimId) throw staleRuntimeError(desired, "superseded_claim")
 	})
-}
-
-function routeError(err) {
-	return json({ error: /** @type {any} */ (err)?.message ?? String(err) }, /** @type {any} */ (err)?.status ?? 400)
-}
-
-/** @param {Request} req */
-async function readJson(req) {
-	return req.json().catch(() => ({}))
-}
-
-function createEventHub(onActivity = () => {}) {
-	/** @type {Map<string, ReadableStreamDefaultController<Uint8Array>>} */
-	const clients = new Map()
-	let nextClientId = 1
-	const sendTo = (controller, event) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
-	return {
-		stream(initialEvent, signal) {
-			/** @type {ReadableStreamDefaultController<Uint8Array> | undefined} */
-			let streamController
-			const clientId = String(nextClientId++)
-			let released = false
-			const release = () => {
-				if (released) return
-				released = true
-				clients.delete(clientId)
-				signal?.removeEventListener?.("abort", release)
-				try { streamController?.close() } catch {}
-				onActivity()
-			}
-			const response = new Response(new ReadableStream({
-				start(controller) {
-					streamController = controller
-					clients.set(clientId, controller)
-					signal?.addEventListener?.("abort", release, { once: true })
-					onActivity()
-					if (signal?.aborted) release()
-					else sendTo(controller, { ...initialEvent, eventClientId: clientId })
-				},
-				cancel() {
-					release()
-				},
-			}), {
-				headers: {
-					"content-type": "text/event-stream; charset=utf-8",
-					"cache-control": "no-cache",
-					"connection": "keep-alive",
-				},
-			})
-			return response
-		},
-		send(event) {
-			for (const [clientId, controller] of [...clients]) {
-				try {
-					sendTo(controller, event)
-				} catch {
-					clients.delete(clientId)
-				}
-			}
-			onActivity()
-		},
-		closeClient(clientId) {
-			const controller = clients.get(clientId)
-			clients.delete(clientId)
-			try { controller?.close() } catch {}
-			onActivity()
-		},
-		clientCount() {
-			return clients.size
-		},
-	}
 }
 
 /**
@@ -575,6 +503,7 @@ function createEventHub(onActivity = () => {}) {
  * @param {string} [options.serviceRunId]
  * @param {string} [options.serviceClaimId]
  * @param {() => void | Promise<void>} [options.onIdle]
+ * @param {number} [options.eventHeartbeatIntervalMs]
  * @param {any} [options.webAppOptions]
  * @param {(info: { sessionId: string, session: any, cwd: string }) => Agent} options.createAgent
  */
@@ -601,7 +530,7 @@ export async function runService(options) {
 		clearTimeout(idleTimer)
 		idleTimer = undefined
 	}
-	const hub = createEventHub(() => scheduleIdleCheck())
+	const hub = createEventHub(() => scheduleIdleCheck(), { heartbeatIntervalMs: options.eventHeartbeatIntervalMs })
 	const db = await openOwnedServerDb({ recoverRunningRuns: true })
 	db.recoverServiceRuns(undefined, serviceRunId)
 	db.startServiceRun({
@@ -653,9 +582,20 @@ export async function runService(options) {
 			return
 		}
 		shutdownReason = "idle_shutdown"
+		await exitAfterCleanup(0)
+	}
+	async function exitAfterCleanup(exitCode = 0) {
 		await cleanup()
 		if (options.onIdle) await options.onIdle()
-		else process.exit(0)
+		else process.exit(exitCode)
+	}
+	function scheduleExitAfterCleanup(exitCode = 0) {
+		setTimeout(() => {
+			exitAfterCleanup(exitCode).catch((err) => {
+				console.error("service shutdown error", err)
+				if (!options.onIdle) process.exit(1)
+			})
+		}, 20)
 	}
 	async function waitForNoRunning(deadline) {
 		while (Date.now() < deadline && (runningRuntimes().length > 0 || backgroundRuntimes().length > 0)) {
@@ -769,6 +709,10 @@ export async function runService(options) {
 				serviceSettings = await updateSetting("model", model)
 				return serviceSettings
 			},
+			setDefaultReasoning: async (level) => {
+				serviceSettings = await updateSetting("thinkingLevel", /** @type {any} */ (level))
+				return serviceSettings
+			},
 		}, appOptions)
 		webServer = {
 			...webApp,
@@ -783,215 +727,96 @@ export async function runService(options) {
 		return { ok: true, web: webStatus() }
 	}
 
-	/** @param {Request} req */
-	const handleServiceRequest = async (req) => {
-		const url = new URL(req.url)
-		const pathname = stripServiceRoutePrefix(url.pathname)
+	const serviceApi = createManagerClientApi({
+		cwd: options.cwd,
+		manager,
+		hub,
+		resolveId,
+		getSettings: () => serviceSettings,
+		setDefaultModel: async (model) => {
+			serviceModelOverride = true
+			serviceSettings = await updateSetting("model", model)
+			return serviceSettings
+		},
+		setDefaultReasoning: async (level) => {
+			serviceSettings = await updateSetting("thinkingLevel", /** @type {any} */ (level))
+			return serviceSettings
+		},
+	})
+	const serviceApp = new WebRouter()
+	const serviceRoutePath = (prefix, suffix) => prefix ? `${prefix}${suffix}` : suffix
+	const safeServiceRoute = (handler) => async (context) => {
 		try {
-			if (req.method === "GET" && pathname === "/health") {
-				return json({
-					ok: true,
-					pid: process.pid,
-					serviceRunId,
-					cwd: options.cwd,
-					transport: "tcp",
-					host: serviceEndpoint.host,
-					port: serviceEndpoint.port,
-					requestedPort: serviceEndpoint.requestedPort,
-					portFallback: serviceEndpoint.portFallback === true,
-					protocolVersion: SERVICE_PROTOCOL_VERSION,
-					codeFingerprint,
-					runtimeKey: runtimeIdentity.runtimeKey,
-					packageName: runtimeIdentity.packageName,
-					packageVersion: runtimeIdentity.packageVersion,
-					mainPath,
-					sourceRoot,
-					packageRoot,
-					execPath: process.execPath,
-					argv: process.argv,
-					activeRequests,
-					eventClients: hub.clientCount(),
-					web: webStatus(false),
-					runningSessions: runningRuntimes().map((runtime) => runtime.sessionId),
-					backgroundSessions: backgroundRuntimes().map((runtime) => runtime.sessionId),
-					waiting: waitingInfos(),
-					diagnostics: diagnostics.status(),
-				})
-			}
-			if (req.method === "GET" && pathname === "/events") {
-				return hub.stream({ type: "sessions", sessions: await manager.sessions() }, req.signal)
-			}
-			if (req.method === "GET" && pathname === "/web/status") return json({ ok: true, web: webStatus() })
-			if (req.method === "POST" && pathname === "/web/start") return json(await startWeb(await readJson(req)))
-			if (req.method === "POST" && pathname === "/web/stop") return json({ ok: true, stopped: await stopWeb(), web: webStatus() })
-			if (req.method === "GET" && pathname === "/settings") return json({ settings: serviceSettings })
-			if (req.method === "POST" && pathname === "/settings") {
-				const body = await readJson(req)
-				if (Object.hasOwn(body, "model")) {
-					const model = typeof body.model === "string" ? body.model.trim() : ""
-					if (!model) return json({ error: "model is required" }, 400)
-					serviceModelOverride = true
-					serviceSettings = await updateSetting("model", model)
-					return json({ ok: true, settings: serviceSettings })
-				}
-				if (Object.hasOwn(body, "thinkingLevel")) {
-					const level = normalizeReasoningLevel(typeof body.thinkingLevel === "string" ? body.thinkingLevel.trim() : "")
-					if (!level) return json({ error: "valid reasoning level is required" }, 400)
-					serviceSettings = await updateSetting("thinkingLevel", /** @type {any} */ (level))
-					return json({ ok: true, settings: serviceSettings })
-				}
-				return json({ error: "no supported settings provided" }, 400)
-			}
-			if (req.method === "GET" && pathname === "/sessions") {
-				return json({ sessions: await manager.sessions(url.searchParams.get("cwd") || undefined) })
-			}
-			if (req.method === "POST" && pathname === "/sessions") {
-				const body = await readJson(req)
-				const cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : options.cwd
-				const runtime = await manager.createSession(cwd)
-				if (typeof body.prompt === "string" && body.prompt.trim()) await runtime.prompt(body.prompt)
-				return json({ ok: true, sessionId: runtime.sessionId, snapshot: await runtime.snapshot() })
-			}
-			const eventClientMatch = pathname.match(/^\/event-clients\/([^/]+)\/close$/)
-			if (req.method === "POST" && eventClientMatch) {
-				hub.closeClient(decodeURIComponent(eventClientMatch[1]))
-				return json({ ok: true })
-			}
-
-			const sessionMatch = pathname.match(/^\/sessions\/([^/]+)(?:\/(snapshot|prompt|draft|continue|abort|cancel-prompt|complete|defer|review|delete|reasoning|fast|compact|bash|rewind-targets|rewind|branch))?$/)
-			if (sessionMatch) {
-				const id = resolveId(decodeURIComponent(sessionMatch[1]))
-				const action = sessionMatch[2] ?? "snapshot"
-				if (req.method === "GET" && action === "snapshot") return json(await manager.snapshot(id, { includeSessions: url.searchParams.get("includeSessions") === "1" }))
-				if (req.method === "POST" && action === "prompt") {
-					const body = await readJson(req)
-					const message = typeof body.message === "string" ? body.message : ""
-					if (!message.trim()) return json({ error: "message is required" }, 400)
-					const runtime = await manager.getRuntime(id)
-					await runtime.prompt(message, body.streamingBehavior)
-					manager.setPromptDraft(id, "", { clientId: body.draftClientId, clientSeq: body.draftClientSeq })
-					return json({ ok: true, snapshot: await runtime.snapshot() })
-				}
-				if (req.method === "POST" && action === "draft") {
-					const body = await readJson(req)
-					const text = typeof body.text === "string" ? body.text : ""
-					const draft = manager.setPromptDraft(id, text, { clientId: body.clientId, clientSeq: body.clientSeq })
-					return json({ ok: true, draft })
-				}
-				if (req.method === "POST" && action === "continue") {
-					const runtime = await manager.getRuntime(id)
-					await runtime.continueRun()
-					return json({ ok: true, snapshot: await runtime.snapshot() })
-				}
-				if (req.method === "POST" && action === "abort") {
-					const runtime = await manager.getRuntime(id)
-					await runtime.abort()
-					return json({ ok: true, snapshot: await runtime.snapshot() })
-				}
-				if (req.method === "POST" && action === "cancel-prompt") {
-					const runtime = await manager.getRuntime(id)
-					return json(await runtime.cancelCurrentPrompt())
-				}
-				if (req.method === "POST" && action === "complete") {
-					const metadata = await manager.markCompleted(id)
-					return json({ ok: true, metadata, sessions: await manager.sessions(url.searchParams.get("cwd") || undefined) })
-				}
-				if (req.method === "POST" && action === "defer") {
-					const metadata = await manager.markDeferred(id)
-					return json({ ok: true, metadata, sessions: await manager.sessions(url.searchParams.get("cwd") || undefined) })
-				}
-				if (req.method === "POST" && action === "review") {
-					const metadata = await manager.markReadyForReview(id)
-					return json({ ok: true, metadata, sessions: await manager.sessions(url.searchParams.get("cwd") || undefined) })
-				}
-				if (req.method === "POST" && action === "delete") {
-					await manager.deleteStoppedSession(id)
-					return json({ ok: true, sessions: await manager.sessions(url.searchParams.get("cwd") || undefined) })
-				}
-				if (req.method === "POST" && action === "reasoning") {
-					const body = await readJson(req)
-					const level = normalizeReasoningLevel(typeof body.level === "string" ? body.level.trim() : "")
-					if (!level) return json({ error: "valid reasoning level is required" }, 400)
-					const runtime = await manager.getRuntime(id)
-					runtime.agent.state.thinkingLevel = /** @type {any} */ (level)
-					await runtime.session.appendConfigPatch({ version: 1, thinkingLevel: runtime.agent.state.thinkingLevel })
-					await manager.sendSnapshot(id)
-					return json({ ok: true, snapshot: await runtime.snapshot() })
-				}
-				if (req.method === "POST" && action === "fast") {
-					const body = await readJson(req)
-					const args = typeof body.args === "string" ? body.args : ""
-					const runtime = await manager.getRuntime(id)
-					const message = await runtime.setFastMode(args)
-					await manager.sendSnapshot(id)
-					return json({ ok: true, message, snapshot: await runtime.snapshot() })
-				}
-				if (req.method === "POST" && action === "compact") {
-					const runtime = await manager.getRuntime(id)
-					const result = await runtime.compact()
-					await manager.sendSnapshot(id)
-					return json({ ok: true, result, snapshot: await runtime.snapshot() })
-				}
-				if (req.method === "POST" && action === "bash") {
-					const body = await readJson(req)
-					const text = typeof body.text === "string" ? body.text : ""
-					const shortcut = parseBashShortcut(text)
-					if (!shortcut) return json({ error: "valid bash shortcut is required" }, 400)
-					const runtime = await manager.getRuntime(id)
-					const result = await runBashShortcut(runtime.agent, shortcut.command, { excludeFromContext: shortcut.excludeFromContext })
-					await recordBashShortcut(runtime.agent, runtime.session, result)
-					await manager.sendSnapshot(id)
-					return json({ ok: true, result, snapshot: await runtime.snapshot() })
-				}
-				if (req.method === "GET" && action === "rewind-targets") {
-					const runtime = await manager.getRuntime(id)
-					return json({ targets: runtime.rewindTargets() })
-				}
-				if (req.method === "POST" && action === "rewind") {
-					const body = await readJson(req)
-					const runtime = await manager.getRuntime(id)
-					if (body.targetKind === "leaf") {
-						await runtime.switchBranchTip(String(body.entryId ?? ""))
-						return json({ ok: true, text: "", targetKind: "leaf", snapshot: await runtime.snapshot() })
-					}
-					const text = await runtime.rewind(String(body.entryId ?? ""), {
-						summary: body.summary === true,
-						restoreFiles: body.restoreFiles === true,
-						restoreConversation: body.restoreConversation !== false,
-					})
-					return json({ ok: true, text, targetKind: "message", snapshot: await runtime.snapshot() })
-				}
-				if (req.method === "POST" && action === "branch") {
-					const runtime = await manager.branchSession(id)
-					return json({ ok: true, sessionId: runtime.sessionId, snapshot: await runtime.snapshot(), sessions: await manager.sessions(url.searchParams.get("cwd") || undefined) })
-				}
-			}
-
-			if (req.method === "POST" && pathname === "/interrupt") {
-				const body = await readJson(req)
-				const mode = body.mode === "hard" ? "hard" : "soft"
-				if (mode === "hard") {
-					for (const runtime of runningRuntimes()) runtime.agent.abort()
-					shutdownReason = "hard_interrupt"
-					setTimeout(() => { cleanup().finally(() => process.exit(0)) }, 20)
-					return json({ ok: true, mode, exiting: true, waiting: waitingInfos() })
-				}
-
-				for (const runtime of runningRuntimes()) runtime.softInterrupt()
-				const waitMs = Number.isFinite(body.waitMs) ? Math.max(0, body.waitMs) : 0
-				if (waitMs > 0) await waitForNoRunning(Date.now() + waitMs)
-				const waiting = waitingInfos()
-				if (waiting.length > 0) return json({ ok: false, mode, exiting: false, waiting })
-				shutdownReason = "soft_interrupt"
-				setTimeout(() => { cleanup().finally(() => process.exit(0)) }, 20)
-				return json({ ok: true, mode, exiting: true, waiting })
-			}
-
-			return json({ error: "Not Found" }, 404)
+			return await handler(context)
 		} catch (err) {
 			return routeError(err)
 		}
 	}
+	const registerServiceManagementRoutes = (prefix) => {
+		const path = (suffix) => serviceRoutePath(prefix, suffix)
+		serviceApp.get(path("/health"), safeServiceRoute(async () => json({
+			ok: true,
+			pid: process.pid,
+			serviceRunId,
+			cwd: options.cwd,
+			transport: "tcp",
+			host: serviceEndpoint.host,
+			port: serviceEndpoint.port,
+			requestedPort: serviceEndpoint.requestedPort,
+			portFallback: serviceEndpoint.portFallback === true,
+			protocolVersion: SERVICE_PROTOCOL_VERSION,
+			codeFingerprint,
+			runtimeKey: runtimeIdentity.runtimeKey,
+			packageName: runtimeIdentity.packageName,
+			packageVersion: runtimeIdentity.packageVersion,
+			mainPath,
+			sourceRoot,
+			packageRoot,
+			execPath: process.execPath,
+			argv: process.argv,
+			activeRequests,
+			eventClients: hub.clientCount(),
+			web: webStatus(false),
+			runningSessions: runningRuntimes().map((runtime) => runtime.sessionId),
+			backgroundSessions: backgroundRuntimes().map((runtime) => runtime.sessionId),
+			waiting: waitingInfos(),
+			diagnostics: diagnostics.status(),
+		})))
+		serviceApp.get(path("/web/status"), safeServiceRoute(async () => json({ ok: true, web: webStatus() })))
+		serviceApp.post(path("/web/start"), safeServiceRoute(async (context) => json(await startWeb(await jsonBody(context)))))
+		serviceApp.post(path("/web/stop"), safeServiceRoute(async () => json({ ok: true, stopped: await stopWeb(), web: webStatus() })))
+		serviceApp.post(path("/event-clients/:id/close"), safeServiceRoute(async (context) => {
+			hub.closeClient(context.req.param("id") ?? "")
+			return json({ ok: true })
+		}))
+		serviceApp.post(path("/interrupt"), safeServiceRoute(async (context) => {
+			const body = await jsonBody(context)
+			const mode = body.mode === "hard" ? "hard" : "soft"
+			if (mode === "hard") {
+				for (const runtime of runningRuntimes()) runtime.agent.abort()
+				shutdownReason = "hard_interrupt"
+				scheduleExitAfterCleanup(0)
+				return json({ ok: true, mode, exiting: true, waiting: waitingInfos() })
+			}
+
+			for (const runtime of runningRuntimes()) runtime.softInterrupt()
+			const waitMs = Number.isFinite(body.waitMs) ? Math.max(0, body.waitMs) : 0
+			if (waitMs > 0) await waitForNoRunning(Date.now() + waitMs)
+			const waiting = waitingInfos()
+			if (waiting.length > 0) return json({ ok: false, mode, exiting: false, waiting })
+			shutdownReason = "soft_interrupt"
+			scheduleExitAfterCleanup(0)
+			return json({ ok: true, mode, exiting: true, waiting })
+		}))
+	}
+	registerClientApiRoutes(serviceApp, serviceApi, { prefix: SERVICE_ROUTE_PREFIX, includeSnapshotRoute: true })
+	registerClientApiRoutes(serviceApp, serviceApi)
+	registerServiceManagementRoutes(SERVICE_ROUTE_PREFIX)
+	registerServiceManagementRoutes("")
+	serviceApp.use("*", () => json({ error: "Not Found" }, 404))
+
+	/** @param {Request} req */
+	const handleServiceRequest = (req) => serviceApp.fetch(req)
 
 	/** @param {Request} req */
 	const handle = async (req) => {
@@ -1060,20 +885,12 @@ export async function runService(options) {
 			if (headers["content-type"]?.startsWith("text/event-stream")) {
 				outgoing.writeHead(response.status, headers)
 				finishActiveRequest(false)
-				if (response.body) {
-					const reader = response.body.getReader()
-					for (;;) {
-						const { done, value } = await reader.read()
-						if (done || outgoing.destroyed) break
-						outgoing.write(value)
-					}
-				}
+				await writeResponseBody(incoming, outgoing, response)
 				if (!outgoing.destroyed) await new Promise((resolve) => outgoing.end(resolve))
 			} else {
-				const bodyText = await response.text()
-				headers["content-length"] = String(Buffer.byteLength(bodyText))
 				outgoing.writeHead(response.status, headers)
-				await new Promise((resolve) => outgoing.end(bodyText, resolve))
+				await writeResponseBody(incoming, outgoing, response)
+				if (!outgoing.destroyed) await new Promise((resolve) => outgoing.end(resolve))
 			}
 			finishActiveRequest(requestPath !== "/health")
 		} catch (err) {
@@ -1156,11 +973,17 @@ export async function runService(options) {
 	}
 	process.once("SIGINT", () => {
 		shutdownReason = "signal_SIGINT"
-		cleanup().finally(() => process.exit(0))
+		exitAfterCleanup(0).catch((err) => {
+			console.error("service shutdown error", err)
+			if (!options.onIdle) process.exit(1)
+		})
 	})
 	process.once("SIGTERM", () => {
 		shutdownReason = "signal_SIGTERM"
-		cleanup().finally(() => process.exit(0))
+		exitAfterCleanup(0).catch((err) => {
+			console.error("service shutdown error", err)
+			if (!options.onIdle) process.exit(1)
+		})
 	})
 	process.once("exit", () => {
 		if (!closed) {
@@ -1194,16 +1017,58 @@ function serviceHttpOptions(info, path) {
 	throw Object.assign(new Error(`Unsupported Pinano service transport: ${info.transport || "unknown"}`), { code: "PINANO_UNSUPPORTED_SERVICE_TRANSPORT" })
 }
 
+function serviceTimeoutError(kind, path, timeoutMs) {
+	const suffix = path ? ` (${path})` : ""
+	return Object.assign(new Error(`Pinano service ${kind} timed out after ${timeoutMs}ms${suffix}`), { code: "PINANO_SERVICE_TIMEOUT" })
+}
+
+function serviceSseParseError(err, data) {
+	const text = String(data)
+	const message = err?.message ?? String(err)
+	const dataSha256 = createHash("sha256").update(text).digest("hex")
+	return Object.assign(new Error(`Pinano service event stream JSON parse failed after ${text.length} bytes (sha256=${dataSha256}): ${message}`), {
+		code: SERVICE_SSE_PARSE_ERROR_CODE,
+		dataLength: text.length,
+		dataSha256,
+		cause: err instanceof Error ? err : undefined,
+	})
+}
+
+function isServiceTimeoutError(err) {
+	if (/** @type {any} */ (err)?.code === "PINANO_SERVICE_TIMEOUT") return true
+	return /timed out/i.test(String(/** @type {any} */ (err)?.message ?? err))
+}
+
 /**
  * @param {any} info
  * @param {string} path
- * @param {{ method?: string, body?: string, headers?: Record<string, string>, signal?: AbortSignal }} [options]
+ * @param {{ method?: string, body?: string, headers?: Record<string, string>, signal?: AbortSignal, timeoutMs?: number }} [options]
  * @returns {Promise<{ status: number, headers: import("node:http").IncomingHttpHeaders, body: string }>}
  */
 function requestText(info, path, options = {}) {
 	return new Promise((resolve, reject) => {
 		const body = options.body ?? ""
-		const req = http.request({
+		const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, options.timeoutMs) : 0
+		let settled = false
+		let timeoutTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
+		let req = /** @type {import("node:http").ClientRequest | undefined} */ (undefined)
+		const cleanup = () => {
+			if (timeoutTimer) clearTimeout(timeoutTimer)
+			options.signal?.removeEventListener?.("abort", abortRequest)
+		}
+		const settle = (fn, value) => {
+			if (settled) return
+			settled = true
+			cleanup()
+			fn(value)
+		}
+		const fail = (err) => settle(reject, err)
+		const abortRequest = () => {
+			const err = Object.assign(new Error(`Pinano service request aborted (${path})`), { code: "ABORT_ERR" })
+			fail(err)
+			req?.destroy?.(err)
+		}
+		req = http.request({
 			...serviceHttpOptions(info, path),
 			method: options.method ?? "GET",
 			headers: {
@@ -1214,20 +1079,38 @@ function requestText(info, path, options = {}) {
 				...(options.headers || {}),
 			},
 		}, (res) => {
-			const chunks = []
-			res.on("data", (chunk) => chunks.push(Buffer.from(chunk)))
+			const decoder = new TextDecoder()
+			let responseBody = ""
+			res.on("data", (chunk) => {
+				responseBody += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true })
+			})
 			res.on("end", () => {
+				responseBody += decoder.decode()
 				const result = {
 					status: res.statusCode ?? 0,
 					headers: res.headers ?? {},
-					body: Buffer.concat(chunks).toString("utf-8"),
+					body: responseBody,
 				}
+				settle(resolve, result)
 				req.destroy?.()
-				resolve(result)
 			})
+			res.on("aborted", () => fail(Object.assign(new Error(`Pinano service response aborted (${path})`), { code: "ECONNRESET" })))
+			res.on("error", fail)
 		})
-		req.on("error", reject)
-		options.signal?.addEventListener("abort", () => req.destroy())
+		req.on("error", fail)
+		if (timeoutMs > 0) {
+			timeoutTimer = setTimeout(() => {
+				const err = serviceTimeoutError("request", path, timeoutMs)
+				fail(err)
+				req?.destroy?.(err)
+			}, timeoutMs)
+			timeoutTimer.unref?.()
+		}
+		if (options.signal?.aborted) {
+			abortRequest()
+			return
+		}
+		options.signal?.addEventListener("abort", abortRequest, { once: true })
 		if (body) req.write(body)
 		req.end()
 	})
@@ -1246,11 +1129,11 @@ async function requestJson(info, path, options = {}) {
 	return data
 }
 
-async function ping(info, expectedIdentity) {
+async function ping(info, expectedIdentity, timeoutMs = SERVICE_CONNECTIVITY_TIMEOUT_MS) {
 	if (!info || info.protocolVersion !== SERVICE_PROTOCOL_VERSION) return false
 	if (expectedIdentity && !runtimeIdentityMatches(info, expectedIdentity)) return false
 	try {
-		const res = await requestJson(info, "/health")
+		const res = await requestJson(info, "/health", { timeoutMs })
 		return res.ok === true &&
 			res.protocolVersion === SERVICE_PROTOCOL_VERSION &&
 			(!expectedIdentity || runtimeIdentityMatches(res, expectedIdentity))
@@ -1261,7 +1144,7 @@ async function ping(info, expectedIdentity) {
 
 async function interruptOldService(info, mode = "soft", waitMs = 0) {
 	try {
-		return await requestJson(info, "/interrupt", { method: "POST", body: JSON.stringify({ mode, waitMs }) })
+		return await requestJson(info, "/interrupt", { method: "POST", body: JSON.stringify({ mode, waitMs }), timeoutMs: waitMs + SERVICE_CONNECTIVITY_TIMEOUT_MS })
 	} catch (err) {
 		return { ok: false, error: /** @type {any} */ (err)?.message ?? String(err), status: /** @type {any} */ (err)?.status }
 	}
@@ -1496,7 +1379,8 @@ export async function ensureService(options) {
 	const deadline = Date.now() + (options.startupTimeoutMs ?? 5000)
 	while (Date.now() < deadline) {
 		const info = await readInfo()
-		if (info?.serviceRunId === serviceRunId && info.transport === "tcp" && await ping(info, runtimeIdentity)) {
+		const remainingMs = Math.max(1, deadline - Date.now())
+		if (info?.serviceRunId === serviceRunId && info.transport === "tcp" && await ping(info, runtimeIdentity, Math.min(SERVICE_CONNECTIVITY_TIMEOUT_MS, remainingMs))) {
 			child.off("error", onChildStartupError)
 			child.off("exit", onChildStartupExit)
 			return info
@@ -1525,12 +1409,18 @@ export async function openServiceClient(options) {
 	})
 }
 
+/**
+ * @param {any} info
+ * @param {{ cwd?: string, sessionListCwd?: string, noContextFiles?: boolean, runtimeIdentity?: any, reconnect?: boolean, requestTimeoutMs?: number, eventStallTimeoutMs?: number }} [options]
+ */
 export function createServiceClient(info, options = {}) {
 	let currentInfo = info
 	const clientCwd = options.cwd
 	const sessionListCwd = options.sessionListCwd
 	const runtimeIdentity = options.runtimeIdentity
 	const canReconnect = options.reconnect === true
+	const requestTimeoutMs = Number.isFinite(options.requestTimeoutMs) ? Math.max(0, options.requestTimeoutMs) : SERVICE_REQUEST_TIMEOUT_MS
+	const eventStallTimeoutMs = Number.isFinite(options.eventStallTimeoutMs) ? Math.max(0, options.eventStallTimeoutMs) : SERVICE_EVENT_STALL_TIMEOUT_MS
 	const sessionsPath = () => sessionListCwd ? `/sessions?cwd=${encodeURIComponent(sessionListCwd)}` : "/sessions"
 	const sessionActionPath = (id, action) => `/sessions/${encodeURIComponent(id)}/${action}${sessionListCwd ? `?cwd=${encodeURIComponent(sessionListCwd)}` : ""}`
 	const filterSessionEvent = (event) => {
@@ -1543,9 +1433,9 @@ export function createServiceClient(info, options = {}) {
 	})
 	const isServiceTransportError = (err) => {
 		const code = /** @type {any} */ (err)?.code
-		if (["ENOENT", "ECONNREFUSED", "ECONNRESET", "EPIPE"].includes(code)) return true
+		if (["ENOENT", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "PINANO_SERVICE_TIMEOUT", SERVICE_SSE_PARSE_ERROR_CODE].includes(code)) return true
 		const message = String(/** @type {any} */ (err)?.message ?? err)
-		return /\b(ENOENT|ECONNREFUSED|ECONNRESET|EPIPE)\b|no such file or directory|socket hang up/i.test(message)
+		return /\b(ENOENT|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EPIPE)\b|no such file or directory|socket hang up|timed out/i.test(message)
 	}
 	const reconnect = async () => {
 		if (!canReconnect) return false
@@ -1558,11 +1448,17 @@ export function createServiceClient(info, options = {}) {
 	const serviceApiPath = (path) => path.startsWith(SERVICE_ROUTE_PREFIX) ? path : `${SERVICE_ROUTE_PREFIX}${path}`
 	const request = async (path, requestOptions = {}) => {
 		await verifyCurrentRuntimeDesired()
+		const method = String(requestOptions.method ?? "GET").toUpperCase()
+		const retryOnTimeout = requestOptions.retryOnTimeout ?? method === "GET"
+		const requestOptionsWithTimeout = requestOptions.timeoutMs === undefined
+			? { ...requestOptions, timeoutMs: requestTimeoutMs }
+			: requestOptions
 		try {
-			return await requestJson(currentInfo, serviceApiPath(path), requestOptions)
+			return await requestJson(currentInfo, serviceApiPath(path), requestOptionsWithTimeout)
 		} catch (err) {
+			if (isServiceTimeoutError(err) && !retryOnTimeout) throw err
 			if (!isServiceTransportError(err) || !await reconnect()) throw err
-			return requestJson(currentInfo, serviceApiPath(path), requestOptions)
+			return requestJson(currentInfo, serviceApiPath(path), requestOptionsWithTimeout)
 		}
 	}
 	return {
@@ -1593,7 +1489,7 @@ export function createServiceClient(info, options = {}) {
 		async createSession(options = {}) {
 			return request("/sessions", {
 				method: "POST",
-				body: JSON.stringify({ prompt: options.prompt, cwd: clientCwd }),
+				body: JSON.stringify({ prompt: options.prompt, cwd: clientCwd, images: options.images }),
 			})
 		},
 		async setDefaultModel(model) {
@@ -1612,8 +1508,17 @@ export function createServiceClient(info, options = {}) {
 			return request(sessionActionPath(id, "branch"), { method: "POST", body: "{}" })
 		},
 		async snapshot(id, options = {}) {
-			const includeSessions = options.includeSessions === true ? "?includeSessions=1" : ""
-			return request(`/sessions/${encodeURIComponent(id)}/snapshot${includeSessions}`)
+			const params = new URLSearchParams()
+			if (options.includeSessions === true) params.set("includeSessions", "1")
+			if (options.includeContextMessages === true) params.set("includeContextMessages", "1")
+			const query = params.size > 0 ? `?${params}` : ""
+			return request(`/sessions/${encodeURIComponent(id)}/snapshot${query}`)
+		},
+		async contextReport(id) {
+			return (await request(`/sessions/${encodeURIComponent(id)}/context-report`)).lines ?? []
+		},
+		async systemReport(id) {
+			return (await request(`/sessions/${encodeURIComponent(id)}/system-report`)).lines ?? []
 		},
 		async prompt(id, message, streamingBehavior, options = {}) {
 			return request(`/sessions/${encodeURIComponent(id)}/prompt`, {
@@ -1623,6 +1528,7 @@ export function createServiceClient(info, options = {}) {
 					streamingBehavior,
 					draftClientId: options.draftClientId,
 					draftClientSeq: options.draftClientSeq,
+					images: options.images,
 				}),
 			})
 		},
@@ -1666,12 +1572,13 @@ export function createServiceClient(info, options = {}) {
 			})
 		},
 		async compact(id) {
-			return request(`/sessions/${encodeURIComponent(id)}/compact`, { method: "POST", body: "{}" })
+			return request(`/sessions/${encodeURIComponent(id)}/compact`, { method: "POST", body: "{}", timeoutMs: 0 })
 		},
 		async bash(id, text) {
 			return request(`/sessions/${encodeURIComponent(id)}/bash`, {
 				method: "POST",
 				body: JSON.stringify({ text }),
+				timeoutMs: 0,
 			})
 		},
 		async rewindTargets(id) {
@@ -1680,6 +1587,7 @@ export function createServiceClient(info, options = {}) {
 		async rewind(id, entryId, options = {}) {
 			return request(`/sessions/${encodeURIComponent(id)}/rewind`, {
 				method: "POST",
+				timeoutMs: 0,
 				body: JSON.stringify({
 					entryId,
 					targetKind: options.targetKind,
@@ -1690,9 +1598,11 @@ export function createServiceClient(info, options = {}) {
 			})
 		},
 		async interrupt(mode = "soft", waitMs = 0) {
+			const timeoutMs = requestTimeoutMs > 0 ? Math.max(requestTimeoutMs, waitMs + SERVICE_CONNECTIVITY_TIMEOUT_MS) : 0
 			return request("/interrupt", {
 				method: "POST",
 				body: JSON.stringify({ mode, waitMs }),
+				timeoutMs,
 			})
 		},
 		subscribe(onEvent) {
@@ -1702,7 +1612,12 @@ export function createServiceClient(info, options = {}) {
 			let req = /** @type {import("node:http").ClientRequest | undefined} */ (undefined)
 			let reconnectTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
 			let runtimeCheckTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
-			const bodyDecoder = new TextDecoder()
+			let stallTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
+			let bodyDecoder = new TextDecoder()
+			const clearStallTimer = () => {
+				if (stallTimer) clearTimeout(stallTimer)
+				stallTimer = undefined
+			}
 			const reportEventHandlerError = (err) => {
 				const message = err?.message ?? String(err)
 				const stack = err?.stack ? String(err.stack) : ""
@@ -1729,7 +1644,12 @@ export function createServiceClient(info, options = {}) {
 						.map((line) => line.startsWith("data: ") ? line.slice(6) : line.slice(5))
 						.join("\n")
 					if (!data) continue
-					const parsed = JSON.parse(data)
+					let parsed
+					try {
+						parsed = JSON.parse(data)
+					} catch (err) {
+						throw serviceSseParseError(err, data)
+					}
 					if (parsed.eventClientId) eventClientId = parsed.eventClientId
 					dispatchEvent(filterSessionEvent(parsed))
 				}
@@ -1742,7 +1662,14 @@ export function createServiceClient(info, options = {}) {
 					reconnectTimer = undefined
 					reconnect()
 						.then(() => {
-							if (!closed) connect()
+							if (!closed) {
+								connect()
+								dispatchEvent({
+									type: "service_event_stream_reconnected",
+									reason: err?.code === SERVICE_SSE_PARSE_ERROR_CODE ? "sse_parse_error" : "transport",
+									errorCode: err?.code,
+								})
+							}
 						})
 						.catch((nextErr) => {
 							if (!closed) dispatchEvent({ type: "error", error: nextErr?.message ?? String(nextErr) })
@@ -1752,7 +1679,19 @@ export function createServiceClient(info, options = {}) {
 				return true
 			}
 			const fail = (err) => {
+				clearStallTimer()
+				if (err?.code === SERVICE_SSE_PARSE_ERROR_CODE) console.error(err.message)
 				if (!closed && !scheduleReconnect(err)) dispatchEvent({ type: "error", error: err?.message ?? String(err) })
+			}
+			const resetStallTimer = () => {
+				if (closed || eventStallTimeoutMs <= 0) return
+				clearStallTimer()
+				stallTimer = setTimeout(() => {
+					const err = serviceTimeoutError("event stream", serviceApiPath("/events"), eventStallTimeoutMs)
+					req?.destroy?.(err)
+					fail(err)
+				}, eventStallTimeoutMs)
+				stallTimer.unref?.()
 			}
 			if (runtimeIdentity) {
 				runtimeCheckTimer = setInterval(() => {
@@ -1762,8 +1701,10 @@ export function createServiceClient(info, options = {}) {
 			}
 			const connect = () => {
 				if (closed) return
+				clearStallTimer()
 				eventClientId = ""
 				sseBuffer = ""
+				bodyDecoder = new TextDecoder()
 				req = http.request({
 					...serviceHttpOptions(currentInfo, serviceApiPath("/events")),
 					method: "GET",
@@ -1774,12 +1715,15 @@ export function createServiceClient(info, options = {}) {
 						...(currentInfo.token ? { "authorization": `Bearer ${currentInfo.token}` } : {}),
 					},
 				}, (res) => {
+					resetStallTimer()
 					if ((res.statusCode ?? 0) < 200 || (res.statusCode ?? 0) >= 300) {
+						clearStallTimer()
 						fail(new Error(`service event stream HTTP ${res.statusCode ?? 0}`))
 						res.resume()
 						return
 					}
 					res.on("data", (chunk) => {
+						resetStallTimer()
 						try {
 							emitSse(bodyDecoder.decode(Buffer.from(chunk), { stream: true }))
 						} catch (err) {
@@ -1788,6 +1732,7 @@ export function createServiceClient(info, options = {}) {
 						}
 					})
 					res.on("end", () => {
+						clearStallTimer()
 						try {
 							const tail = bodyDecoder.decode()
 							if (tail) emitSse(tail)
@@ -1797,9 +1742,12 @@ export function createServiceClient(info, options = {}) {
 						}
 						scheduleReconnect()
 					})
+					res.on("aborted", () => fail(Object.assign(new Error("service event stream aborted"), { code: "ECONNRESET" })))
+					res.on("error", fail)
 				})
 				req.on("error", fail)
 				req.end()
+				resetStallTimer()
 			}
 			connect()
 			return async () => {
@@ -1807,8 +1755,9 @@ export function createServiceClient(info, options = {}) {
 				closed = true
 				if (reconnectTimer) clearTimeout(reconnectTimer)
 				if (runtimeCheckTimer) clearInterval(runtimeCheckTimer)
+				clearStallTimer()
 				const closePromise = eventClientId
-					? requestJson(currentInfo, serviceApiPath(`/event-clients/${encodeURIComponent(eventClientId)}/close`), { method: "POST", body: "{}" }).catch(() => {})
+					? requestJson(currentInfo, serviceApiPath(`/event-clients/${encodeURIComponent(eventClientId)}/close`), { method: "POST", body: "{}", timeoutMs: SERVICE_CONNECTIVITY_TIMEOUT_MS }).catch(() => {})
 					: Promise.resolve()
 				req?.destroy()
 				await closePromise
@@ -1838,7 +1787,7 @@ export async function serviceStatus(options) {
 	let health = null
 	if (info) {
 		try {
-			health = await requestJson(info, "/health")
+			health = await requestJson(info, "/health", { timeoutMs: SERVICE_CONNECTIVITY_TIMEOUT_MS })
 		} catch {}
 	}
 	const desiredRuntime = await readDesiredRuntimeIdentity()

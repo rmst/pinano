@@ -13,7 +13,8 @@
 // tokenizer would bloat the binary considerably. Be transparent about
 // it in /context output.
 
-import { isProjectContextMessage } from "./project-context.js"
+import { isCompactionCheckpointMessage, isCompactionSummaryMessage } from "./compaction-summary.js"
+import { isProjectContextMessage } from "./project-context-message.js"
 
 const CHARS_PER_TOKEN = 4
 const MESSAGE_OVERHEAD = 8
@@ -86,13 +87,14 @@ function messageTokens(m) {
  * @typedef {object} PerMessageEntry
  * @property {number} index                 position in the original messages array
  * @property {string} role                  user | assistant | toolResult | (custom)
- * @property {"text"|"thinking"|"toolCall"|"toolResult"|"compaction"|"compactionMemento"|"branchSummary"|"projectContext"|"empty"} kind
+ * @property {"text"|"thinking"|"toolCall"|"toolResult"|"compaction"|"compactionSummary"|"compactionMemento"|"branchSummary"|"projectContext"|"empty"} kind
  * @property {number} tokens                approximate token cost of this message
  * @property {{ text: number, thinking: number, toolCall: number, image: number }} parts
  * @property {string} [preview]             short snippet for display (≤80 chars)
  * @property {string} [toolName]            for toolResult / assistant turns with a single toolCall
  * @property {number} [removedCount]        for compaction markers
  * @property {number} [keptCount]
+ * @property {number} [mementoCount]
  * @property {number} [tokensBefore]
  */
 
@@ -172,6 +174,7 @@ function entryFor(m, index) {
 	/** @type {PerMessageEntry["kind"]} */
 	let kind = "empty"
 	if (m.compaction === true) kind = "compaction"
+	else if (isCompactionSummaryMessage(m)) kind = "compactionSummary"
 	else if (m.pinanoCompactionMemento === true) kind = "compactionMemento"
 	else if (m.branchSummary === true) kind = "branchSummary"
 	else if (role === "user" && isProjectContextMessage(m)) kind = "projectContext"
@@ -200,9 +203,10 @@ function entryFor(m, index) {
 		const firstCall = m.content?.find((/** @type any */ c) => c?.type === "toolCall")
 		if (firstCall?.name) entry.toolName = firstCall.name
 	}
-	if (m.compaction === true) {
+	if (isCompactionCheckpointMessage(m)) {
 		entry.removedCount = m.removedCount
 		entry.keptCount = m.keptCount
+		entry.mementoCount = m.mementoCount
 		entry.tokensBefore = m.tokensBefore
 	}
 	return entry

@@ -25,9 +25,10 @@ import {
 import { authenticateRequestParts } from "./http-auth.js"
 import { configRoot, dataRoot } from "./paths.js"
 import { openServiceClient } from "./service-mode.js"
-import { loadSettings, updateSetting } from "./settings.js"
 import { RuntimeManager } from "./server-runtime.js"
 import { WebRouter } from "./web-router.js"
+import { createManagerClientApi, createServiceClientApi, registerClientApiRoutes } from "./client-api.js"
+import { writeResponseBody } from "./http-response.js"
 
 /** @typedef {import("./server-db.js").ServerDb} ServerDb */
 
@@ -38,21 +39,8 @@ const publicDir = join(webRoot, "public")
 const katexDir = join(webRoot, "node_modules/katex")
 const bundleHelperPath = join(here, "web-bundle-helper.js")
 
-const encoder = new TextEncoder()
 const MIN_TOKEN_LENGTH = 16
 
-const WEB_COMMANDS = [
-	{ name: "help", description: "show available slash commands" },
-	{ name: "hotkeys", description: "show keyboard shortcuts" },
-	{ name: "usage", description: "show ChatGPT/Codex usage limits" },
-	{ name: "model", description: "select default model for new sessions" },
-	{ name: "session", description: "show info about the current session" },
-	{ name: "fast", description: "set Codex Fast mode for this session: /fast on|off|status" },
-	{ name: "compact", description: "summarize older messages for agent context" },
-	{ name: "branch", description: "create a new session from the current conversation branch" },
-	{ name: "rewind", description: "rewind to a previous user message or switch to a branch tip" },
-	{ name: "abort", description: "abort the running turn" },
-]
 
 /**
  * @typedef {object} WebModeOptions
@@ -112,49 +100,6 @@ async function getOrCreateWebToken() {
 	return token
 }
 
-function waitForEvent(emitter, event) {
-	return new Promise((resolve) => emitter.once(event, resolve))
-}
-
-function waitForDrainOrClose(stream) {
-	if (stream.destroyed) return false
-	return new Promise((resolve) => {
-		const cleanup = (value) => {
-			stream.removeListener("drain", onDrain)
-			stream.removeListener("close", onClose)
-			resolve(value)
-		}
-		const onDrain = () => cleanup(true)
-		const onClose = () => cleanup(false)
-		stream.once("drain", onDrain)
-		stream.once("close", onClose)
-	})
-}
-
-async function writeResponseBody(incoming, outgoing, response) {
-	if (incoming.method === "HEAD" || !response.body) return
-
-	const reader = response.body.getReader()
-	const closed = waitForEvent(outgoing, "close").then(() => null)
-	try {
-		for (;;) {
-			const chunk = await Promise.race([reader.read(), closed])
-			if (!chunk) {
-				await reader.cancel().catch(() => {})
-				return
-			}
-			const { done, value } = chunk
-			if (done) return
-			if (!outgoing.write(value) && !await waitForDrainOrClose(outgoing)) {
-				await reader.cancel().catch(() => {})
-				return
-			}
-		}
-	} finally {
-		reader.releaseLock()
-	}
-}
-
 async function serve(options, handler) {
 	const server = createServer(async (incoming, outgoing) => {
 		try {
@@ -181,7 +126,7 @@ async function serve(options, handler) {
 			response.headers.forEach((value, key) => outgoing.setHeader(key, value))
 			outgoing.writeHead(response.status)
 			await writeResponseBody(incoming, outgoing, response)
-			outgoing.end()
+			if (!outgoing.destroyed) outgoing.end()
 		} catch (err) {
 			console.error("web serve error:", err)
 			if (!outgoing.headersSent) outgoing.writeHead(500)
@@ -275,14 +220,6 @@ async function bundleUi(dev, { signal } = {}) {
 	return readFile(join(outdir, "main.js"), "utf8")
 }
 
-function routeSessionId(c) {
-	return c.req.param?.("id")
-}
-
-async function jsonBody(c) {
-	return c.req.json().catch(() => ({}))
-}
-
 function isApiPath(url) {
 	const { pathname } = new URL(url)
 	return pathname === "/api" || pathname.startsWith("/api/")
@@ -309,36 +246,6 @@ async function codexUsageWebStatus(settings) {
 		details: formatCodexUsage(payload),
 		warnings: codexUsageThresholdMessages(payload, new Set()),
 	}
-}
-
-async function promptSession(manager, sessionId, body) {
-	const message = typeof body.message === "string" ? body.message : ""
-	if (!message.trim()) return error("message is required")
-	const runtime = await manager.getRuntime(sessionId)
-	await runtime.prompt(message, body.streamingBehavior)
-	manager.setPromptDraft(sessionId, "", { clientId: body.draftClientId, clientSeq: body.draftClientSeq })
-	return json({ ok: true, snapshot: await manager.snapshot(sessionId) })
-}
-
-async function abortSession(manager, sessionId) {
-	const runtime = await manager.getRuntime(sessionId)
-	await runtime.abort()
-	return json({ ok: true, snapshot: await manager.snapshot(sessionId) })
-}
-
-async function rewindSession(manager, sessionId, body) {
-	const id = typeof body.id === "string" ? body.id : ""
-	if (!id) return error("id is required")
-	const runtime = await manager.getRuntime(sessionId)
-	if (body.kind === "leaf" || body.targetKind === "leaf") {
-		await runtime.switchBranchTip(id)
-		return json({ ok: true, targetKind: "leaf", editorText: "", snapshot: await manager.snapshot(sessionId) })
-	}
-	const editorText = await runtime.rewind(id, {
-		restoreFiles: body.restoreFiles === true,
-		restoreConversation: body.restoreConversation !== false,
-	})
-	return json({ ok: true, targetKind: "message", editorText, snapshot: await manager.snapshot(sessionId) })
 }
 
 async function createBaseWebApp(opts, appOptions = {}) {
@@ -430,224 +337,25 @@ export async function createServiceWebApp(opts, appOptions = {}) {
 		cwd: opts.cwd,
 		noContextFiles: opts.noContextFiles,
 	})
-	let initialSessionId = opts.initialSessionId || opts.sessionId || ""
-
-	const sessions = () => client.sessions()
-	const ensureInitialSessionId = async () => {
-		if (initialSessionId) return initialSessionId
-		const list = await sessions()
-		if (list[0]?.id) {
-			initialSessionId = list[0].id
-			return initialSessionId
-		}
-		const created = await client.createSession()
-		initialSessionId = created.sessionId || created.snapshot?.sessionId
-		return initialSessionId
-	}
-	const snapshot = async (id = undefined) => client.snapshot(id || await ensureInitialSessionId(), { includeSessions: true })
-	const currentSettings = async () => (await client.getSettings?.())?.settings ?? await loadSettings()
-	const snapshotFromResponse = async (sessionId, response) => {
-		const snap = response?.snapshot
-		if (snap?.sessions) return snap
-		return snapshot(snap?.sessionId || sessionId)
-	}
-	const streamEvents = async (requestedSessionId) => {
-		let unsubscribe = () => {}
-		return new Response(new ReadableStream({
-			async start(controller) {
-				let closed = false
-				const send = (event) => {
-					if (closed) return
-					try {
-						controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
-					} catch {
-						closed = true
-						unsubscribe()
-					}
-				}
-				try {
-					if (requestedSessionId) send({ type: "snapshot", sessionId: requestedSessionId, snapshot: await snapshot(requestedSessionId) })
-					else send({ type: "sessions", sessions: await sessions() })
-					unsubscribe = client.subscribe((event) => send(event))
-				} catch (err) {
-					send({ type: "error", error: /** @type {any} */ (err)?.message ?? String(err) })
-					closed = true
-					controller.close()
-				}
-			},
-			cancel() {
-				unsubscribe()
-			},
-		}), {
-			headers: {
-				"content-type": "text/event-stream; charset=utf-8",
-				"cache-control": "no-cache",
-				"connection": "keep-alive",
-			},
-		})
-	}
-
-	app.get("/api/events", async (c) => {
-		const url = new URL(c.req.url)
-		return streamEvents(url.searchParams.get("sessionId") || undefined)
+	const api = createServiceClientApi({
+		client,
+		cwd: opts.cwd,
+		initialSessionId: opts.initialSessionId || opts.sessionId,
 	})
-	app.get("/api/snapshot", async (c) => {
-		const url = new URL(c.req.url)
-		try {
-			return c.json(await snapshot(url.searchParams.get("sessionId") || undefined))
-		} catch (err) {
-			return routeError(err)
-		}
+
+	registerClientApiRoutes(app, api, {
+		prefix: "/api",
+		includeCommands: true,
+		includeSnapshotRoute: true,
+		includeSessionsInSnapshots: true,
 	})
-	app.get("/api/sessions", async (c) => c.json({ sessions: await sessions() }))
 	app.get("/api/usage/codex", async (c) => {
 		try {
-			return c.json(await codexUsageWebStatus(await currentSettings()))
+			return c.json(await codexUsageWebStatus((await api.getSettings()).settings))
 		} catch (err) {
 			return routeError(err)
 		}
 	})
-	app.get("/api/settings", async (c) => c.json(await client.getSettings()))
-	app.post("/api/settings", async (c) => {
-		try {
-			const body = await jsonBody(c)
-			if (Object.hasOwn(body, "model")) return json(await client.setDefaultModel(body.model))
-			return error("no supported settings provided")
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions", async (c) => {
-		try {
-			const body = await jsonBody(c)
-			const prompt = typeof body.prompt === "string" ? body.prompt : undefined
-			const created = await client.createSession({ prompt })
-			const id = created.sessionId || created.snapshot?.sessionId
-			return json({ ok: true, snapshot: await snapshot(id) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.get("/api/sessions/:id/snapshot", async (c) => {
-		try {
-			return c.json(await snapshot(routeSessionId(c)))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/prompt", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const body = await jsonBody(c)
-			const message = typeof body.message === "string" ? body.message : ""
-			if (!message.trim()) return error("message is required")
-			const result = await client.prompt(id, message, body.streamingBehavior, { draftClientId: body.draftClientId, draftClientSeq: body.draftClientSeq })
-			return json({ ok: true, snapshot: await snapshotFromResponse(id, result) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/draft", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const body = await jsonBody(c)
-			const text = typeof body.text === "string" ? body.text : ""
-			return json(await client.setPromptDraft(id, text, { clientId: body.clientId, clientSeq: body.clientSeq }))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/abort", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const result = await client.abort(id)
-			return json({ ok: true, snapshot: await snapshotFromResponse(id, result) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/fast", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const body = await jsonBody(c)
-			const result = await client.setFast(id, typeof body.args === "string" ? body.args : "")
-			return json({ ok: true, message: result.message, snapshot: await snapshotFromResponse(id, result) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/compact", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const result = await client.compact(id)
-			return json({ ok: true, result: result.result, snapshot: await snapshotFromResponse(id, result) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/complete", async (c) => {
-		try {
-			return json(await client.markCompleted(routeSessionId(c)))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/defer", async (c) => {
-		try {
-			return json(await client.markDeferred(routeSessionId(c)))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/review", async (c) => {
-		try {
-			return json(await client.markReadyForReview(routeSessionId(c)))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/delete", async (c) => {
-		try {
-			return json(await client.deleteSession(routeSessionId(c)))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.get("/api/sessions/:id/rewind-targets", async (c) => {
-		try {
-			return c.json({ targets: await client.rewindTargets(routeSessionId(c)) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/rewind", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const body = await jsonBody(c)
-			const entryId = typeof body.id === "string" ? body.id : ""
-			if (!entryId) return error("id is required")
-			const targetKind = body.kind === "leaf" || body.targetKind === "leaf" ? "leaf" : undefined
-			const result = await client.rewind(id, entryId, {
-				targetKind,
-				summary: body.summary === true,
-				restoreFiles: body.restoreFiles === true,
-				restoreConversation: body.restoreConversation !== false,
-			})
-			return json({ ok: true, targetKind: result.targetKind ?? targetKind ?? "message", editorText: result.text ?? "", snapshot: await snapshotFromResponse(id, result) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/branch", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const result = await client.branchSession(id)
-			return json({ ok: true, sessionId: result.sessionId, snapshot: await snapshotFromResponse(result.sessionId, result), sessions: await sessions() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.get("/api/commands", (c) => c.json({ commands: WEB_COMMANDS }))
 
 	app.get("*", serveIndexHtml)
 
@@ -655,8 +363,8 @@ export async function createServiceWebApp(opts, appOptions = {}) {
 		app,
 		token,
 		client,
-		snapshot,
-		sendSnapshot: () => {},
+		snapshot: api.snapshot,
+		invalidateSnapshot: () => {},
 		manager: undefined,
 		db: undefined,
 	}
@@ -664,193 +372,56 @@ export async function createServiceWebApp(opts, appOptions = {}) {
 
 /**
  * Create a web app against the RuntimeManager owned by the service.
- * @param {WebModeOptions & { manager: RuntimeManager, hub: { send: (event: any) => void, stream: (initialEvent: any) => Response }, db: ServerDb, sessionListCwd?: string, getSettings?: () => any | Promise<any>, setDefaultModel?: (model: string) => any | Promise<any> }} opts
+ * @param {WebModeOptions & { manager: RuntimeManager, hub: { send: (event: any) => void, stream: (initialEvent: any) => Response }, db: ServerDb, sessionListCwd?: string, getSettings?: () => any | Promise<any>, setDefaultModel?: (model: string) => any | Promise<any>, setDefaultReasoning?: (level: string) => any | Promise<any> }} opts
  * @param {WebAppOptions} [appOptions]
  */
 export async function createManagerWebApp(opts, appOptions = {}) {
 	const { app, token } = await createBaseWebApp(opts, appOptions)
 	const { manager, hub, db } = opts
 	const sessionListCwd = opts.sessionListCwd
-	const sessions = () => manager.sessions(sessionListCwd)
-	const snapshot = (id = manager.initialSessionId) => manager.snapshot(id, { includeSessions: true })
-	const currentSettings = () => opts.getSettings?.() ?? loadSettings()
+	const api = createManagerClientApi({
+		cwd: opts.cwd,
+		manager,
+		hub,
+		sessionListCwd,
+		getSettings: opts.getSettings,
+		setDefaultModel: opts.setDefaultModel,
+		setDefaultReasoning: opts.setDefaultReasoning,
+	})
 
 	if (appOptions.dev) {
 		watch(uiDir, { recursive: true }, async (event, filename) => {
 			void event
 			console.log(`web ui change (${filename}); rebuilding…`)
 			try {
-				await manager.sendSnapshot(manager.initialSessionId, { includeSessions: true })
+				await manager.invalidateSnapshot(manager.initialSessionId, { includeSessions: true })
 			} catch (err) {
 				console.error("web ui reload notification failed:", /** @type {any} */ (err)?.message ?? err)
 			}
 		})
 	}
 
-	app.get("/api/events", async (c) => {
-		const url = new URL(c.req.url)
-		const id = url.searchParams.get("sessionId") || undefined
-		return hub.stream(id
-			? { type: "snapshot", sessionId: id, snapshot: await snapshot(id) }
-			: { type: "sessions", sessions: await sessions() })
+	registerClientApiRoutes(app, api, {
+		prefix: "/api",
+		includeCommands: true,
+		includeSnapshotRoute: true,
+		includeSessionsInSnapshots: true,
 	})
-	app.get("/api/snapshot", async (c) => {
-		const url = new URL(c.req.url)
-		try {
-			return c.json(await snapshot(url.searchParams.get("sessionId") || undefined))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.get("/api/sessions", async (c) => c.json({ sessions: await sessions() }))
 	app.get("/api/usage/codex", async (c) => {
 		try {
-			return c.json(await codexUsageWebStatus(await currentSettings()))
+			return c.json(await codexUsageWebStatus((await api.getSettings()).settings))
 		} catch (err) {
 			return routeError(err)
 		}
 	})
-	app.get("/api/settings", async (c) => c.json({ settings: await currentSettings() }))
-	app.post("/api/settings", async (c) => {
-		try {
-			const body = await jsonBody(c)
-			if (Object.hasOwn(body, "model")) {
-				const model = typeof body.model === "string" ? body.model.trim() : ""
-				if (!model) return error("model is required")
-				const settings = await (opts.setDefaultModel?.(model) ?? updateSetting("model", model))
-				return c.json({ ok: true, settings })
-			}
-			return error("no supported settings provided")
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions", async (c) => {
-		try {
-			const body = await jsonBody(c)
-			const runtime = await manager.createSession(sessionListCwd || opts.cwd)
-			if (typeof body.prompt === "string" && body.prompt.trim()) await runtime.prompt(body.prompt)
-			return c.json({ ok: true, snapshot: await snapshot(runtime.sessionId) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.get("/api/sessions/:id/snapshot", async (c) => {
-		try {
-			return c.json(await snapshot(routeSessionId(c)))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/prompt", async (c) => {
-		try {
-			return await promptSession(manager, routeSessionId(c), await jsonBody(c))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/draft", async (c) => {
-		try {
-			const body = await jsonBody(c)
-			const text = typeof body.text === "string" ? body.text : ""
-			return c.json({ ok: true, draft: manager.setPromptDraft(routeSessionId(c), text, { clientId: body.clientId, clientSeq: body.clientSeq }) })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/abort", async (c) => {
-		try {
-			return await abortSession(manager, routeSessionId(c))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/fast", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const body = await jsonBody(c)
-			const runtime = await manager.getRuntime(id)
-			const message = await runtime.setFastMode(typeof body.args === "string" ? body.args : "")
-			await manager.sendSnapshot(id)
-			return c.json({ ok: true, message, snapshot: await runtime.snapshot() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/compact", async (c) => {
-		try {
-			const id = routeSessionId(c)
-			const runtime = await manager.getRuntime(id)
-			const result = await runtime.compact()
-			await manager.sendSnapshot(id)
-			return c.json({ ok: true, result, snapshot: await runtime.snapshot() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/complete", async (c) => {
-		try {
-			const metadata = await manager.markCompleted(routeSessionId(c))
-			return c.json({ ok: true, metadata, sessions: await sessions() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/defer", async (c) => {
-		try {
-			const metadata = await manager.markDeferred(routeSessionId(c))
-			return c.json({ ok: true, metadata, sessions: await sessions() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/review", async (c) => {
-		try {
-			const metadata = await manager.markReadyForReview(routeSessionId(c))
-			return c.json({ ok: true, metadata, sessions: await sessions() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/delete", async (c) => {
-		try {
-			await manager.deleteStoppedSession(routeSessionId(c))
-			return c.json({ ok: true, sessions: await sessions() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.get("/api/sessions/:id/rewind-targets", async (c) => {
-		try {
-			return c.json({ targets: (await manager.getRuntime(routeSessionId(c))).rewindTargets() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/rewind", async (c) => {
-		try {
-			return await rewindSession(manager, routeSessionId(c), await jsonBody(c))
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.post("/api/sessions/:id/branch", async (c) => {
-		try {
-			const runtime = await manager.branchSession(routeSessionId(c))
-			return c.json({ ok: true, sessionId: runtime.sessionId, snapshot: await runtime.snapshot(), sessions: await sessions() })
-		} catch (err) {
-			return routeError(err)
-		}
-	})
-	app.get("/api/commands", (c) => c.json({ commands: WEB_COMMANDS }))
 
 	app.get("*", serveIndexHtml)
 
 	return {
 		app,
 		token,
-		snapshot,
-		sendSnapshot: (id) => manager.sendSnapshot(id ?? manager.initialSessionId, { includeSessions: true }),
+		snapshot: api.snapshot,
+		invalidateSnapshot: (id) => manager.invalidateSnapshot(id ?? manager.initialSessionId, { includeSessions: true }),
 		manager,
 		db,
 	}
@@ -864,7 +435,7 @@ export function webPublicUrl({ host, port, token, publicUrl }) {
 }
 
 /**
- * @param {WebModeOptions & { manager: RuntimeManager, hub: { send: (event: any) => void, stream: (initialEvent: any) => Response }, db: ServerDb, sessionListCwd?: string, getSettings?: () => any | Promise<any>, setDefaultModel?: (model: string) => any | Promise<any> }} opts
+ * @param {WebModeOptions & { manager: RuntimeManager, hub: { send: (event: any) => void, stream: (initialEvent: any) => Response }, db: ServerDb, sessionListCwd?: string, getSettings?: () => any | Promise<any>, setDefaultModel?: (model: string) => any | Promise<any>, setDefaultReasoning?: (level: string) => any | Promise<any> }} opts
  * @param {WebAppOptions} [appOptions]
  */
 export async function startManagerWebServer(opts, appOptions = {}) {

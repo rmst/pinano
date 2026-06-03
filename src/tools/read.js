@@ -64,12 +64,15 @@ export function createReadTool(cwd) {
 			}
 
 			let selected
+			let selectedEndLine
 			let userLimited
 			if (limit !== undefined) {
 				const end = Math.min(startLine + limit, totalLines)
+				selectedEndLine = end
 				selected = allLines.slice(startLine, end).join("\n")
 				userLimited = end - startLine
 			} else {
+				selectedEndLine = totalLines
 				selected = allLines.slice(startLine).join("\n")
 			}
 
@@ -98,7 +101,18 @@ export function createReadTool(cwd) {
 				outputText = truncation.content
 			}
 
-			return { content: [{ type: "text", text: outputText }], details: details ?? {} }
+			return {
+				content: [{ type: "text", text: outputText }],
+				details: {
+					...(details ?? {}),
+					text: {
+						totalLines,
+						startLine: startDisplay,
+						endLine: selectedEndLine,
+						fullFile: startLine === 0 && selectedEndLine >= totalLines && !truncation.truncated && !truncation.firstLineExceedsLimit,
+					},
+				},
+			}
 		},
 	}
 }

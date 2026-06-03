@@ -5,6 +5,7 @@
 // wording focused on continuation quality rather than UI presentation.
 
 export const COMPACTION_MARKER_PREFIX = "[earlier context compacted]"
+export const COMPACTION_SUMMARY_DISPLAY_MAX_LINES = 10
 
 export const SUMMARY_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION for a coding-agent conversation. Create a handoff summary for a future model call that will resume the task after the older transcript is replaced.
 
@@ -30,11 +31,32 @@ export const SUMMARY_USER_PREAMBLE = "Create a context checkpoint handoff from t
 
 export const MODEL_HANDOFF_PREFIX = `The earlier conversation was compacted. Treat this as an authoritative handoff checkpoint for continuing the task. It may include facts carried forward from previous compactions; preserve them unless superseded by later context.`
 
+/** @param {any} message */
+export function isCompactionSummaryMessage(message) {
+	return message?.pinanoCompactionSummary === true
+}
+
+/** @param {any} message */
+export function isCompactionCheckpointMessage(message) {
+	return message?.compaction === true || isCompactionSummaryMessage(message)
+}
+
 /** @param {string} text */
 export function stripCompactionMarkerPrefix(text) {
 	let stripped = text.replace(/^\[earlier context compacted\]\n?/, "")
 	if (stripped.startsWith(MODEL_HANDOFF_PREFIX)) stripped = stripped.slice(MODEL_HANDOFF_PREFIX.length)
 	return stripped.trim()
+}
+
+/** @param {string} text @param {number} [maxLines] */
+export function truncateCompactionSummaryForDisplay(text, maxLines = COMPACTION_SUMMARY_DISPLAY_MAX_LINES) {
+	const normalized = String(text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim()
+	if (!normalized) return ""
+	if (maxLines <= 0) return ""
+	const lines = normalized.split("\n")
+	if (lines.length <= maxLines) return normalized
+	const omitted = lines.length - maxLines
+	return [...lines.slice(0, maxLines), `... ${omitted} more line${omitted === 1 ? "" : "s"}`].join("\n")
 }
 
 /** @param {any} message */
@@ -51,10 +73,21 @@ export function compactionSummaryText(message) {
 
 /** @param {any} message */
 export function modelCompactionHandoffMessage(message) {
+	if (isCompactionSummaryMessage(message)) return message
 	if (message?.compaction !== true) return message
 	const summary = compactionSummaryText(message)
-	return {
-		...message,
+	const { compaction, usage, ...rest } = message
+	void compaction
+	const handoff = {
+		...rest,
+		role: "user",
 		content: [{ type: "text", text: `${MODEL_HANDOFF_PREFIX}\n\n${summary || "(no compaction summary available)"}` }],
+		pinanoCompactionSummary: true,
 	}
+	if (usage !== undefined) {
+		handoff.usage = usage && typeof usage === "object"
+			? { ...usage, cost: usage.cost && typeof usage.cost === "object" ? { ...usage.cost } : usage.cost }
+			: usage
+	}
+	return handoff
 }
