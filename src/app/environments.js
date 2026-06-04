@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute } from "node:path"
 
-import { environmentsConfigPath } from "./paths.js"
+import { environmentsConfigPath, legacyEnvironmentsConfigPath } from "./paths.js"
 import { configuredWorkerSpec } from "./service-config.js"
 import { parseWorkerSpec } from "./worker-launchers.js"
 
@@ -15,9 +15,26 @@ function defaultLocalSandbox() {
 		: { type: "container" }
 }
 
-function readEnvironmentsConfig() {
+/** @param {string} path */
+function readEnvironmentsConfigFile(path) {
 	try {
-		const parsed = JSON.parse(readFileSync(environmentsConfigPath(), "utf-8"))
+		const parsed = JSON.parse(readFileSync(path, "utf-8"))
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("environments.json must contain an object")
+		return parsed
+	} catch (err) {
+		if (err?.code === "ENOENT") return undefined
+		throw err
+	}
+}
+
+function readEnvironmentsConfig() {
+	return readEnvironmentsConfigFile(environmentsConfigPath()) ?? readEnvironmentsConfigFile(legacyEnvironmentsConfigPath())
+}
+
+/** @param {string} path */
+async function readEnvironmentsConfigFileForWrite(path) {
+	try {
+		const parsed = JSON.parse(await readFile(path, "utf-8"))
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("environments.json must contain an object")
 		return parsed
 	} catch (err) {
@@ -27,14 +44,9 @@ function readEnvironmentsConfig() {
 }
 
 async function readEnvironmentsConfigForWrite() {
-	try {
-		const parsed = JSON.parse(await readFile(environmentsConfigPath(), "utf-8"))
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("environments.json must contain an object")
-		return parsed
-	} catch (err) {
-		if (err?.code === "ENOENT") return {}
-		throw err
-	}
+	return await readEnvironmentsConfigFileForWrite(environmentsConfigPath())
+		?? await readEnvironmentsConfigFileForWrite(legacyEnvironmentsConfigPath())
+		?? {}
 }
 
 /** @param {string} id */

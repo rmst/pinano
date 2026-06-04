@@ -4,9 +4,8 @@
 // agent dir plus every directory from the cwd up to the filesystem root, in
 // the order: AGENTS.md, AGENTS.MD, CLAUDE.md, CLAUDE.MD (first hit per dir).
 //
-// pinano checks two global locations: `configRoot()` (i.e.
-// `$PINANO_HOME/config/AGENTS.md`, defaulting to `~/.pinano/config/AGENTS.md`)
-// and the flat `~/.pinano/AGENTS.md`, mirroring pi's `~/.pi/agent/` convenience.
+// pinano checks configured global agent dirs before project ancestors. The
+// default global dir is `$PINANO_HOME` (`~/.pinano` by default).
 
 import { existsSync, readFileSync } from "node:fs"
 import { join, resolve } from "node:path"

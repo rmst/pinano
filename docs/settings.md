@@ -3,8 +3,8 @@
 Pinano reads settings from three layers, in order:
 
 1. Built-in defaults.
-2. `$PINANO_HOME/config/default-settings.json`, owned by the launcher or deployment.
-3. `$PINANO_HOME/config/settings.json`, owned by the user and written by Pinano settings flows.
+2. `$PINANO_HOME/default-settings.json`, owned by the launcher or deployment.
+3. `$PINANO_HOME/settings.json`, owned by the user and written by Pinano settings flows.
 
 `default-settings.json` and `settings.json` have the same schema. Pinano never writes `default-settings.json`; it only writes `settings.json`. Put declarative install, launcher, or deployment defaults in `default-settings.json`, and let user choices accumulate in `settings.json`.
 
@@ -38,7 +38,7 @@ Model refs are `provider/model-id`. The first slash separates the provider from 
 Provider-level fields apply to all models under that provider:
 
 - `baseUrl`: API base URL.
-- `apiKey`: fallback API key when no credential exists under `config/auth/<provider>.json`.
+- `apiKey`: fallback API key when no credential exists under `$PINANO_HOME/auth/<provider>.json`.
 - `headers`: extra HTTP headers.
 - `compat`: OpenAI-compatible transport feature flags.
 - `transport`: `chat` or `responses`.
@@ -59,7 +59,7 @@ The `service` object configures the local background service:
 
 ## Credentials
 
-Pinano resolves provider credentials from `$PINANO_HOME/config/auth/<provider>.json` first, then from `providers.<provider>.apiKey`. API keys in settings are useful for declarative deployments and local launcher defaults.
+Pinano resolves provider credentials from `$PINANO_HOME/auth/<provider>.json` first, then from `providers.<provider>.apiKey`. API keys in settings are useful for declarative deployments and local launcher defaults.
 
 ## llama.cpp
 

@@ -1,4 +1,4 @@
-// Settings persisted under $PINANO_HOME/config.
+// Settings persisted under $PINANO_HOME.
 //
 // default-settings.json is launcher/deployment-owned and never written here.
 // settings.json is the user override layer and is the only file update paths
@@ -9,7 +9,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises"
 import { dirname } from "node:path"
 
 import { normalizeReasoningLevel } from "../reasoning.js"
-import { defaultSettingsPath, settingsPath } from "./paths.js"
+import { defaultSettingsPath, legacyDefaultSettingsPath, legacySettingsPath, settingsPath } from "./paths.js"
 
 /** @typedef {import("../reasoning.js").ReasoningLevel} ThinkingLevel */
 
@@ -116,31 +116,49 @@ function pickSettingsKeys(parsed) {
 
 /**
  * @param {string} path
- * @returns {RawSettings}
+ * @returns {RawSettings | undefined}
  */
-function readSettingsFileSync(path) {
+function readSettingsFileMaybeSync(path) {
 	try {
 		const parsed = /** @type {Record<string, unknown>} */ (JSON.parse(readFileSync(path, "utf-8")))
 		return pickSettingsKeys(parsed)
 	} catch (/** @type {any} */ err) {
-		if (err.code === "ENOENT") return {}
+		if (err.code === "ENOENT") return undefined
 		throw err
 	}
 }
 
 /**
  * @param {string} path
- * @returns {Promise<RawSettings>}
+ * @param {string} legacyPath
+ * @returns {RawSettings}
  */
-async function readSettingsFile(path) {
+function readSettingsLayerSync(path, legacyPath) {
+	return { ...(readSettingsFileMaybeSync(legacyPath) ?? {}), ...(readSettingsFileMaybeSync(path) ?? {}) }
+}
+
+/**
+ * @param {string} path
+ * @returns {Promise<RawSettings | undefined>}
+ */
+async function readSettingsFileMaybe(path) {
 	try {
 		const text = await readFile(path, "utf-8")
 		const parsed = /** @type {Record<string, unknown>} */ (JSON.parse(text))
 		return pickSettingsKeys(parsed)
 	} catch (/** @type {any} */ err) {
-		if (err.code === "ENOENT") return {}
+		if (err.code === "ENOENT") return undefined
 		throw err
 	}
+}
+
+/**
+ * @param {string} path
+ * @param {string} legacyPath
+ * @returns {Promise<RawSettings>}
+ */
+async function readSettingsLayer(path, legacyPath) {
+	return { ...(await readSettingsFileMaybe(legacyPath) ?? {}), ...(await readSettingsFileMaybe(path) ?? {}) }
 }
 
 function plainObject(value) {
@@ -400,12 +418,18 @@ function mergeSettings(defaultSettings, userSettings) {
 
 /** @returns {Settings} */
 export function loadSettingsSync() {
-	return mergeSettings(readSettingsFileSync(defaultSettingsPath()), readSettingsFileSync(settingsPath()))
+	return mergeSettings(
+		readSettingsLayerSync(defaultSettingsPath(), legacyDefaultSettingsPath()),
+		readSettingsLayerSync(settingsPath(), legacySettingsPath()),
+	)
 }
 
 /** @returns {Promise<Settings>} */
 export async function loadSettings() {
-	return mergeSettings(await readSettingsFile(defaultSettingsPath()), await readSettingsFile(settingsPath()))
+	return mergeSettings(
+		await readSettingsLayer(defaultSettingsPath(), legacyDefaultSettingsPath()),
+		await readSettingsLayer(settingsPath(), legacySettingsPath()),
+	)
 }
 
 /** @param {Pick<Settings, "defaultModel">} settings */
@@ -448,8 +472,8 @@ export async function saveSettings(settings) {
  * @returns {Promise<Settings>}
  */
 export async function updateSettings(patch) {
-	const userSettings = await readSettingsFile(settingsPath())
-	const defaultSettings = await readSettingsFile(defaultSettingsPath())
+	const userSettings = await readSettingsLayer(settingsPath(), legacySettingsPath())
+	const defaultSettings = await readSettingsLayer(defaultSettingsPath(), legacyDefaultSettingsPath())
 	const current = mergeSettings(defaultSettings, userSettings)
 	await writeUserSettings(settingsForWrite({ ...userSettings, ...patch }, current))
 	return loadSettings()

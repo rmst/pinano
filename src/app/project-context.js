@@ -16,7 +16,7 @@ import {
 	hasProjectContextMessage,
 	isProjectContextMessage,
 } from "./context-format.js"
-import { configRoot, isPinanoTestProcess } from "./paths.js"
+import { configRoot, isPinanoTestProcess, legacyConfigRoot } from "./paths.js"
 
 /** @typedef {import("./context-files.js").ContextFile} ContextFile */
 
@@ -25,8 +25,9 @@ export { PROJECT_CONTEXT_HEADING, formatContextFilesAsUserMessage, hasProjectCon
 /** Default global agent dirs used by the session-startup path.
  * @returns {string[]} */
 export function defaultAgentDirs() {
-	const dirs = [configRoot()]
-	if (!isPinanoTestProcess()) dirs.push(join(homedir(), ".pinano"))
+	const dirs = [configRoot(), legacyConfigRoot()]
+	const home = join(homedir(), ".pinano")
+	if (!isPinanoTestProcess() && !dirs.includes(home)) dirs.push(home)
 	return dirs
 }
 

@@ -103,7 +103,7 @@ Sandbox paths default to `["."]`, resolved against the configured environment `c
 <details>
 <summary>Environment configuration</summary>
 
-Create `~/.pinano/config/environments.json` to define explicit environments:
+Create `~/.pinano/environments.json` to define explicit environments:
 
 ```json
 {

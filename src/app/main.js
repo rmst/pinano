@@ -178,7 +178,7 @@ function parseArgs(argv) {
 }
 
 function webDisabledMessage() {
-	return "Pinano Web is disabled. Set \"web\": true in $PINANO_HOME/config/default-settings.json or settings.json to enable it."
+	return "Pinano Web is disabled. Set \"web\": true in $PINANO_HOME/default-settings.json or settings.json to enable it."
 }
 
 async function packageVersion() {

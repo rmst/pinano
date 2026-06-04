@@ -1,7 +1,7 @@
 // Centralized path resolution for pinano on-disk state.
 //
-// Defaults to ~/.pinano. Override the entire config/data/environment root with
-// $PINANO_HOME — useful for tests and custom installs.
+// Defaults to ~/.pinano. Override the entire user, data, and environment root
+// with $PINANO_HOME — useful for tests and custom installs.
 
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
@@ -36,7 +36,12 @@ function assertSafeTestHome() {
 /** @returns {string} */
 export function configRoot() {
 	assertSafeTestHome()
-	return join(pinanoHome(), "config")
+	return pinanoHome()
+}
+
+/** @returns {string} */
+export function legacyConfigRoot() {
+	return join(configRoot(), "config")
 }
 
 /** @returns {string} */
@@ -66,19 +71,38 @@ export function settingsPath() {
 }
 
 /** @returns {string} */
+export function legacySettingsPath() {
+	return join(legacyConfigRoot(), "settings.json")
+}
+
+/** @returns {string} */
 export function defaultSettingsPath() {
 	return join(configRoot(), "default-settings.json")
 }
 
 /** @returns {string} */
+export function legacyDefaultSettingsPath() {
+	return join(legacyConfigRoot(), "default-settings.json")
+}
+
 /** @returns {string} */
 export function environmentsConfigPath() {
 	return join(configRoot(), "environments.json")
 }
 
 /** @returns {string} */
+export function legacyEnvironmentsConfigPath() {
+	return join(legacyConfigRoot(), "environments.json")
+}
+
+/** @returns {string} */
 export function authDir() {
 	return join(configRoot(), "auth")
+}
+
+/** @returns {string} */
+export function legacyAuthDir() {
+	return join(legacyConfigRoot(), "auth")
 }
 
 /**
@@ -87,6 +111,14 @@ export function authDir() {
  */
 export function authFilePath(provider) {
 	return join(authDir(), `${provider}.json`)
+}
+
+/**
+ * @param {string} provider
+ * @returns {string}
+ */
+export function legacyAuthFilePath(provider) {
+	return join(legacyAuthDir(), `${provider}.json`)
 }
 
 /**
