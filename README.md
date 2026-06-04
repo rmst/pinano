@@ -30,7 +30,7 @@ git clone https://github.com/rmst/pinano
 
 On first run, Pinano opens the model provider credentials view when no provider is configured. Pinano is currently optimized for use with a ChatGPT subscription.
 
-API keys are also supported. Pinano can import supported API keys from the launch environment (`OPENAI_API_KEY`, `MOONSHOT_API_KEY`/`KIMI_API_KEY`, `DEEPSEEK_API_KEY`, `LLAMACPP_API_KEY`). Deployment-level API keys and other settings can also be configured declaratively.
+API keys are also supported. Pinano can import supported API keys from the launch environment. Deployment-level API keys and other settings can also be configured declaratively; see [settings](docs/settings.md).
 
 
 ## Common commands
@@ -168,9 +168,7 @@ src/
   tools/             read/view_image, write, edit/apply_patch, exec_command/write_stdin, bash, ls, grep, find, js
   fallback-tools/    PATH fallbacks for common external commands (currently curl)
   session-manager/   SQLite + in-memory storage, parent-link tree
-  tui/               ported pi-tui — Markdown renderer restored with vendored
-                     marked, east-asian-width vendored, Intl.Segmenter
-                     polyfilled for [qn](https://github.com/rmst/qn)
+  tui/               ported pi-tui — Markdown renderer restored with vendored marked, east-asian-width vendored
   app/               CLI, service runtime, and terminal app UI
 ```
 

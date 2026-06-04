@@ -6,17 +6,17 @@ import { Text } from "./text.js";
  * @property {number} [intervalMs] Frame interval in milliseconds for animated indicators.
  */
 
-const DEFAULT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const DEFAULT_INTERVAL_MS = 80;
+export const LOADER_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+export const LOADER_SPINNER_INTERVAL_MS = 80;
 
 /**
  * Loader component that updates with an optional spinning animation.
  */
 export class Loader extends Text {
 	/** @type {string[]} */
-	frames = [...DEFAULT_FRAMES];
+	frames = [...LOADER_SPINNER_FRAMES];
 	/** @type {number} */
-	intervalMs = DEFAULT_INTERVAL_MS;
+	intervalMs = LOADER_SPINNER_INTERVAL_MS;
 	/** @type {number} */
 	currentFrame = 0;
 	/** @type {ReturnType<typeof setInterval> | null} */
@@ -77,8 +77,8 @@ export class Loader extends Text {
 	/** @param {LoaderIndicatorOptions} [indicator] */
 	setIndicator(indicator) {
 		this.renderIndicatorVerbatim = indicator !== undefined;
-		this.frames = indicator?.frames !== undefined ? [...indicator.frames] : [...DEFAULT_FRAMES];
-		this.intervalMs = indicator?.intervalMs && indicator.intervalMs > 0 ? indicator.intervalMs : DEFAULT_INTERVAL_MS;
+		this.frames = indicator?.frames !== undefined ? [...indicator.frames] : [...LOADER_SPINNER_FRAMES];
+		this.intervalMs = indicator?.intervalMs && indicator.intervalMs > 0 ? indicator.intervalMs : LOADER_SPINNER_INTERVAL_MS;
 		this.currentFrame = 0;
 		this.start();
 	}

@@ -14,7 +14,8 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { dataRoot } from "./paths.js"
-import { loadSettings, updateSetting } from "./settings.js"
+import { canonicalModelRef, parseModelRef } from "./models.js"
+import { loadSettings, updateSetting, updateSettings } from "./settings.js"
 import { RuntimeManager } from "./server-runtime.js"
 import { authenticateRequest } from "./http-auth.js"
 import { configuredServiceDiagnostics, configuredServiceEndpointDefaults, configuredServiceToken, configuredWebDefaults } from "./service-config.js"
@@ -133,6 +134,15 @@ function authError(auth) {
 
 function createServiceToken() {
 	return configuredServiceToken() || randomUUID()
+}
+
+/**
+ * @param {string} ref
+ * @param {import("./settings.js").Settings} current
+ */
+async function updateDefaultModel(ref, current) {
+	const currentProvider = parseModelRef(current.defaultModel).provider
+	return updateSettings({ defaultModel: canonicalModelRef(ref, { provider: currentProvider, providers: current.providers }) })
 }
 
 async function writePrivateJson(path, value) {
@@ -547,7 +557,7 @@ export async function runService(options) {
 	const manager = await RuntimeManager.create({
 		cwd: options.cwd,
 		createAgent: options.createAgent,
-		getSettings: () => ({ ...serviceSettings, model: serviceModelOverride ? serviceSettings.model : undefined }),
+		getSettings: () => serviceModelOverride ? serviceSettings : { ...serviceSettings, defaultModel: undefined },
 		noContextFiles: options.noContextFiles === true,
 		diagnostics,
 	}, db, hub)
@@ -669,9 +679,9 @@ export async function runService(options) {
 		const configuredHost = typeof defaults.host === "string" && defaults.host ? defaults.host : undefined
 		const configuredFixedPort = Number.isInteger(defaults.port) && defaults.port > 0 ? defaults.port : undefined
 		const fallbackPort = Number(serviceEndpoint.requestedPort)
-		if (configuredHost && configuredHost !== endpointHost) throw Object.assign(new Error(`Pinano Web is configured for host ${configuredHost}, but the running service is bound to ${endpointHost}; restart the service after updating $PINANO_HOME/config/service.json.`), { status: 409 })
-		if (configuredFixedPort && configuredFixedPort !== endpointPort) throw Object.assign(new Error(`Pinano Web is configured for port ${configuredFixedPort}, but the running service is on ${endpointHost}:${endpointPort}. Free the configured port and restart the service, or update $PINANO_HOME/config/service.json.`), { status: 409 })
-		if (serviceEndpoint.portFallback && fallbackPort > 0) throw Object.assign(new Error(`Pinano Web cannot start on fallback service port ${endpointPort}; requested port ${fallbackPort} was unavailable when the service started. Free the requested port and restart the service, or update $PINANO_HOME/config/service.json.`), { status: 409 })
+		if (configuredHost && configuredHost !== endpointHost) throw Object.assign(new Error(`Pinano Web is configured for host ${configuredHost}, but the running service is bound to ${endpointHost}; restart the service after updating service.web in Pinano settings.`), { status: 409 })
+		if (configuredFixedPort && configuredFixedPort !== endpointPort) throw Object.assign(new Error(`Pinano Web is configured for port ${configuredFixedPort}, but the running service is on ${endpointHost}:${endpointPort}. Free the configured port and restart the service, or update service.web in Pinano settings.`), { status: 409 })
+		if (serviceEndpoint.portFallback && fallbackPort > 0) throw Object.assign(new Error(`Pinano Web cannot start on fallback service port ${endpointPort}; requested port ${fallbackPort} was unavailable when the service started. Free the requested port and restart the service, or update service.web in Pinano settings.`), { status: 409 })
 		const requestedPort = Number.isInteger(body.port) ? Math.max(0, body.port) : undefined
 		const requestedToken = typeof body.token === "string" && body.token ? body.token : undefined
 		if (explicit.host && body.host && body.host !== endpointHost) throw Object.assign(new Error("Pinano Web shares the service endpoint; restart the service to change its host."), { status: 409 })
@@ -706,7 +716,7 @@ export async function runService(options) {
 			getSettings: () => serviceSettings,
 			setDefaultModel: async (model) => {
 				serviceModelOverride = true
-				serviceSettings = await updateSetting("model", model)
+				serviceSettings = await updateDefaultModel(model, serviceSettings)
 				return serviceSettings
 			},
 			setDefaultReasoning: async (level) => {
@@ -735,7 +745,7 @@ export async function runService(options) {
 		getSettings: () => serviceSettings,
 		setDefaultModel: async (model) => {
 			serviceModelOverride = true
-			serviceSettings = await updateSetting("model", model)
+			serviceSettings = await updateDefaultModel(model, serviceSettings)
 			return serviceSettings
 		},
 		setDefaultReasoning: async (level) => {

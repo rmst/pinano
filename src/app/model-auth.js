@@ -35,7 +35,8 @@ export async function getFreshCodexCredential() {
  * @returns {Promise<any>}
  */
 export async function resolveModelStreamOptions(model, options = {}) {
-	if (model.provider === "openai-codex") {
+	const provider = model.authProvider ?? model.provider
+	if (provider === "openai-codex") {
 		const cred = await getFreshCodexCredential()
 		return {
 			...options,
@@ -48,14 +49,14 @@ export async function resolveModelStreamOptions(model, options = {}) {
 			},
 		}
 	}
-	const apiKey = (await resolveApiKey(model.provider)) ?? options.apiKey
+	const apiKey = (provider ? await resolveApiKey(provider) : undefined) ?? options.apiKey
 	return {
 		...options,
 		apiKey,
 		auth: {
 			...(options.auth ?? {}),
-			provider: model.provider ?? options.auth?.provider,
-			credentialId: model.provider ?? options.auth?.credentialId,
+			provider: provider ?? options.auth?.provider,
+			credentialId: provider ?? options.auth?.credentialId,
 		},
 	}
 }

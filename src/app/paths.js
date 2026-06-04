@@ -71,10 +71,6 @@ export function defaultSettingsPath() {
 }
 
 /** @returns {string} */
-export function serviceConfigPath() {
-	return join(configRoot(), "service.json")
-}
-
 /** @returns {string} */
 export function environmentsConfigPath() {
 	return join(configRoot(), "environments.json")

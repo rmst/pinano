@@ -1,6 +1,7 @@
 import { normalizeReasoningLevel } from "../reasoning.js"
 import { parseBashShortcut, recordBashShortcut, runBashShortcut } from "./bash-shortcut.js"
-import { loadSettings, updateSetting } from "./settings.js"
+import { canonicalModelRef, parseModelRef } from "./models.js"
+import { loadSettings, updateSetting, updateSettings } from "./settings.js"
 
 export const WEB_COMMANDS = [
 	{ name: "help", description: "show available slash commands" },
@@ -96,6 +97,16 @@ const entryIdFromBody = (body) => {
 
 const settingsResponse = async (settings) => ({ settings: await settings })
 
+/**
+ * @param {string} ref
+ * @returns {Promise<import("./settings.js").Settings>}
+ */
+async function updateDefaultModel(ref) {
+	const current = await loadSettings()
+	const currentProvider = parseModelRef(current.defaultModel).provider
+	return updateSettings({ defaultModel: canonicalModelRef(ref, { provider: currentProvider, providers: current.providers }) })
+}
+
 const snapshotCursor = (snapshot) => {
 	const cursor = {}
 	if (typeof snapshot?.seq === "number") cursor.seq = snapshot.seq
@@ -140,7 +151,7 @@ export function createManagerClientApi(options) {
 			const model = typeof body.model === "string" ? body.model.trim() : ""
 			if (!model) throw Object.assign(new Error("model is required"), { status: 400 })
 			if (options.setDefaultModel) return options.setDefaultModel(model)
-			return updateSetting("model", model)
+			return updateDefaultModel(model)
 		}
 		if (hasOwn(body, "thinkingLevel")) {
 			const level = normalizeReasoningLevel(typeof body.thinkingLevel === "string" ? body.thinkingLevel.trim() : "")

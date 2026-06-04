@@ -227,7 +227,7 @@ function webHelpLines() {
 		"  pinano web",
 		"",
 		"Web uses the authenticated local service endpoint.",
-		"Endpoint and public URL defaults are read from $PINANO_HOME/config/service.json.",
+		"Endpoint and public URL defaults are read from service.web in Pinano settings.",
 		"Use /web in the TUI to open the same service-hosted browser UI.",
 	]
 }
@@ -290,7 +290,7 @@ async function main() {
 
 	const [
 		{ loadSettings },
-		{ availableModelEntries, modelEntryMatches, modelRef, modelSettingsHasRef, resolveModel },
+		{ availableModelEntries, modelEntryMatches, resolveModel },
 		{ buildProjectContextMessage, isProjectContextMessage },
 		{ runPrintMode },
 		{ installStderrCapture },
@@ -330,10 +330,11 @@ async function main() {
 		console.error(NO_MODEL_PROVIDER_CLI_MESSAGE)
 		process.exit(2)
 	}
-	const configuredModel = availableModels.find((m) => modelEntryMatches(m, settings.model))
-	const configuredDeclarativeModel = modelSettingsHasRef(settings.models, settings.model)
-	const modelId = configuredModel || configuredDeclarativeModel ? settings.model : (availableModels[0] ? modelRef(availableModels[0]) : settings.model)
-	const model = resolveModel(modelId, { models: settings.models })
+	const configuredModel = availableModels.find((m) => modelEntryMatches(m, settings.defaultModel))
+	const fallbackModel = configuredModel ?? availableModels[0]
+	const model = fallbackModel
+		? resolveModel(fallbackModel.id, { provider: fallbackModel.provider, providers: settings.providers })
+		: resolveModel(settings.defaultModel, { providers: settings.providers })
 
 	const createAgent = ({ cwd = args.cwd, toolExecutor = undefined } = {}) => createPinanoAgent({
 		cwd,

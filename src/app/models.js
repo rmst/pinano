@@ -33,6 +33,7 @@ import { CODEX_TOOL_PROFILE, DEFAULT_TOOL_PROFILE, GPT_5_4_MINI_PINANO_INSTRUCTI
  * @property {number} maxTokens
  * @property {{ input: number, output: number, cacheRead: number, cacheWrite: number }} cost
  * @property {("text" | "image")[]} [input]
+ * @property {Record<string, string>} [headers]
  * @property {Record<string, unknown>} [compat]
  * @property {"chat" | "responses"} [transport]
  * @property {boolean} [supportsTextVerbosity]
@@ -95,7 +96,6 @@ export const MODEL_REGISTRY = [
 		authProvider: "openai",
 		baseUrl: OPENAI_BASE,
 		...GPT_5_5_MODEL,
-		maintenanceModelRef: "gpt-5.4-mini",
 		cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
 		tags: ["frontier"],
 	},
@@ -149,7 +149,6 @@ export const MODEL_REGISTRY = [
 		baseUrl: CODEX_BASE,
 		legacyIds: ["gpt-5.5-codex"],
 		...GPT_5_5_MODEL,
-		maintenanceModelRef: "openai-codex/gpt-5.4-mini",
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		tags: ["subscription"],
 	},
@@ -264,12 +263,12 @@ const MODEL_PROVIDERS = new Set(["openai", "openai-codex", "llamacpp", "moonshot
 
 /**
  * @param {string} ref
- * @returns {{ provider?: ModelProvider, id: string }}
+ * @returns {{ provider?: string, id: string }}
  */
-function parseModelRef(ref) {
+export function parseModelRef(ref) {
 	const match = ref.match(/^([^/]+)\/(.+)$/)
 	if (!match) return { id: ref }
-	return { provider: /** @type {ModelProvider} */ (match[1]), id: match[2] }
+	return { provider: match[1], id: match[2] }
 }
 
 /**
@@ -277,7 +276,7 @@ function parseModelRef(ref) {
  * @returns {string}
  */
 export function modelRef(entry) {
-	return entry.provider === "openai-codex" ? `${entry.provider}/${entry.id}` : entry.id
+	return `${entry.provider}/${entry.id}`
 }
 
 /**
@@ -288,7 +287,7 @@ export function modelRef(entry) {
  */
 export function modelEntryMatches(entry, id, provider) {
 	const parsed = parseModelRef(id)
-	const expectedProvider = provider ?? validProvider(parsed.provider)
+	const expectedProvider = validProvider(provider) ?? validProvider(parsed.provider)
 	if (expectedProvider && entry.provider !== expectedProvider) return false
 	return entry.id === parsed.id || (entry.legacyIds ?? []).includes(parsed.id)
 }
@@ -300,8 +299,11 @@ export function modelEntryMatches(entry, id, provider) {
  */
 export function modelRefMatches(entry, id) {
 	if (id === modelRef(entry)) return true
-	if ((entry.legacyIds ?? []).includes(id)) return true
-	return !id.includes("/") && entry.provider !== "openai-codex" && modelEntryMatches(entry, id)
+	const parsed = parseModelRef(id)
+	if (validProvider(parsed.provider) && entry.provider !== parsed.provider) return false
+	const canonical = parsed.provider ? undefined : findRegistryModelEntry(parsed.id)
+	if (canonical && canonical.provider !== entry.provider) return false
+	return entry.id === parsed.id || (entry.legacyIds ?? []).includes(parsed.id)
 }
 
 /** @param {unknown} value */
@@ -312,6 +314,11 @@ function plainObject(value) {
 /** @param {unknown} value */
 function validProvider(value) {
 	return typeof value === "string" && MODEL_PROVIDERS.has(value) ? /** @type {ModelProvider} */ (value) : undefined
+}
+
+/** @param {unknown} value */
+export function knownModelProvider(value) {
+	return validProvider(value)
 }
 
 /** @param {unknown} value @param {number} fallback */
@@ -332,6 +339,22 @@ function mergeCost(base, value) {
 		cacheRead: finiteNumber(cost.cacheRead, base.cacheRead),
 		cacheWrite: finiteNumber(cost.cacheWrite, base.cacheWrite),
 	}
+}
+
+function mergeRecords(...sources) {
+	const merged = {}
+	for (const source of sources) {
+		for (const [key, value] of Object.entries(plainObject(source))) {
+			if (typeof value === "string") merged[key] = value
+		}
+	}
+	return Object.keys(merged).length > 0 ? merged : undefined
+}
+
+function mergeObjects(...sources) {
+	const merged = {}
+	for (const source of sources) Object.assign(merged, plainObject(source))
+	return Object.keys(merged).length > 0 ? merged : undefined
 }
 
 /** @param {unknown} value @param {ModelEntry["input"]} fallback */
@@ -368,45 +391,79 @@ function findRegistryModelEntry(id, options = {}) {
 	return MODEL_REGISTRY.find((m) => modelEntryMatches(m, parsed.id, provider))
 }
 
-/** @param {string} ref @param {unknown} value */
-function configuredModelEntry(ref, value) {
-	const config = plainObject(value)
-	if (Object.keys(config).length === 0 && (!value || typeof value !== "object")) return undefined
-	const parsed = parseModelRef(ref)
-	const extended = typeof config.extends === "string" ? findRegistryModelEntry(config.extends) : undefined
-	const template = extended ?? findRegistryModelEntry(ref) ?? /** @type {ModelEntry} */ (findRegistryModelEntry("local"))
-	const provider = validProvider(config.provider) ?? validProvider(parsed.provider) ?? template.provider
-	const authProvider = validProvider(config.authProvider) ?? (provider !== template.provider ? provider : template.authProvider)
-	const sameTemplateModel = template.id === parsed.id && template.provider === provider
+/** @param {ModelProvider} provider */
+function defaultTemplateForProvider(provider) {
+	return MODEL_REGISTRY.find((m) => m.provider === provider) ?? /** @type {ModelEntry} */ (findRegistryModelEntry("llamacpp/local"))
+}
+
+function hasProviderModelOverrides(config) {
+	return ["authProvider", "baseUrl", "headers", "compat", "transport"].some((key) => config[key] !== undefined)
+		|| Object.keys(plainObject(config.modelOverrides)).length > 0
+}
+
+/**
+ * @param {ModelProvider} provider
+ * @param {Record<string, any>} providerConfig
+ * @param {Record<string, any>} modelConfig
+ * @param {ModelEntry} template
+ * @returns {ModelEntry}
+ */
+function configuredModelEntry(provider, providerConfig, modelConfig, template) {
+	const id = typeof modelConfig.id === "string" && modelConfig.id ? modelConfig.id : template.id
+	const extended = typeof modelConfig.extends === "string" ? findRegistryModelEntry(modelConfig.extends) : undefined
+	const baseTemplate = extended ?? template
+	const authProvider = validProvider(modelConfig.authProvider) ?? validProvider(providerConfig.authProvider) ?? provider
+	const sameTemplateModel = baseTemplate.id === id && baseTemplate.provider === provider
 	return {
-		...template,
-		id: parsed.id,
-		displayName: typeof config.displayName === "string" && config.displayName ? config.displayName : sameTemplateModel ? template.displayName : parsed.id,
+		...baseTemplate,
+		id,
+		displayName: typeof modelConfig.displayName === "string" && modelConfig.displayName ? modelConfig.displayName : sameTemplateModel ? baseTemplate.displayName : id,
 		provider,
 		authProvider,
-		baseUrl: typeof config.baseUrl === "string" && config.baseUrl ? config.baseUrl : template.baseUrl,
-		wireModel: typeof config.wireModel === "string" && config.wireModel ? config.wireModel : sameTemplateModel ? template.wireModel : parsed.id,
-		reasoning: typeof config.reasoning === "boolean" ? config.reasoning : template.reasoning,
-		contextWindow: positiveNumber(config.contextWindow, template.contextWindow),
-		maxTokens: positiveNumber(config.maxTokens, template.maxTokens),
-		cost: mergeCost(template.cost, config.cost),
-		input: modelInput(config.input, template.input),
-		compat: Object.keys(plainObject(config.compat)).length > 0 ? { ...(template.compat ?? {}), ...plainObject(config.compat) } : template.compat,
-		transport: modelTransport(config.transport, template.transport),
-		maintenanceModelRef: typeof config.maintenanceModelRef === "string" && config.maintenanceModelRef ? config.maintenanceModelRef : template.maintenanceModelRef,
-		toolProfile: modelToolProfile(config.toolProfile, template.toolProfile),
-		tags: stringArray(config.tags, template.tags),
+		baseUrl: typeof modelConfig.baseUrl === "string" && modelConfig.baseUrl ? modelConfig.baseUrl : typeof providerConfig.baseUrl === "string" && providerConfig.baseUrl ? providerConfig.baseUrl : baseTemplate.baseUrl,
+		wireModel: typeof modelConfig.wireModel === "string" && modelConfig.wireModel ? modelConfig.wireModel : sameTemplateModel ? baseTemplate.wireModel : id,
+		reasoning: typeof modelConfig.reasoning === "boolean" ? modelConfig.reasoning : baseTemplate.reasoning,
+		contextWindow: positiveNumber(modelConfig.contextWindow, baseTemplate.contextWindow),
+		maxTokens: positiveNumber(modelConfig.maxTokens, baseTemplate.maxTokens),
+		cost: mergeCost(baseTemplate.cost, modelConfig.cost),
+		input: modelInput(modelConfig.input, baseTemplate.input),
+		headers: mergeRecords(baseTemplate.headers, providerConfig.headers, modelConfig.headers),
+		compat: mergeObjects(baseTemplate.compat, providerConfig.compat, modelConfig.compat),
+		transport: modelTransport(modelConfig.transport, modelTransport(providerConfig.transport, baseTemplate.transport)),
+		maintenanceModelRef: typeof modelConfig.maintenanceModelRef === "string" && modelConfig.maintenanceModelRef ? modelConfig.maintenanceModelRef : baseTemplate.maintenanceModelRef,
+		toolProfile: modelToolProfile(modelConfig.toolProfile, baseTemplate.toolProfile),
+		tags: stringArray(modelConfig.tags, baseTemplate.tags),
 	}
 }
 
 /**
- * @param {Record<string, import("./settings.js").ModelSettings> | undefined} models
+ * @param {Record<string, import("./settings.js").ProviderSettings> | undefined} providers
  * @returns {ModelEntry[]}
  */
-export function configuredModelEntries(models = {}) {
-	return Object.entries(plainObject(models))
-		.map(([ref, config]) => configuredModelEntry(ref, config))
-		.filter(Boolean)
+export function configuredModelEntries(providers = {}) {
+	const entries = []
+	for (const [providerId, value] of Object.entries(plainObject(providers))) {
+		const provider = validProvider(providerId)
+		if (!provider) continue
+		const providerConfig = plainObject(value)
+		const overrides = plainObject(providerConfig.modelOverrides)
+		if (hasProviderModelOverrides(providerConfig)) {
+			for (const template of MODEL_REGISTRY.filter((m) => m.provider === provider)) {
+				entries.push(configuredModelEntry(provider, providerConfig, { id: template.id, ...plainObject(overrides[template.id]) }, template))
+			}
+		}
+		if (Array.isArray(providerConfig.models)) {
+			for (const modelValue of providerConfig.models) {
+				const modelConfig = plainObject(modelValue)
+				if (typeof modelConfig.id !== "string" || !modelConfig.id) continue
+				const template = (typeof modelConfig.extends === "string" ? findRegistryModelEntry(modelConfig.extends) : undefined)
+					?? findRegistryModelEntry(modelConfig.id, { provider })
+					?? defaultTemplateForProvider(provider)
+				entries.push(configuredModelEntry(provider, providerConfig, modelConfig, template))
+			}
+		}
+	}
+	return entries
 }
 
 /** @param {ModelEntry[]} entries */
@@ -422,28 +479,40 @@ function dedupeModelEntries(entries) {
 	return result
 }
 
-/** @param {Record<string, import("./settings.js").ModelSettings> | undefined} models */
-function allModelEntries(models = {}) {
-	return dedupeModelEntries([...configuredModelEntries(models), ...MODEL_REGISTRY])
+/** @param {Record<string, import("./settings.js").ProviderSettings> | undefined} providers */
+function allModelEntries(providers = {}) {
+	return dedupeModelEntries([...configuredModelEntries(providers), ...MODEL_REGISTRY])
 }
 
 /**
- * @param {Record<string, import("./settings.js").ModelSettings> | undefined} models
+ * @param {Record<string, import("./settings.js").ProviderSettings> | undefined} providers
  * @param {string} ref
  */
-export function modelSettingsHasRef(models, ref) {
-	return configuredModelEntries(models).some((entry) => modelRefMatches(entry, ref))
+export function providerSettingsHasRef(providers, ref) {
+	return configuredModelEntries(providers).some((entry) => modelRefMatches(entry, ref))
 }
 
 /**
  * @param {string} id
- * @param {{ provider?: ModelProvider, models?: Record<string, import("./settings.js").ModelSettings> }} [options]
+ * @param {{ provider?: ModelProvider, providers?: Record<string, import("./settings.js").ProviderSettings> }} [options]
  * @returns {ModelEntry | undefined}
  */
 export function findModelEntry(id, options = {}) {
 	const parsed = parseModelRef(id)
-	const provider = options.provider ?? validProvider(parsed.provider)
-	return allModelEntries(options.models).find((m) => modelEntryMatches(m, parsed.id, provider))
+	const provider = validProvider(options.provider) ?? validProvider(parsed.provider)
+	return allModelEntries(options.providers).find((m) => modelEntryMatches(m, parsed.id, provider))
+}
+
+/**
+ * @param {string} id
+ * @param {{ provider?: string, providers?: Record<string, import("./settings.js").ProviderSettings> }} [options]
+ */
+export function canonicalModelRef(id, options = {}) {
+	const entry = findModelEntry(id, { providers: options.providers })
+	if (entry) return modelRef(entry)
+	const parsed = parseModelRef(id)
+	if (parsed.provider) return id
+	return `${options.provider ?? "llamacpp"}/${parsed.id}`
 }
 
 /**
@@ -451,10 +520,14 @@ export function findModelEntry(id, options = {}) {
  * @returns {Promise<ModelEntry[]>}
  */
 export async function availableModelEntries(settings = undefined) {
-	const entries = allModelEntries(settings?.models)
+	const entries = allModelEntries(settings?.providers)
 	const providers = Array.from(new Set(entries.map((m) => m.authProvider)))
 	const available = new Set(
-		/** @type {ModelProvider[]} */ ((await Promise.all(providers.map(async (p) => ((await resolveApiKey(p)) ? p : undefined)))).filter(Boolean)),
+		/** @type {ModelProvider[]} */ ((await Promise.all(providers.map(async (p) => {
+			const configuredKey = settings?.providers?.[p]?.apiKey
+			const apiKey = (typeof configuredKey === "string" && configuredKey) || await resolveApiKey(p)
+			return apiKey ? p : undefined
+		}))).filter(Boolean)),
 	)
 	return entries
 		.filter((m) => available.has(m.authProvider))
@@ -483,6 +556,7 @@ export function buildModel(entry, overrides = {}) {
 		input: [
 			...(entry.input ?? (entry.provider === "openai" || entry.provider === "openai-codex" ? VISION_INPUT : TEXT_ONLY_INPUT)),
 		],
+		headers: entry.headers,
 		cost: entry.cost,
 		contextWindow: entry.contextWindow,
 		maxTokens: entry.maxTokens,
@@ -522,14 +596,16 @@ export function refreshModelFromRegistry(model, ref = undefined) {
 }
 
 /**
- * Resolve a model from the curated registry plus declarative settings.models.
- * Unknown ids fall back to the local-llamacpp template.
+ * Resolve a model from the curated registry plus declarative settings providers.
+ * Unknown ids fall back to the selected provider's first registry template.
  *
  * @param {string} id
- * @param {{ models?: Record<string, import("./settings.js").ModelSettings> }} [options]
+ * @param {{ provider?: ModelProvider, providers?: Record<string, import("./settings.js").ProviderSettings> }} [options]
  */
 export function resolveModel(id, options = {}) {
-	const entry = findModelEntry(id, { models: options.models })
+	const entry = findModelEntry(id, { provider: options.provider, providers: options.providers })
 	if (entry) return buildModel(entry)
-	return buildModel(/** @type {ModelEntry} */ (findRegistryModelEntry("local")), { id })
+	const parsed = parseModelRef(id)
+	const provider = validProvider(options.provider) ?? validProvider(parsed.provider) ?? "llamacpp"
+	return buildModel(defaultTemplateForProvider(provider), { id: parsed.id })
 }

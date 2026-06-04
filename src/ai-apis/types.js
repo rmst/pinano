@@ -163,6 +163,7 @@
  * @property {string} id Model id sent to the API
  * @property {string} [name] Human-readable name
  * @property {string} [provider] Free-form provider tag (e.g. "openai", "ollama")
+ * @property {string} [authProvider] Credential provider when it differs from `provider`
  * @property {string} baseUrl API base URL, e.g. "https://api.openai.com/v1"
  * @property {boolean} [reasoning] Whether the model supports reasoning_effort
  * @property {("text" | "image")[]} [input] Modalities the model accepts. Default: ["text"]

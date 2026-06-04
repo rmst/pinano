@@ -13,7 +13,11 @@ const LABEL_BY_PROVIDER = {
  */
 export function providerConfiguredApiKey(model) {
 	const provider = model?.authProvider ?? model?.provider ?? "openai"
-	return configuredProviderApiKey(provider)
+	try {
+		return configuredProviderApiKey(provider)
+	} catch {
+		return undefined
+	}
 }
 
 /**
@@ -23,5 +27,5 @@ export function providerConfiguredApiKey(model) {
 export function missingApiKeyMessage(model) {
 	const provider = model?.authProvider ?? model?.provider ?? "openai"
 	const label = LABEL_BY_PROVIDER[provider] ?? provider
-	return `${label} API key is required. Run pinano open /settings/credentials, pass options.apiKey, or configure providers.${provider}.apiKey in $PINANO_HOME/config/service.json.`
+	return `${label} API key is required. Run pinano open /settings/credentials, pass options.apiKey, or configure providers.${provider}.apiKey in $PINANO_HOME/config/settings.json or default-settings.json.`
 }

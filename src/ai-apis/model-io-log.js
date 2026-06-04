@@ -1,6 +1,6 @@
 // Optional model wire-log logger.
 //
-// Disabled by default. Set modelIoLog=true in $PINANO_HOME/config/service.json
+// Disabled by default. Set service.modelIoLog=true in merged Pinano settings
 // to write every model API call to a separate SQLite database. All logging is best-effort: failures are
 // swallowed so observability can never break model calls.
 
@@ -36,11 +36,19 @@ export function closeModelIoLogDb() {
 }
 
 export function isModelIoLogEnabled() {
-	return isModelIoLogConfigured()
+	try {
+		return isModelIoLogConfigured()
+	} catch {
+		return false
+	}
 }
 
 export function modelIoLogDbPath() {
-	return configuredModelIoLogDbPath() || join(dataRoot(), "model-io.sqlite")
+	try {
+		return configuredModelIoLogDbPath() || join(dataRoot(), "model-io.sqlite")
+	} catch {
+		return join(process.env.PINANO_HOME || "/tmp/pinano", "data", "model-io.sqlite")
+	}
 }
 
 function nowIso() {

@@ -217,9 +217,9 @@ export async function listProviders() {
 }
 
 /**
- * Resolve an API key for `provider`. Falls back to providers.<provider>.apiKey
- * in config/service.json when no credential is on disk. Returns undefined if
- * neither is available.
+ * Resolve an API key for `provider`. Falls back to
+ * settings.providers.<provider>.apiKey when no credential is on disk. Returns
+ * undefined if neither is available.
  *
  * @param {string} provider
  * @returns {Promise<string | undefined>}
@@ -253,7 +253,7 @@ export function detectedEnvApiKeys(env = process.env) {
 
 /**
  * Returns true once at least one usable credential is configured in Pinano's
- * credential store or service config. Environment variables intentionally do
+ * credential store or merged settings. Environment variables intentionally do
  * not count here: onboarding should still offer to import them into Pinano.
  *
  * @returns {Promise<boolean>}

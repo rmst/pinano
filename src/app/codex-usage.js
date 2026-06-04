@@ -45,8 +45,8 @@ export { getFreshCodexCredential } from "./model-auth.js"
 
 /** @param {import("./settings.js").Settings | undefined} settings */
 export function codexUsageBaseUrlFromSettings(settings) {
-	if (!settings?.model) return undefined
-	const model = resolveModel(settings.model, { models: settings.models })
+	if (!settings?.defaultModel) return undefined
+	const model = resolveModel(settings.defaultModel, { providers: settings.providers })
 	return model.provider === "openai-codex" ? model.baseUrl : undefined
 }
 

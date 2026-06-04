@@ -12,7 +12,7 @@ import { ensureProjectContextMessage, isProjectContextMessage, loadProjectContex
 import { compact, summarizeMessages } from "./compaction.js"
 import { systemPromptFor } from "./agent-factory.js"
 import { toolProfileForModel } from "./model-instructions.js"
-import { refreshModelFromRegistry, resolveModel } from "./models.js"
+import { modelRef, refreshModelFromRegistry, resolveModel } from "./models.js"
 import { branchSession, createSession, loadSessionPreview, openSession, sessionPreviewFromMessages } from "./session-store.js"
 import { sessionActivityAt } from "./session-activity.js"
 import { deriveSessionRunState, startedToolsWithoutDurableResult, synthesizeUnknownToolResultsForStartedTools } from "./session-run-state.js"
@@ -334,7 +334,7 @@ function sessionInfoFromEntry(entry) {
 function sessionConfigForAgent(agent, extra = {}) {
 	return {
 		version: 1,
-		modelRef: agent.state.model?.id,
+		modelRef: agent.state.model ? modelRef(agent.state.model) : undefined,
 		model: agent.state.model,
 		baseUrl: agent.state.model?.baseUrl,
 		thinkingLevel: agent.state.thinkingLevel,
@@ -384,7 +384,7 @@ export class SessionRuntime {
 	 * @param {() => number} options.getEventSeq
 	 * @param {() => number} options.getViewEpoch
 	 * @param {() => number} options.bumpViewEpoch
-	 * @param {() => { models?: Record<string, any> }} [options.getSettings]
+	 * @param {() => { providers?: Record<string, any> }} [options.getSettings]
 	 * @param {{ span?: (name: string, args?: Record<string, any>) => (extraArgs?: Record<string, any>) => void }} [options.diagnostics]
 	 */
 	constructor(options) {
@@ -833,7 +833,7 @@ export class SessionRuntime {
 		if (!sessionPropertiesMaintenanceExchangeActive(ctx?.context?.messages ?? [])) return undefined
 		const ref = this.agent.state.model?.maintenanceModelRef
 		if (!ref) return undefined
-		return resolveModel(ref, { models: this.getSettings?.()?.models })
+		return resolveModel(ref, { providers: this.getSettings?.()?.providers })
 	}
 
 	automatedMaintenanceFollowUp(ctx) {
@@ -1571,10 +1571,10 @@ export class RuntimeManager {
 		this.upsertSession(opened.session, opened.id)
 		const runtime = this.createRuntime(opened.session, opened.id)
 		const settings = this.opts.getSettings?.()
-		if (settings?.model) {
+		if (settings?.defaultModel) {
 			const previousModel = runtime.agent.state.model
 			const previousPrompt = runtime.agent.state.systemPrompt
-			runtime.agent.state.model = resolveModel(settings.model, { models: settings.models })
+			runtime.agent.state.model = resolveModel(settings.defaultModel, { providers: settings.providers })
 			if (previousPrompt === systemPromptFor(initial.cwd, previousModel)) runtime.agent.state.systemPrompt = systemPromptFor(initial.cwd, runtime.agent.state.model)
 		}
 		const thinkingLevel = normalizeReasoningLevel(settings?.thinkingLevel)

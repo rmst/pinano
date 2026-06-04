@@ -8,7 +8,7 @@ export { CancellableLoader } from "./components/cancellable-loader.js";
 export { Editor } from "./components/editor.js";
 export { Image } from "./components/image.js";
 export { Input } from "./components/input.js";
-export { Loader } from "./components/loader.js";
+export { Loader, LOADER_SPINNER_FRAMES, LOADER_SPINNER_INTERVAL_MS } from "./components/loader.js";
 export { Markdown } from "./components/markdown.js";
 export { SelectList } from "./components/select-list.js";
 export { SettingsList } from "./components/settings-list.js";

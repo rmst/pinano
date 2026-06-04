@@ -12,6 +12,8 @@ import {
 	Editor,
 	Input,
 	Loader,
+	LOADER_SPINNER_FRAMES,
+	LOADER_SPINNER_INTERVAL_MS,
 	ProcessTerminal,
 	RetainedComponent,
 	Spacer,
@@ -45,8 +47,8 @@ import { promptForInput } from "./components/prompt-input.js"
 import { pickHistoryTarget } from "./components/history-selector.js"
 import { API_KEY_PROVIDER_INFOS, deleteCredential, detectedEnvApiKeys, getCredential, hasConfiguredProviderCredentials, listProviders, setCredential } from "./auth.js"
 import { loginCodex } from "../ai-apis/codex/index.js"
-import { availableModelEntries, findModelEntry, modelRef, modelRefMatches } from "./models.js"
-import { loadSettings, messageRenderOptionsFromSettings, updateSetting } from "./settings.js"
+import { availableModelEntries, canonicalModelRef, findModelEntry, modelRef, modelRefMatches, parseModelRef } from "./models.js"
+import { defaultModelRef, loadSettings, messageRenderOptionsFromSettings, updateSetting, updateSettings } from "./settings.js"
 import { authFilePath } from "./paths.js"
 import { parseBashShortcut } from "./bash-shortcut.js"
 import { readClipboardImage } from "./clipboard-image.js"
@@ -181,11 +183,26 @@ function renderKeyHints(hints, width) {
 
 /** @param {import("./settings.js").Settings | undefined} settings */
 export function overviewModelLabel(settings) {
-	const model = settings?.model
+	const model = settings ? defaultModelRef(settings) : ""
 	if (!model) return ""
-	const entry = findModelEntry(model, { models: settings.models })
-	const provider = entry?.provider ?? (model.startsWith("openai-codex/") ? "openai-codex" : undefined)
-	return modelDisplayLabel({ id: entry?.id ?? model, provider }, entry)
+	const entry = findModelEntry(settings.defaultModel, { providers: settings.providers })
+	const parsed = parseModelRef(settings.defaultModel)
+	return modelDisplayLabel({ id: entry?.id ?? parsed.id, provider: entry?.provider ?? parsed.provider }, entry)
+}
+
+/** @param {import("./settings.js").Settings | undefined} settings */
+function currentDefaultModelRef(settings) {
+	return settings ? defaultModelRef(settings) : ""
+}
+
+/**
+ * @param {string} ref
+ * @param {import("./settings.js").Settings | undefined} [settings]
+ */
+async function updateDefaultModel(ref, settings = undefined) {
+	const current = settings ?? await loadSettings()
+	const currentProvider = parseModelRef(current.defaultModel).provider
+	return updateSettings({ defaultModel: canonicalModelRef(ref, { provider: currentProvider, providers: current.providers }) })
 }
 
 /** @param {import("./settings.js").Settings | undefined} settings */
@@ -345,7 +362,7 @@ export function streamingStatusBase(message) {
 const DEFERRED_FOLDED_GROUP_LIMIT = 6
 
 export class AgentTable {
-	/** @param {{ cwd?: string, getMaxLines?: (width: number) => number, getEmptyText?: () => string, getEmptyLines?: () => Array<string | { text: string, highlight?: boolean }> }} [options] */
+	/** @param {{ cwd?: string, getMaxLines?: (width: number) => number, getEmptyText?: () => string, getEmptyLines?: () => Array<string | { text: string, highlight?: boolean }>, spinnerFrame?: () => string }} [options] */
 	constructor(options = {}) {
 		/** @type {any[]} */
 		this.sessions = []
@@ -361,6 +378,7 @@ export class AgentTable {
 		this.getMaxLines = options.getMaxLines
 		this.getEmptyText = options.getEmptyText
 		this.getEmptyLines = options.getEmptyLines
+		this.spinnerFrame = options.spinnerFrame ?? (() => "✽")
 		this.cwd = resolve(options.cwd ?? process.cwd())
 	}
 
@@ -698,6 +716,21 @@ export class AgentTable {
 	}
 
 	/** @param {any} session */
+	isRunningSession(session) {
+		const lifecycleState = this.lifecycleStateFor(session)
+		const runtimeState = session.runtimeState || session.runStatus || "idle"
+		return lifecycleState === "running" || runtimeState === "running"
+	}
+
+	hasRunningSession() {
+		return this.sessions.some((session) => this.isRunningSession(session))
+	}
+
+	hasVisibleRunningSession() {
+		return this.rows().some((entry) => entry.type !== "more" && this.isRunningSession(entry))
+	}
+
+	/** @param {any} session */
 	groupFor(session) {
 		const state = this.stateFor(session)
 		if (state === "needs_input") return "Needs input"
@@ -715,7 +748,7 @@ export class AgentTable {
 		const lifecycleState = this.lifecycleStateFor(session)
 		const runtimeState = session.runtimeState || session.runStatus || "idle"
 		if (lifecycleState === "queued") return theme.cyan("◌")
-		if (lifecycleState === "running" || runtimeState === "running") return theme.cyan("✽")
+		if (this.isRunningSession(session)) return theme.cyan(this.spinnerFrame() || "✽")
 		if (runtimeState === "failed") return theme.red("✖")
 		if (runtimeState === "aborted" || runtimeState === "interrupted" || runtimeState === "paused") return theme.yellow("■")
 		return theme.gray("∙")
@@ -1136,9 +1169,9 @@ async function ensureConfiguredDefaultModel({ setDefaultModel, onSettingsChanged
 	const settings = await loadSettings()
 	const models = await availableModelEntries()
 	if (models.length === 0) return settings
-	if (models.some((entry) => modelRefMatches(entry, settings.model))) return settings
+	if (models.some((entry) => modelRefMatches(entry, currentDefaultModelRef(settings)))) return settings
 	const next = modelRef(models[0])
-	const updated = await setDefaultModel?.(next) ?? await updateSetting("model", next)
+	const updated = await setDefaultModel?.(next) ?? await updateDefaultModel(next, settings)
 	await onSettingsChanged?.(updated)
 	return updated
 }
@@ -1336,7 +1369,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 				provider,
 				label: `Remove ${providerLabel(provider)} API key`,
 				value: "saved",
-				description: "Deletes the stored API key from Pinano. This does not change environment variables or service.json.",
+				description: "Deletes the stored API key from Pinano. This does not change environment variables or settings provider keys.",
 			})
 		}
 
@@ -1381,7 +1414,8 @@ export class CredentialsSettingsModal extends RetainedComponent {
 			onSettingsChanged: this.options.onSettingsChanged,
 		})
 		await this.reload()
-		this.setStatus(message + (settings?.model ? ` · default model: ${settings.model}` : ""))
+		const model = currentDefaultModelRef(settings)
+		this.setStatus(message + (model ? ` · default model: ${model}` : ""))
 	}
 
 	async startChatGptOAuth() {
@@ -1686,7 +1720,7 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 		const settings = await loadSettings()
 		const choice = await pickFromOverlay(ctx.tui, [
 			{ value: "credentials", label: "credentials", description: "manage ChatGPT subscription OAuth and API keys" },
-			{ value: "model", label: `model: ${settings.model}`, description: "default model id for new sessions" },
+			{ value: "model", label: `model: ${currentDefaultModelRef(settings)}`, description: "default model for new sessions" },
 			{ value: "thinkingLevel", label: `reasoning: ${reasoningLevelLabel(settings.thinkingLevel)}`, description: "default reasoning effort for new sessions" },
 			{ value: "autocompactThreshold", label: `autocompactThreshold: ${settings.autocompactThreshold}`, description: "fraction of context window before auto-compaction" },
 			{ value: "scopedModelIds", label: `scopedModelIds: ${settings.scopedModelIds.length} model(s)`, description: "model shortlist shown by the model selector" },
@@ -1706,10 +1740,11 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 				write("no authenticated models available; open /settings and choose credentials first")
 				continue
 			}
-			const rows = rowsForModels(models, { currentId: settings.model, scopedModelIds: settings.scopedModelIds })
-			const chosen = await pickModel(ctx, rows, { initialSelectedValue: settings.model, title: "Default model", subtitle: "Pick the default model for new sessions." }) ?? ""
+			const current = currentDefaultModelRef(settings)
+			const rows = rowsForModels(models, { currentId: current, scopedModelIds: settings.scopedModelIds })
+			const chosen = await pickModel(ctx, rows, { initialSelectedValue: current, title: "Default model", subtitle: "Pick the default model for new sessions." }) ?? ""
 			if (!chosen) continue
-			const updated = await setDefaultModel?.(chosen) ?? await updateSetting("model", chosen)
+			const updated = await setDefaultModel?.(chosen) ?? await updateDefaultModel(chosen, settings)
 			await onSettingsChanged?.(updated)
 			write(`default model → ${chosen}`)
 			continue
@@ -1775,7 +1810,7 @@ async function reloadUiSettingsAndAuth({ notify, onSettingsChanged, refreshAuthC
 	const settings = await loadSettings()
 	await onSettingsChanged?.(settings)
 	await refreshAuthCache?.()
-	notify(`reloaded — model=${settings.model} reasoning=${reasoningLevelLabel(settings.thinkingLevel)}`)
+	notify(`reloaded — model=${currentDefaultModelRef(settings)} reasoning=${reasoningLevelLabel(settings.thinkingLevel)}`)
 }
 
 function openUrlInBrowser(url) {
@@ -2523,7 +2558,7 @@ export class Chat {
 					this.onSettingsChanged?.(settings)
 					if (this.snapshot) this.update(this.snapshot, { rebuildTranscript: true })
 				},
-				setDefaultModel: async (model) => (await this.client.setDefaultModel?.(model))?.settings ?? updateSetting("model", model),
+				setDefaultModel: async (model) => (await this.client.setDefaultModel?.(model))?.settings ?? updateDefaultModel(model),
 				setDefaultReasoning: async (level) => (await this.client.setDefaultReasoning?.(level))?.settings ?? updateSetting("thinkingLevel", /** @type {any} */ (level)),
 				refreshAuthCache: () => this.refreshAuthCache(),
 			})
@@ -3043,8 +3078,11 @@ export async function runServiceTuiMode(options) {
 	let promptLabel = /** @type {PromptLabel | undefined} */ (undefined)
 	let overviewModelLine = /** @type {OverviewModelLine | undefined} */ (undefined)
 	let overviewUsageStatus = /** @type {{ text: string, tone: "normal" | "warn" | "error" } | undefined} */ (undefined)
+	let overviewSpinnerFrameIndex = 0
+	const overviewSpinnerFrame = () => LOADER_SPINNER_FRAMES[overviewSpinnerFrameIndex] ?? "✽"
 	const table = new AgentTable({
 		cwd: options.cwd,
+		spinnerFrame: overviewSpinnerFrame,
 		getMaxLines: (width) => tui.terminal.rows
 			- overviewSpacerLines
 			- overviewKeyHintLines
@@ -3087,8 +3125,36 @@ export async function runServiceTuiMode(options) {
 		peeking: Boolean(table.peekSessionId && table.selected()?.id === table.peekSessionId),
 		hasText: editor.getText().trim().length > 0,
 	}))
+	let staleRuntimeActive = false
+	let overviewMounted = false
+	/** @type {ReturnType<typeof setInterval> | undefined} */
+	let overviewSpinnerTimer = undefined
+	const stopOverviewSpinner = () => {
+		if (!overviewSpinnerTimer) return
+		clearInterval(overviewSpinnerTimer)
+		overviewSpinnerTimer = undefined
+	}
+	const canAnimateOverviewSpinner = () => overviewMounted && !staleRuntimeActive && LOADER_SPINNER_FRAMES.length > 1
+	const shouldAnimateOverviewSpinner = () => canAnimateOverviewSpinner() && table.hasVisibleRunningSession()
+	const startOverviewSpinner = () => {
+		if (overviewSpinnerTimer || !shouldAnimateOverviewSpinner()) return
+		overviewSpinnerTimer = setInterval(() => {
+			if (!canAnimateOverviewSpinner()) {
+				stopOverviewSpinner()
+				return
+			}
+			overviewSpinnerFrameIndex = (overviewSpinnerFrameIndex + 1) % LOADER_SPINNER_FRAMES.length
+			tui.requestRender()
+		}, LOADER_SPINNER_INTERVAL_MS)
+		overviewSpinnerTimer.unref?.()
+	}
+	const syncOverviewSpinner = () => {
+		if (shouldAnimateOverviewSpinner()) startOverviewSpinner()
+		else stopOverviewSpinner()
+	}
 	const requestShellRender = (force = false) => {
 		editor.invalidate()
+		syncOverviewSpinner()
 		tui.requestRender(force)
 	}
 	const overviewPromptAttachmentsForText = (text) => promptAttachmentsForText(overviewPromptImages, text)
@@ -3117,7 +3183,6 @@ export async function runServiceTuiMode(options) {
 	let messageRenderOptions = messageRenderOptionsFromSettings(settings)
 	const doubleEscape = new DoubleEscapeTracker()
 	const textDoubleEscape = new DoubleEscapeTracker()
-	let staleRuntimeActive = false
 	let staleRuntimeDesired = /** @type {any} */ (null)
 	let staleRuntimeRouteArgs = /** @type {string[]} */ ([])
 	let reexecInProgress = false
@@ -3257,6 +3322,7 @@ export async function runServiceTuiMode(options) {
 		exiting = true
 		scheduleRowsRefresh.cancel()
 		scheduleCodexUsageRefresh.cancel()
+		stopOverviewSpinner()
 		currentChat?.dispose()
 		if (unsubscribe) {
 			let detachTimer
@@ -3277,12 +3343,19 @@ export async function runServiceTuiMode(options) {
 	}
 
 	const mountOverview = () => {
+		overviewMounted = true
 		root.addChild(table)
 		root.addChild(new Spacer(1))
 		root.addChild(overviewKeyHints)
 		root.addChild(promptLabel)
 		root.addChild(editor)
 		root.addChild(overviewModelLine)
+		syncOverviewSpinner()
+	}
+
+	const unmountOverview = () => {
+		overviewMounted = false
+		stopOverviewSpinner()
 	}
 
 	const showAgents = (showOptions = {}) => {
@@ -3290,6 +3363,7 @@ export async function runServiceTuiMode(options) {
 		const selectSessionId = showOptions.selectSessionId ?? currentChat?.sessionId
 		currentChat?.dispose()
 		currentChat = undefined
+		unmountOverview()
 		root.clear()
 		mountOverview()
 		if (selectSessionId) table.selectSession(selectSessionId)
@@ -3305,6 +3379,7 @@ export async function runServiceTuiMode(options) {
 		webEnabled = settings.web === true
 		messageRenderOptions = messageRenderOptionsFromSettings(settings)
 		currentChat = new Chat({ tui, client: options.client, sessionId: id, detach: () => showAgents({ selectSessionId: id }), exit, stderrCapture: options.stderrCapture, onClientError: showStaleRuntime, messageRenderOptions, webEnabled, onSettingsChanged: applyOverviewSettings, onCodexUsage: (payload) => applyCodexUsage(payload), getCodexUsageBaseUrl: (model) => codexUsageBaseUrlForModel(model, settings), refreshGlobalAuth: refreshOverviewAuth })
+		unmountOverview()
 		root.clear()
 		root.addChild(currentChat.root)
 		tui.setFocus(currentChat.editor)
@@ -3380,6 +3455,7 @@ export async function runServiceTuiMode(options) {
 			}
 			const done = () => showAgents()
 			const { component, focus } = create(done)
+			unmountOverview()
 			root.clear()
 			root.addChild(component)
 			tui.setFocus(focus)
@@ -3406,7 +3482,7 @@ export async function runServiceTuiMode(options) {
 		if (currentChat) currentChat.webEnabled = webEnabled
 		requestShellRender()
 	}
-	const setOverviewDefaultModel = async (model) => (await options.client.setDefaultModel?.(model))?.settings ?? updateSetting("model", model)
+	const setOverviewDefaultModel = async (model) => (await options.client.setDefaultModel?.(model))?.settings ?? updateDefaultModel(model, settings)
 	const openCredentialsSettingsPage = async (credentialsOptions = {}) => {
 		const previousRoute = currentRoute
 		currentRoute = settingsCredentialsRoute
@@ -3431,10 +3507,10 @@ export async function runServiceTuiMode(options) {
 				return
 			}
 			const rows = rowsForModels(models, {
-				currentId: settings.model,
+				currentId: currentDefaultModelRef(settings),
 				scopedModelIds: settings.scopedModelIds,
 			})
-			chosen = await pickModel(overviewCommandCtx, rows, { initialSelectedValue: settings.model, title: "Default model", subtitle: "Pick the default model for new sessions." }) ?? ""
+			chosen = await pickModel(overviewCommandCtx, rows, { initialSelectedValue: currentDefaultModelRef(settings), title: "Default model", subtitle: "Pick the default model for new sessions." }) ?? ""
 			if (!chosen) return
 		}
 		const updated = await setOverviewDefaultModel(chosen)
@@ -3847,6 +3923,7 @@ export async function runServiceTuiMode(options) {
 	if (startupDone && startupPage) {
 		await startupDone
 		startupPage.dispose()
+		unmountOverview()
 		root.clear()
 		mountOverview()
 		tui.setFocus(editor)
