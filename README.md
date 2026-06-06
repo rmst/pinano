@@ -1,8 +1,7 @@
 # Pinano
 
 <p>
-<a href="#pinano"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/install-setup-scripted-640w.gif" alt="Pinano install and setup demo" width="49%"></a>
-<a href="#pinano"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-640w.gif" alt="Pinano session overview and running agent demo" width="49%"></a>
+<a href="#pinano"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-960w.gif" alt="Pinano session overview and running agent demo" width="100%"></a>
 </p>
 
 Pinano is an interactive AI coding assistant for the terminal with an ergonomic agent-view UI comparable to Claude Code's [Agent View](https://code.claude.com/docs/en/agent-view). Pinano works very well with a ChatGPT/Codex subscription. Pinano exposes the same system prompt and tools like the official Codex CLI, so agent performance with the flagship GPT-5.x models should be just as good. Other APIs are also supported, including local models via `llama.cpp`.
@@ -29,6 +28,15 @@ git clone https://github.com/rmst/pinano
 </details>
 
 On first run, Pinano opens the model provider credentials view when no provider is configured. Pinano is currently optimized for use with a ChatGPT subscription.
+
+<details>
+<summary>Install and first setup demo</summary>
+
+<p>
+<a href="#install"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/install-setup-scripted-960w.gif" alt="Pinano install and first setup demo" width="100%"></a>
+</p>
+
+</details>
 
 API keys are also supported. Pinano can import supported API keys from the launch environment. Deployment-level API keys and other settings can also be configured declaratively; see [settings](docs/settings.md).
 
