@@ -18,14 +18,56 @@ export class StreamInactivityTimeoutError extends Error {
 	}
 }
 
-async function readWithInactivityTimeout(reader, timeoutMs) {
-	if (!timeoutMs) return reader.read()
+export class StreamEventTimeoutError extends Error {
+	constructor(timeoutMs, phase) {
+		super(`No ${phase === "stream_start" ? "first " : ""}SSE event received within ${timeoutMs}ms`)
+		this.name = "StreamEventTimeoutError"
+		this.timeoutMs = timeoutMs
+		this.phase = phase
+	}
+}
+
+function positiveTimeoutMs(value) {
+	const n = Number(value ?? 0)
+	return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+function eventDeadline(timeoutMs, phase) {
+	return timeoutMs > 0 ? { at: Date.now() + timeoutMs, timeoutMs, phase } : null
+}
+
+function expiredEventDeadline(deadline) {
+	if (!deadline || Date.now() < deadline.at) return null
+	return new StreamEventTimeoutError(deadline.timeoutMs, deadline.phase)
+}
+
+function nextTimeout(inactivityTimeoutMs, deadline) {
+	const choices = []
+	if (inactivityTimeoutMs > 0) {
+		choices.push({
+			timeoutMs: inactivityTimeoutMs,
+			error: () => new StreamInactivityTimeoutError(inactivityTimeoutMs),
+		})
+	}
+	if (deadline) {
+		choices.push({
+			timeoutMs: Math.max(0, deadline.at - Date.now()),
+			error: () => new StreamEventTimeoutError(deadline.timeoutMs, deadline.phase),
+		})
+	}
+	if (choices.length === 0) return null
+	return choices.reduce((best, choice) => choice.timeoutMs < best.timeoutMs ? choice : best)
+}
+
+async function readWithTimeouts(reader, inactivityTimeoutMs, deadline) {
+	const timeout = nextTimeout(inactivityTimeoutMs, deadline)
+	if (!timeout) return reader.read()
 	let timer
 	try {
 		return await Promise.race([
 			reader.read(),
 			new Promise((_, reject) => {
-				timer = setTimeout(() => reject(new StreamInactivityTimeoutError(timeoutMs)), timeoutMs)
+				timer = setTimeout(() => reject(timeout.error()), timeout.timeoutMs)
 			}),
 		])
 	} finally {
@@ -35,15 +77,23 @@ async function readWithInactivityTimeout(reader, timeoutMs) {
 
 export async function* parseSSE(stream, options = {}) {
 	const reader = stream.getReader()
-	const inactivityTimeoutMs = Number(options.inactivityTimeoutMs ?? 0)
+	const inactivityTimeoutMs = positiveTimeoutMs(options.inactivityTimeoutMs)
+	const firstEventTimeoutMs = positiveTimeoutMs(options.firstEventTimeoutMs)
+	const eventInactivityTimeoutMs = positiveTimeoutMs(options.eventInactivityTimeoutMs)
 	let buffer = new Uint8Array(0)
+	let semanticEventDeadline = eventDeadline(firstEventTimeoutMs, "stream_start")
+	const markSemanticEvent = () => {
+		semanticEventDeadline = eventDeadline(eventInactivityTimeoutMs, "stream_event")
+	}
 	try {
 		while (true) {
 			let chunk
 			try {
-				chunk = await readWithInactivityTimeout(reader, inactivityTimeoutMs > 0 ? inactivityTimeoutMs : 0)
+				const expired = expiredEventDeadline(semanticEventDeadline)
+				if (expired) throw expired
+				chunk = await readWithTimeouts(reader, inactivityTimeoutMs, semanticEventDeadline)
 			} catch (error) {
-				if (error?.name === "StreamInactivityTimeoutError") {
+				if (error?.name === "StreamInactivityTimeoutError" || error?.name === "StreamEventTimeoutError") {
 					try { await reader.cancel(error) } catch {}
 				}
 				throw error
@@ -60,11 +110,13 @@ export async function* parseSSE(stream, options = {}) {
 				const rawEvent = DECODER.decode(eventBytes)
 				const data = extractData(rawEvent)
 				if (data === null || data === "[DONE]") {
+					if (data === "[DONE]") markSemanticEvent()
 					options.onEvent?.({ rawEvent, data })
 					continue
 				}
 				try {
 					const parsed = JSON.parse(data)
+					markSemanticEvent()
 					options.onEvent?.({ rawEvent, data, parsed })
 					yield parsed
 				} catch {
@@ -80,10 +132,12 @@ export async function* parseSSE(stream, options = {}) {
 			if (tail.trim().length > 0) {
 				const data = extractData(tail)
 				if (data === "[DONE]") {
+					markSemanticEvent()
 					options.onEvent?.({ rawEvent: tail, data })
 				} else if (data) {
 					try {
 						const parsed = JSON.parse(data)
+						markSemanticEvent()
 						options.onEvent?.({ rawEvent: tail, data, parsed })
 						yield parsed
 					} catch {

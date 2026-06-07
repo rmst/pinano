@@ -23,7 +23,7 @@ import {
 	formatCodexUsageSummary,
 } from "./codex-usage.js"
 import { authenticateRequestParts } from "./http-auth.js"
-import { dataRoot, legacyConfigRoot } from "./paths.js"
+import { dataRoot } from "./paths.js"
 import { openServiceClient } from "./service-mode.js"
 import { RuntimeManager } from "./server-runtime.js"
 import { WebRouter } from "./web-router.js"
@@ -93,14 +93,6 @@ async function getOrCreateWebToken() {
 	try {
 		const existing = (await readFile(path, "utf-8")).trim()
 		if (existing.length >= MIN_TOKEN_LENGTH) return existing
-	} catch {}
-	try {
-		const existing = (await readFile(join(legacyConfigRoot(), "web-token"), "utf-8")).trim()
-		if (existing.length >= MIN_TOKEN_LENGTH) {
-			await mkdir(dirname(path), { recursive: true })
-			await writeFile(path, existing, { mode: 0o600 })
-			return existing
-		}
 	} catch {}
 	const token = randomUUID()
 	await mkdir(dirname(path), { recursive: true })

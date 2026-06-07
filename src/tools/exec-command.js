@@ -55,10 +55,10 @@ export function createExecCommandTool(cwd) {
 			"Execute a shell command. If the command is still running after yield_time_ms, returns a session_id; poll or interact with that session using write_stdin. Use interactive: 'pipe' when stdin is needed.",
 		parameters: execCommandSchema,
 		executionMode: "sequential",
-		async execute(_id, args, signal) {
+		async execute(id, args, signal) {
 			if (!args || typeof args.cmd !== "string") throw new Error("cmd is required")
 			if (signal?.aborted) throw new Error("Operation aborted")
-			const session = processSessionManager.start(cwd, args)
+			const session = processSessionManager.start(cwd, args, { toolCallId: id })
 			const abort = () => session.dispose("kill")
 			signal?.addEventListener("abort", abort, { once: true })
 			try {

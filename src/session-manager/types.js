@@ -18,7 +18,7 @@
  */
 
 /**
- * @typedef {{ source: string, cwd?: string, loadedAt?: string, disabled?: boolean, files: Array<{ path: string, scopeDir?: string, content: string, hash?: string }> }} ContextLoad
+ * @typedef {{ source: string, cwd?: string, loadedAt?: string, disabled?: boolean, files: Array<{ path: string, scopeDir?: string, identityPath?: string, content: string, hash?: string }> }} ContextLoad
  * @typedef {BaseEntry & { type: "message", message: import("../agent-core/types.js").AgentMessage, contextLoad?: ContextLoad }} MessageEntry
  * @typedef {BaseEntry & { type: "label", targetId: string, label?: string, contextLoad?: ContextLoad }} LabelEntry
  * @typedef {BaseEntry & { type: "custom", customType: string, data?: unknown, contextLoad?: ContextLoad }} CustomEntry

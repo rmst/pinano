@@ -2,12 +2,12 @@ import { readFileSync } from "node:fs"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute } from "node:path"
 
-import { environmentsConfigPath, legacyEnvironmentsConfigPath } from "./paths.js"
+import { environmentsConfigPath } from "./paths.js"
 import { configuredWorkerSpec } from "./service-config.js"
 import { parseWorkerSpec } from "./worker-launchers.js"
 
 const ENVIRONMENT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
-const DEFAULT_SANDBOX_PATHS = ["."]
+const DEFAULT_MOUNT_PATHS = []
 
 function defaultLocalSandbox() {
 	return process.platform === "darwin" || process.platform === "linux"
@@ -28,7 +28,7 @@ function readEnvironmentsConfigFile(path) {
 }
 
 function readEnvironmentsConfig() {
-	return readEnvironmentsConfigFile(environmentsConfigPath()) ?? readEnvironmentsConfigFile(legacyEnvironmentsConfigPath())
+	return readEnvironmentsConfigFile(environmentsConfigPath())
 }
 
 /** @param {string} path */
@@ -38,15 +38,13 @@ async function readEnvironmentsConfigFileForWrite(path) {
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("environments.json must contain an object")
 		return parsed
 	} catch (err) {
-		if (err?.code === "ENOENT") return undefined
+		if (err?.code === "ENOENT") return {}
 		throw err
 	}
 }
 
 async function readEnvironmentsConfigForWrite() {
-	return await readEnvironmentsConfigFileForWrite(environmentsConfigPath())
-		?? await readEnvironmentsConfigFileForWrite(legacyEnvironmentsConfigPath())
-		?? {}
+	return readEnvironmentsConfigFileForWrite(environmentsConfigPath())
 }
 
 /** @param {string} id */
@@ -83,16 +81,74 @@ function normalizeTarget(id, value) {
 	return parseTargetSpec(spec, id)
 }
 
-/** @param {string} id @param {any} value */
-function normalizeSandboxPaths(id, value) {
-	const raw = Object.prototype.hasOwnProperty.call(value, "paths") ? value.paths : DEFAULT_SANDBOX_PATHS
-	if (!Array.isArray(raw) || raw.length === 0) throw new TypeError(`Environment ${id} sandbox paths must be a non-empty array`)
-	return raw.map((item, index) => {
-		if (typeof item !== "string") throw new TypeError(`Environment ${id} sandbox paths[${index}] must be a string`)
-		const path = item.trim()
-		if (!path) throw new TypeError(`Environment ${id} sandbox paths[${index}] must be a non-empty string`)
-		return path
+/** @param {any} value @param {string} field */
+function optionalBoolean(value, field) {
+	if (value === undefined || value === null) return undefined
+	if (typeof value !== "boolean") throw new TypeError(`${field} must be a boolean`)
+	return value
+}
+
+function assertOnlyFields(value, fields, context) {
+	for (const field of Object.keys(value)) {
+		if (!fields.includes(field)) throw new TypeError(`${context} field ${field} is not supported`)
+	}
+}
+
+function normalizeEnv(id, value) {
+	if (value === undefined || value === null) return undefined
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`Environment ${id} sandbox env must be an object`)
+	return Object.fromEntries(Object.entries(value).map(([name, envValue]) => {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new TypeError(`Environment ${id} sandbox env name is invalid: ${name}`)
+		if (typeof envValue !== "string") throw new TypeError(`Environment ${id} sandbox env ${name} must be a string`)
+		return [name, envValue]
+	}))
+}
+
+function normalizeExtraArgs(id, value) {
+	if (value === undefined || value === null) return undefined
+	if (!Array.isArray(value)) throw new TypeError(`Environment ${id} sandbox extraArgs must be an array`)
+	return value.map((item, index) => {
+		if (typeof item !== "string") throw new TypeError(`Environment ${id} sandbox extraArgs[${index}] must be a string`)
+		const arg = item.trim()
+		if (!arg) throw new TypeError(`Environment ${id} sandbox extraArgs[${index}] must be a non-empty string`)
+		return arg
 	})
+}
+
+function normalizeMountPath(id, item, index, type) {
+	if (typeof item === "string") {
+		const path = item.trim()
+		if (!path) throw new TypeError(`Environment ${id} sandbox mountPaths[${index}] must be a non-empty string`)
+		return path
+	}
+	if (!item || typeof item !== "object" || Array.isArray(item)) {
+		throw new TypeError(`Environment ${id} sandbox mountPaths[${index}] must be a string or object`)
+	}
+	assertOnlyFields(item, ["from", "to", "readOnly"], `Environment ${id} sandbox mountPaths[${index}]`)
+	const from = optionalString(item.from, `Environment ${id} sandbox mountPaths[${index}].from`)
+	if (!from) throw new TypeError(`Environment ${id} sandbox mountPaths[${index}].from is required`)
+	const to = optionalString(item.to, `Environment ${id} sandbox mountPaths[${index}].to`)
+	if (to && type !== "container") {
+		if (from !== to) throw new TypeError(`Environment ${id} sandbox mountPaths[${index}].to is only valid with sandbox type "container" unless it matches from`)
+		if (!isAbsolute(from)) throw new TypeError(`Environment ${id} sandbox mountPaths[${index}].to on a native sandbox requires an absolute from path`)
+	}
+	if (to && !isAbsolute(to)) throw new TypeError(`Environment ${id} sandbox mountPaths[${index}].to must be an absolute path`)
+	const readOnly = optionalBoolean(item.readOnly, `Environment ${id} sandbox mountPaths[${index}].readOnly`)
+	return {
+		from,
+		...(to && type === "container" ? { to } : {}),
+		...(readOnly === true ? { readOnly: true } : {}),
+	}
+}
+
+/** @param {string} id @param {any} value @param {string} type */
+function normalizeMountPaths(id, value, type) {
+	const hasMountPaths = Object.prototype.hasOwnProperty.call(value, "mountPaths")
+	const hasLegacyPaths = Object.prototype.hasOwnProperty.call(value, "paths")
+	if (hasMountPaths && hasLegacyPaths) throw new TypeError(`Environment ${id} sandbox cannot specify both mountPaths and legacy paths`)
+	const raw = hasMountPaths ? value.mountPaths : hasLegacyPaths ? value.paths : DEFAULT_MOUNT_PATHS
+	if (!Array.isArray(raw)) throw new TypeError(`Environment ${id} sandbox mountPaths must be an array`)
+	return raw.map((item, index) => normalizeMountPath(id, item, index, type))
 }
 
 /** @param {string} id @param {any} value @param {ReturnType<typeof normalizeTarget>} target */
@@ -107,26 +163,39 @@ function normalizeSandbox(id, value, target) {
 	if (!sandbox || typeof sandbox !== "object" || Array.isArray(sandbox)) throw new TypeError(`Environment ${id} sandbox must be an object`)
 	const type = optionalString(sandbox.type, `Environment ${id} sandbox type`)
 	if (type === "none") {
-		if (Object.prototype.hasOwnProperty.call(sandbox, "paths")) throw new TypeError(`Environment ${id} sandbox paths require a sandboxed type`)
+		for (const field of ["mountPaths", "paths", "useSessionWd", "env", "network", "extraArgs"]) {
+			if (Object.prototype.hasOwnProperty.call(sandbox, field)) throw new TypeError(`Environment ${id} sandbox ${field} requires a sandboxed type`)
+		}
 		return { type: "none" }
 	}
+	const mountPaths = normalizeMountPaths(id, sandbox, type)
+	const useSessionWd = optionalBoolean(sandbox.useSessionWd, `Environment ${id} sandbox useSessionWd`) ?? true
 	if (type === "native") {
-		for (const field of ["image", "container", "engine"]) {
+		for (const field of ["image", "container", "engine", "env", "network", "extraArgs"]) {
 			if (Object.prototype.hasOwnProperty.call(sandbox, field)) throw new TypeError(`Environment ${id} sandbox ${field} is only valid with sandbox type "container"`)
 		}
-		return { type: "native", paths: normalizeSandboxPaths(id, sandbox) }
+		return { type: "native", useSessionWd, mountPaths }
 	}
 	if (type !== "container") throw new TypeError(`Environment ${id} sandbox type must be "container", "native", or "none"`)
 	const image = optionalString(sandbox.image, `Environment ${id} sandbox image`)
 	const container = optionalString(sandbox.container, `Environment ${id} sandbox container`)
 	const engine = optionalString(sandbox.engine, `Environment ${id} sandbox engine`)
+	const env = normalizeEnv(id, sandbox.env)
+	const network = optionalString(sandbox.network, `Environment ${id} sandbox network`)
+	const extraArgs = normalizeExtraArgs(id, sandbox.extraArgs)
 	if (image && container) throw new TypeError(`Environment ${id} sandbox cannot specify both image and container`)
+	if (container && network) throw new TypeError(`Environment ${id} sandbox network is only valid for Pinano-managed containers`)
+	if (container && extraArgs?.length) throw new TypeError(`Environment ${id} sandbox extraArgs are only valid for Pinano-managed containers`)
 	return {
 		type: "container",
 		...(image ? { image } : {}),
 		...(container ? { container } : {}),
 		...(engine ? { engine } : {}),
-		paths: normalizeSandboxPaths(id, sandbox),
+		useSessionWd,
+		mountPaths,
+		...(env ? { env } : {}),
+		...(network ? { network } : {}),
+		...(extraArgs?.length ? { extraArgs } : {}),
 	}
 }
 
@@ -166,13 +235,13 @@ function normalizeLegacyWorkerEnvironment(id, value, options) {
 	if (image !== undefined && parsed.type !== "container") throw new TypeError(`Environment ${id} image is only valid with worker "container"`)
 	const cwd = normalizeCwd(id, value)
 	const environment = (() => {
-		if (parsed.type === "container") return { id, target: { type: "local" }, sandbox: { type: "container", ...(image ? { image } : {}), paths: DEFAULT_SANDBOX_PATHS } }
+		if (parsed.type === "container") return { id, target: { type: "local" }, sandbox: { type: "container", ...(image ? { image } : {}), useSessionWd: true, mountPaths: DEFAULT_MOUNT_PATHS } }
 		if (parsed.type === "local") return { id, target: { type: "local" }, sandbox: { type: "none" } }
-		if (parsed.type === "docker") return { id, target: { type: "local" }, sandbox: { type: "container", engine: "docker", container: parsed.container, paths: DEFAULT_SANDBOX_PATHS } }
+		if (parsed.type === "docker") return { id, target: { type: "local" }, sandbox: { type: "container", engine: "docker", container: parsed.container, useSessionWd: true, mountPaths: DEFAULT_MOUNT_PATHS } }
 		if (parsed.type === "ssh") return { id, target: { type: "ssh", host: parsed.target }, sandbox: { type: "none" } }
 		throw new TypeError(`Unsupported worker type for environment ${id}: ${parsed.type}`)
 	})()
-	if (!options.legacy && (parsed.type === "docker" || parsed.type === "ssh") && !cwd) {
+	if (!options.legacy && parsed.type === "ssh" && !cwd) {
 		throw new TypeError(`Environment ${id} with ${parsed.type} worker requires cwd`)
 	}
 	if (environmentRequiresConfiguredCwd(id, environment.target, environment.sandbox, options) && !cwd) {
@@ -298,14 +367,21 @@ export function getEnvironment(id, registry = loadEnvironmentRegistry()) {
 	return environment
 }
 
+/** Resolve persisted session environment ids against the current registry. Explicit writes still validate through getEnvironment. */
+export function resolveConfiguredEnvironmentId(id, registry = loadEnvironmentRegistry()) {
+	const requested = id ?? registry.default
+	validateEnvironmentId(requested)
+	return registry.environments[requested] ? requested : registry.default
+}
+
 function normalizeResolvedEnvironment(id, environment) {
 	return environment?.target && environment?.sandbox ? environment : normalizeEnvironment(id, environment)
 }
 
 /**
  * Choose the environment and initial cwd for a new session. Local sessions keep
- * the caller cwd by default; configured non-local environments start at their
- * own cwd so host paths are not implicitly translated into container/remote paths.
+ * the caller cwd; SSH environments start at their configured remote cwd because
+ * local caller paths cannot be translated safely.
  * @param {string} callerCwd
  * @param {ReturnType<typeof loadEnvironmentRegistry>} [registry]
  */
@@ -313,14 +389,15 @@ export function initialSessionEnvironment(callerCwd, registry = loadEnvironmentR
 	const environment = normalizeResolvedEnvironment(registry.default, getEnvironment(registry.default, registry))
 	return {
 		environmentId: environment.id,
-		cwd: environment.id === "local" && !environment.cwd ? callerCwd : environment.cwd ?? callerCwd,
+		cwd: environment.target?.type === "ssh" ? environment.cwd ?? callerCwd : callerCwd,
 	}
 }
 
 /**
  * Complete a sessionWrite patch whose environment changes but whose cwd is
- * omitted. A configured environment cwd is authoritative for that switch.
- * Re-stating the current environment does not reset a narrowed cwd.
+ * omitted. SSH targets inherit their configured cwd; local targets preserve the
+ * current session cwd. Re-stating the current environment does not reset a
+ * narrowed cwd.
  * @param {any} patch
  * @param {any} current
  * @param {ReturnType<typeof loadEnvironmentRegistry>} [registry]
@@ -329,7 +406,7 @@ export function completeEnvironmentPatch(patch, current, registry = loadEnvironm
 	if (!patch?.environmentId || Object.prototype.hasOwnProperty.call(patch, "cwd")) return patch
 	if (patch.environmentId === current?.environmentId) return patch
 	const environment = normalizeResolvedEnvironment(patch.environmentId, getEnvironment(patch.environmentId, registry))
-	return environment.cwd ? { ...patch, cwd: environment.cwd } : patch
+	return environment.target?.type === "ssh" && environment.cwd ? { ...patch, cwd: environment.cwd } : patch
 }
 
 /**
@@ -339,26 +416,27 @@ export function completeEnvironmentPatch(patch, current, registry = loadEnvironm
  * @param {ReturnType<typeof loadEnvironmentRegistry>} [registry]
  */
 export function resolveExecutionEnvironment(props, fallbackCwd, registry = loadEnvironmentRegistry()) {
-	const environmentId = props?.environmentId ?? registry.default
+	const environmentId = resolveConfiguredEnvironmentId(props?.environmentId, registry)
 	const environment = normalizeResolvedEnvironment(environmentId, getEnvironment(environmentId, registry))
 	return {
 		environmentId: environment.id,
 		target: environment.target,
 		sandbox: environment.sandbox,
-		cwd: props?.cwd ?? environment.cwd ?? fallbackCwd,
+		cwd: props?.cwd ?? (environment.target?.type === "ssh" ? environment.cwd : undefined) ?? fallbackCwd,
 	}
 }
 
 /**
- * Resolve the cwd used as the base for relative sandbox paths. Configured
- * environment cwd values are stable roots; unconfigured environments keep using
- * the caller/session initial cwd as their sandbox root.
+ * Resolve the startup directory used by sandboxed workers and as the base for
+ * relative mountPaths.
  * @param {any} props
  * @param {string} fallbackCwd
  * @param {ReturnType<typeof loadEnvironmentRegistry>} [registry]
  */
-export function resolveSandboxRootCwd(props, fallbackCwd, registry = loadEnvironmentRegistry()) {
-	const environmentId = props?.environmentId ?? registry.default
+export function resolveSessionWd(props, fallbackCwd, registry = loadEnvironmentRegistry()) {
+	const environmentId = resolveConfiguredEnvironmentId(props?.environmentId, registry)
 	const environment = normalizeResolvedEnvironment(environmentId, getEnvironment(environmentId, registry))
-	return environment.cwd ?? fallbackCwd
+	return environment.target?.type === "ssh" ? environment.cwd ?? fallbackCwd : fallbackCwd
 }
+
+export const resolveSandboxRootCwd = resolveSessionWd

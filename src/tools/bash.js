@@ -2,7 +2,7 @@ import { spawn } from "node:child_process"
 import { existsSync } from "node:fs"
 
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateTail } from "./truncate.js"
-import { envWithFallbackTools } from "./fallback-tools.js"
+import { envForToolSubprocess } from "./tool-env.js"
 
 // /bin/bash if available, else sh. We deliberately ignore $SHELL so macOS-zsh
 // (or any user-customized shell) doesn't change behavior. Non-login (-c) so we
@@ -56,11 +56,11 @@ export function createBashTool(cwd) {
 			"Execute a bash command in the working directory. Streams stdout+stderr; output is truncated from the head if it exceeds the size limit. Use the `timeout` parameter for long-running commands.",
 		parameters: bashSchema,
 		executionMode: "sequential",
-		async execute(_id, { command, timeout }, signal, onUpdate) {
+		async execute(id, { command, timeout }, signal, onUpdate) {
 			if (!existsSync(cwd)) {
 				throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`)
 			}
-			const env = envWithFallbackTools(process.env)
+			const env = envForToolSubprocess(process.env, { toolCallId: id })
 			return new Promise((resolve, reject) => {
 				if (signal?.aborted) {
 					reject(new Error("Operation aborted"))

@@ -289,8 +289,8 @@ async function main() {
 	}
 
 	const [
-		{ loadSettings },
-		{ availableModelEntries, modelEntryMatches, resolveModel },
+		{ loadSettings, pinanoStateMountFromSettings },
+		{ availableModelEntries, buildModel, modelEntryMatches, resolveModelWithProviderMetadata },
 		{ buildProjectContextMessage, isProjectContextMessage },
 		{ runPrintMode },
 		{ installStderrCapture },
@@ -333,15 +333,18 @@ async function main() {
 	const configuredModel = availableModels.find((m) => modelEntryMatches(m, settings.defaultModel))
 	const fallbackModel = configuredModel ?? availableModels[0]
 	const model = fallbackModel
-		? resolveModel(fallbackModel.id, { provider: fallbackModel.provider, providers: settings.providers })
-		: resolveModel(settings.defaultModel, { providers: settings.providers })
+		? buildModel(fallbackModel)
+		: await resolveModelWithProviderMetadata(settings.defaultModel, { providers: settings.providers })
 
-	const createAgent = ({ cwd = args.cwd, toolExecutor = undefined } = {}) => createPinanoAgent({
+	const environmentContextOptions = (currentSettings = settings) => ({
+		pinanoStateMount: pinanoStateMountFromSettings(currentSettings),
+	})
+	const createAgent = ({ cwd = args.cwd, toolExecutor = undefined, settings: currentSettings = settings } = {}) => createPinanoAgent({
 		cwd,
 		model,
 		settings,
 		noContextFiles: args.noContextFiles,
-		environmentContext: () => initialEnvironmentContextFor(cwd),
+		environmentContext: () => initialEnvironmentContextFor(cwd, undefined, environmentContextOptions(currentSettings)),
 		...(toolExecutor ? { toolExecutor } : {}),
 	})
 
@@ -355,9 +358,11 @@ async function main() {
 			serviceRunId: args.serviceRunId,
 			serviceClaimId: args.serviceClaimId,
 			noContextFiles: args.noContextFiles,
-			createAgent: ({ cwd }) => {
+			createAgent: ({ cwd, getSettings }) => {
+				const currentSettings = () => getSettings?.() ?? settings
 				const createExecutor = (getAgent) => new ToolExecutorRuntime({
 					cwd,
+					getSettings: currentSettings,
 					getSession: () => getAgent()?.session,
 					pinanoApiRequest: (request) => {
 						const target = getAgent()
@@ -373,7 +378,7 @@ async function main() {
 					settings,
 					noContextFiles: args.noContextFiles,
 					toolExecutor: executor,
-					environmentContext: () => initialEnvironmentContextFor(cwd),
+					environmentContext: () => initialEnvironmentContextFor(cwd, undefined, environmentContextOptions(currentSettings())),
 				})
 				agent.createSidecarAgent = (sidecarOptions) => {
 					let sidecar
@@ -473,7 +478,7 @@ async function main() {
 	// Print mode is hermetic: no session creation, no index work.
 	if (args.sessionCommand === "print") {
 		const { ToolExecutorRuntime } = await import("./tool-executor-runtime.js")
-		const executor = new ToolExecutorRuntime({ cwd: args.cwd })
+		const executor = new ToolExecutorRuntime({ cwd: args.cwd, getSettings: () => settings })
 		const agent = createAgent({ cwd: args.cwd, toolExecutor: executor })
 		let code = 1
 		try {

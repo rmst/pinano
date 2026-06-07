@@ -49,6 +49,7 @@ export {
 	detectCapabilities,
 	encodeITerm2,
 	encodeKitty,
+	formatHyperlinkUrl,
 	getCapabilities,
 	getCellDimensions,
 	getGifDimensions,

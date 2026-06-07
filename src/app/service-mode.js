@@ -13,17 +13,20 @@ import { createInterface } from "node:readline/promises"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { dataRoot } from "./paths.js"
+import { dataRoot, runtimeSourceReferencePath, serviceStateDir } from "./paths.js"
+import { ensureRuntimeSourceReference } from "./runtime-source-reference.js"
 import { canonicalModelRef, parseModelRef } from "./models.js"
 import { loadSettings, updateSetting, updateSettings } from "./settings.js"
 import { RuntimeManager } from "./server-runtime.js"
 import { authenticateRequest } from "./http-auth.js"
-import { configuredServiceDiagnostics, configuredServiceEndpointDefaults, configuredServiceToken, configuredWebDefaults } from "./service-config.js"
+import { configuredServiceDebug, configuredServiceDiagnostics, configuredServiceEndpointDefaults, configuredServiceToken, configuredWebDefaults } from "./service-config.js"
 import { createServiceDiagnostics } from "./service-diagnostics.js"
+import { createDebugInspectApp, isDebugRequestPath } from "./debug-inspect.js"
 import { WebRouter } from "./web-router.js"
 import { createManagerClientApi, json, jsonBody, registerClientApiRoutes, routeError } from "./client-api.js"
 import { writeResponseBody } from "./http-response.js"
 import { createEventHub } from "./sse-event-hub.js"
+import { startCodexUsagePoller } from "./codex-usage-poller.js"
 
 /** @typedef {import("./agent-runtime.js").AgentRuntime} Agent */
 
@@ -32,6 +35,9 @@ export const SERVICE_PROTOCOL_VERSION = 4
 const SERVICE_IDLE_SHUTDOWN_DELAY_MS = 1000
 const DESIRED_RUNTIME_LOCK_TTL_MS = 10000
 const DESIRED_RUNTIME_LOCK_TIMEOUT_MS = DESIRED_RUNTIME_LOCK_TTL_MS + 2000
+const SERVICE_LIFECYCLE_LOCK_TTL_MS = 30000
+const SERVICE_LIFECYCLE_LOCK_TIMEOUT_MS = 5 * 60 * 1000
+const SERVICE_OWNERSHIP_CHECK_INTERVAL_MS = 1000
 const SERVICE_UPGRADE_SOFT_WAIT_MS = 5000
 const SERVICE_UPGRADE_BLOCKED_POLL_MS = 1000
 const SERVICE_CONNECTIVITY_TIMEOUT_MS = 1500
@@ -47,13 +53,8 @@ const packageRoot = join(sourceRoot, "..")
 const mainPath = join(here, "main.js")
 const INFO_PATH = Symbol("serviceInfoPath")
 
-function configuredServiceDir() {
-	return process.env.PINANO_SERVICE_DIR || process.env.PINANO_DAEMON_DIR
-}
-
 function serviceDir() {
-	const root = configuredServiceDir() || join(dataRoot(), "services")
-	return join(root, "global")
+	return serviceStateDir()
 }
 
 function serviceInfoPath() {
@@ -76,6 +77,10 @@ function legacyDesiredRuntimeIdentityPath() {
 
 function desiredRuntimeLockPath() {
 	return join(serviceDir(), "desired-runtime.lock")
+}
+
+function serviceLifecycleLockPath() {
+	return join(serviceDir(), "service-lifecycle.lock")
 }
 
 function serviceLogPath() {
@@ -409,31 +414,82 @@ function runtimeStateForActivation(identity, previousDesired = null) {
 	return state
 }
 
-async function acquireDesiredRuntimeLock(timeoutMs = DESIRED_RUNTIME_LOCK_TIMEOUT_MS) {
-	await mkdir(serviceDir(), { recursive: true })
-	const lockPath = desiredRuntimeLockPath()
+async function acquireDirectoryLock(lockPath, { timeoutMs, ttlMs, label }) {
+	await mkdir(dirname(lockPath), { recursive: true })
 	const deadline = Date.now() + timeoutMs
 	for (;;) {
 		try {
 			await mkdir(lockPath)
-			return async () => rm(lockPath, { recursive: true, force: true }).catch(() => {})
+			let released = false
+			const lockId = randomUUID()
+			const ownerPath = join(lockPath, "owner.json")
+			const heartbeatPath = join(lockPath, "heartbeat")
+			await writeFile(ownerPath, JSON.stringify({
+				lockId,
+				pid: process.pid,
+				startedAtMs: processStartedAtMs,
+				startedAt: new Date().toISOString(),
+			}, null, "\t"), { mode: 0o600 })
+			const writeHeartbeat = () => writeFile(heartbeatPath, new Date().toISOString(), { mode: 0o600 }).catch(() => {})
+			await writeHeartbeat()
+			const heartbeatTimer = setInterval(writeHeartbeat, Math.max(1000, Math.floor(ttlMs / 3)))
+			heartbeatTimer.unref?.()
+			return async () => {
+				if (released) return
+				released = true
+				clearInterval(heartbeatTimer)
+				try {
+					const owner = JSON.parse(await readFile(ownerPath, "utf-8"))
+					if (owner?.lockId !== lockId) return
+				} catch {
+					return
+				}
+				await rm(lockPath, { recursive: true, force: true }).catch(() => {})
+			}
 		} catch (/** @type {any} */ err) {
 			if (err?.code !== "EEXIST") throw err
 			try {
-				const s = await stat(lockPath)
-				if (Date.now() - s.mtimeMs > DESIRED_RUNTIME_LOCK_TTL_MS) {
+				const s = await stat(join(lockPath, "heartbeat"))
+					.catch(() => stat(join(lockPath, "owner.json")))
+					.catch(() => stat(lockPath))
+				if (Date.now() - s.mtimeMs > ttlMs) {
 					await rm(lockPath, { recursive: true, force: true })
 					continue
 				}
 			} catch {}
-			if (Date.now() >= deadline) throw new Error(`Timed out waiting for desired runtime lock: ${lockPath}`)
+			if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}: ${lockPath}`)
 			await delay(25)
 		}
 	}
 }
 
+async function acquireDesiredRuntimeLock(timeoutMs = DESIRED_RUNTIME_LOCK_TIMEOUT_MS) {
+	return acquireDirectoryLock(desiredRuntimeLockPath(), {
+		timeoutMs,
+		ttlMs: DESIRED_RUNTIME_LOCK_TTL_MS,
+		label: "desired runtime lock",
+	})
+}
+
+async function acquireServiceLifecycleLock(timeoutMs = SERVICE_LIFECYCLE_LOCK_TIMEOUT_MS) {
+	return acquireDirectoryLock(serviceLifecycleLockPath(), {
+		timeoutMs,
+		ttlMs: SERVICE_LIFECYCLE_LOCK_TTL_MS,
+		label: "service lifecycle lock",
+	})
+}
+
 async function withDesiredRuntimeLock(fn) {
 	const release = await acquireDesiredRuntimeLock()
+	try {
+		return await fn()
+	} finally {
+		await release()
+	}
+}
+
+async function withServiceLifecycleLock(fn) {
+	const release = await acquireServiceLifecycleLock()
 	try {
 		return await fn()
 	} finally {
@@ -514,6 +570,7 @@ async function ensureCurrentRuntimeIsDesired(identity, expectedClaimId) {
  * @param {string} [options.serviceClaimId]
  * @param {() => void | Promise<void>} [options.onIdle]
  * @param {number} [options.eventHeartbeatIntervalMs]
+ * @param {number} [options.serviceOwnershipCheckIntervalMs]
  * @param {any} [options.webAppOptions]
  * @param {(info: { sessionId: string, session: any, cwd: string }) => Agent} options.createAgent
  */
@@ -524,21 +581,30 @@ export async function runService(options) {
 		path: diagnosticsOptions.path || join(serviceDir(), "diagnostics.jsonl"),
 		processName: "pinano service",
 	})
+	const serviceToken = typeof options.token === "string" && options.token ? options.token : createServiceToken()
 	const runtimeIdentity = await processRuntimeIdentity()
 	const codeFingerprint = runtimeIdentity.codeFingerprint
 	if (options.serviceClaimId) await ensureCurrentRuntimeIsDesired(runtimeIdentity, options.serviceClaimId)
 	else await claimCurrentRuntimeIdentity()
+	const sourceReference = await ensureRuntimeSourceReference(runtimeIdentity)
+	await appendServiceLog("runtime_source_reference_ready", { path: sourceReference.path, generation: sourceReference.generation })
 	const serviceRunId = options.serviceRunId ?? randomUUID()
 	const serviceStartedAt = new Date().toISOString()
-	const serviceToken = typeof options.token === "string" && options.token ? options.token : createServiceToken()
 	let activeRequests = 0
 	let idleTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
+	let ownershipCheckTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
 	let closed = false
+	let lostServiceOwnership = false
 	let shutdownReason = "clean_shutdown"
 	const clearIdleTimer = () => {
 		if (!idleTimer) return
 		clearTimeout(idleTimer)
 		idleTimer = undefined
+	}
+	const clearOwnershipCheckTimer = () => {
+		if (!ownershipCheckTimer) return
+		clearInterval(ownershipCheckTimer)
+		ownershipCheckTimer = undefined
 	}
 	const hub = createEventHub(() => scheduleIdleCheck(), { heartbeatIntervalMs: options.eventHeartbeatIntervalMs })
 	const db = await openOwnedServerDb({ recoverRunningRuns: true })
@@ -566,6 +632,7 @@ export async function runService(options) {
 	let serviceEndpoint = /** @type {{ host?: string, port?: number, requestedPort?: number, portFallback?: boolean }} */ ({ host: options.host, port: options.port, requestedPort: options.port, portFallback: false })
 	let webServer = /** @type {any} */ (undefined)
 	let webOptions = /** @type {any} */ (undefined)
+	let codexUsagePoller = { close() {} }
 	const runningRuntimes = () => [...manager.runtimes.values()].filter((runtime) => runtime.isStreaming())
 	const backgroundRuntimes = () => [...manager.runtimes.values()].filter((runtime) => runtime.hasBackgroundWork?.())
 	const waitingInfos = () => runningRuntimes().map((runtime) => runtime.waitingInfo())
@@ -617,6 +684,52 @@ export async function runService(options) {
 				new Promise((resolve) => setTimeout(resolve, 25)),
 			])
 		}
+	}
+	const hasAgentWork = () => runningRuntimes().length > 0 || backgroundRuntimes().length > 0
+	async function readServiceInfoOwnership() {
+		try {
+			return { info: normalizeServiceInfo(JSON.parse(await readFile(serviceInfoFile, "utf-8")), serviceInfoFile) }
+		} catch (/** @type {any} */ err) {
+			if (err?.code === "ENOENT") return { missing: true }
+			return { error: err?.message ?? String(err) }
+		}
+	}
+	async function handleLostServiceOwnership(owner) {
+		if (!lostServiceOwnership) {
+			lostServiceOwnership = true
+			shutdownReason = "lost_service_ownership"
+			await appendServiceLog("service_lost_ownership", {
+				serviceRunId,
+				ownerServiceRunId: owner?.info?.serviceRunId,
+				ownerPid: owner?.info?.pid,
+				missingInfo: owner?.missing === true || undefined,
+			})
+			try { hub.send({ type: "error", error: "Pinano service lost ownership; reconnecting." }) } catch {}
+			try { hub.closeAll?.() } catch {}
+			try { await stopWeb() } catch {}
+			try { server?.close?.() } catch {}
+		}
+		if (hasAgentWork()) return
+		await exitAfterCleanup(0)
+	}
+	async function checkServiceOwnership() {
+		if (closed) return
+		const owner = await readServiceInfoOwnership()
+		if (owner.error) return
+		if (owner.info?.serviceRunId === serviceRunId) return
+		await handleLostServiceOwnership(owner)
+	}
+	function startOwnershipChecks() {
+		clearOwnershipCheckTimer()
+		const intervalMs = Number.isFinite(options.serviceOwnershipCheckIntervalMs)
+			? Math.max(25, Number(options.serviceOwnershipCheckIntervalMs))
+			: SERVICE_OWNERSHIP_CHECK_INTERVAL_MS
+		ownershipCheckTimer = setInterval(() => {
+			checkServiceOwnership().catch((err) => {
+				console.error("service ownership check error", err)
+			})
+		}, intervalMs)
+		ownershipCheckTimer.unref?.()
 	}
 	function scheduleIdleCheck() {
 		clearIdleTimer()
@@ -754,6 +867,32 @@ export async function runService(options) {
 		},
 	})
 	const serviceApp = new WebRouter()
+	const debugApp = createDebugInspectApp({
+		getConfig: configuredServiceDebug,
+		getEndpoint: () => serviceEndpoint,
+		getDiagnostics: () => diagnostics,
+		getEventHub: () => hub,
+		getManager: () => manager,
+		resolveSessionId: resolveId,
+		heapSnapshotDir: () => join(serviceDir(), "heap-snapshots"),
+		getServiceState: () => ({
+			serviceRunId,
+			serviceStartedAt,
+			processStartedAtMs,
+			cwd: options.cwd,
+			endpoint: serviceEndpoint,
+			protocolVersion: SERVICE_PROTOCOL_VERSION,
+			codeFingerprint,
+			runtimeKey: runtimeIdentity.runtimeKey,
+			packageName: runtimeIdentity.packageName,
+			packageVersion: runtimeIdentity.packageVersion,
+			mainPath,
+			sourceRoot,
+			packageRoot,
+			activeRequests,
+			web: webStatus(false),
+		}),
+	})
 	const serviceRoutePath = (prefix, suffix) => prefix ? `${prefix}${suffix}` : suffix
 	const safeServiceRoute = (handler) => async (context) => {
 		try {
@@ -831,6 +970,7 @@ export async function runService(options) {
 	/** @param {Request} req */
 	const handle = async (req) => {
 		const url = new URL(req.url)
+		if (isDebugRequestPath(url.pathname)) return debugApp.fetch(req)
 		if (isServiceRequestPath(url.pathname)) {
 			const auth = authenticateRequest(req, serviceToken, { checkOrigin: true })
 			if (!auth.ok) return authError(auth)
@@ -920,25 +1060,9 @@ export async function runService(options) {
 	const requestedPort = listenResult.requestedPort
 	const portFallback = listenResult.portFallback
 	serviceEndpoint = { host, port, requestedPort, portFallback }
-	db.startServiceRun({
-		id: serviceRunId,
-		pid: process.pid,
-		cwd: options.cwd,
-		transport: "tcp",
-		port,
-		codeFingerprint,
-		runtimeKey: runtimeIdentity.runtimeKey,
-		packageName: runtimeIdentity.packageName,
-		packageVersion: runtimeIdentity.packageVersion,
-		mainPath,
-		sourceRoot,
-		packageRoot,
-		execPath: process.execPath,
-		argv: process.argv,
-		startedAt: serviceStartedAt,
-	})
-	await mkdir(serviceDir(), { recursive: true })
-	await writePrivateJson(serviceInfoPath(), {
+	const serviceInfoDir = serviceDir()
+	const serviceInfoFile = join(serviceInfoDir, "service.json")
+	const serviceInfo = {
 		pid: process.pid,
 		cwd: options.cwd,
 		transport: "tcp",
@@ -959,24 +1083,51 @@ export async function runService(options) {
 		execPath: process.execPath,
 		argv: process.argv,
 		startedAt: serviceStartedAt,
+	}
+	db.startServiceRun({
+		id: serviceRunId,
+		pid: process.pid,
+		cwd: options.cwd,
+		transport: "tcp",
+		port,
+		codeFingerprint,
+		runtimeKey: runtimeIdentity.runtimeKey,
+		packageName: runtimeIdentity.packageName,
+		packageVersion: runtimeIdentity.packageVersion,
+		mainPath,
+		sourceRoot,
+		packageRoot,
+		execPath: process.execPath,
+		argv: process.argv,
+		startedAt: serviceStartedAt,
 	})
+	await mkdir(serviceInfoDir, { recursive: true })
+	await writePrivateJson(serviceInfoFile, serviceInfo)
 	await appendServiceLog("service_started", { pid: process.pid, serviceRunId, cwd: options.cwd, transport: "tcp", host, port, requestedPort, portFallback, codeFingerprint, runtimeKey: runtimeIdentity.runtimeKey })
+	startOwnershipChecks()
+	codexUsagePoller = startCodexUsagePoller({ getSettings: () => serviceSettings })
 
 	const cleanup = async () => {
 		if (closed) return
 		closed = true
 		clearIdleTimer()
+		clearOwnershipCheckTimer()
+		try { codexUsagePoller.close() } catch {}
+		try { hub.closeAll?.() } catch {}
 		try { await stopWeb() } catch {}
 		try { server.close() } catch {}
 		try { manager.dispose() } catch {}
 		try { db.finishServiceRun(serviceRunId, { status: "clean_exit", reason: shutdownReason }) } catch {}
 		try { db.close() } catch {}
 		try { await diagnostics.close() } catch {}
-		const info = await readInfo()
+		let info = null
+		try {
+			info = normalizeServiceInfo(JSON.parse(await readFile(serviceInfoFile, "utf-8")), serviceInfoFile)
+		} catch {}
 		const ownsInfo = !info || info.serviceRunId === serviceRunId
 		await appendServiceLog("service_cleanup", { serviceRunId, reason: shutdownReason, ownsInfo, ownerServiceRunId: info?.serviceRunId, ownerPid: info?.pid })
 		if (ownsInfo) {
-			try { await rm(serviceInfoPath(), { force: true }) } catch {}
+			try { await rm(serviceInfoFile, { force: true }) } catch {}
 		} else {
 			await appendServiceLog("cleanup_skipped_foreign_service_info", { serviceRunId, ownerServiceRunId: info.serviceRunId, ownerPid: info.pid })
 		}
@@ -1003,7 +1154,7 @@ export async function runService(options) {
 		try { db.close() } catch {}
 	})
 	scheduleIdleCheck()
-	return { manager, db, close: cleanup }
+	return { manager, db, info: normalizeServiceInfo(serviceInfo, serviceInfoFile), close: cleanup }
 }
 
 function normalizeServiceInfo(info, path) {
@@ -1311,8 +1462,14 @@ async function ensureOldServiceStopped(existing, interrupted) {
  */
 export async function ensureService(options) {
 	const runtimeIdentity = await processRuntimeIdentity()
+	return withServiceLifecycleLock(async () => {
+		await ensureCurrentRuntimeIsDesired(runtimeIdentity, options.serviceClaimId)
+		return ensureServiceUnlocked(options, runtimeIdentity)
+	})
+}
+
+async function ensureServiceUnlocked(options, runtimeIdentity) {
 	const codeFingerprint = runtimeIdentity.codeFingerprint
-	await ensureCurrentRuntimeIsDesired(runtimeIdentity, options.serviceClaimId)
 	const endpoint = configuredServiceEndpointDefaults()
 	let existing = await readInfo()
 	if (existing && existing.transport !== "tcp") {
@@ -1398,6 +1555,7 @@ export async function ensureService(options) {
 		if (childStartupFailure) throw new Error(`Pinano service ${childStartupFailure}. See ${logPath}`)
 		await delay(100)
 	}
+	if (child.pid) await terminateProcess(child.pid)
 	throw new Error(`Timed out starting pinano service. See ${logPath}`)
 }
 
@@ -1529,6 +1687,9 @@ export function createServiceClient(info, options = {}) {
 		},
 		async systemReport(id) {
 			return (await request(`/sessions/${encodeURIComponent(id)}/system-report`)).lines ?? []
+		},
+		async worktrees(id) {
+			return (await request(`/sessions/${encodeURIComponent(id)}/worktrees`)).worktrees ?? []
 		},
 		async prompt(id, message, streamingBehavior, options = {}) {
 			return request(`/sessions/${encodeURIComponent(id)}/prompt`, {
@@ -1808,6 +1969,7 @@ export async function serviceStatus(options) {
 		health,
 		desiredRuntime,
 		logPath: serviceLogPath(),
+		runtimeSourceReferencePath: runtimeSourceReferencePath(),
 		serviceInfoPath: info?.[INFO_PATH] ?? serviceInfoPath(),
 		desiredRuntimeIdentityPath: desiredRuntimeIdentityPath(),
 	}
@@ -1858,6 +2020,7 @@ export function formatServiceStatus(status) {
 		`running sessions: ${health?.runningSessions?.length ?? 0}`,
 		`background sessions: ${health?.backgroundSessions?.length ?? 0}`,
 		`diagnostics: ${health?.diagnostics?.enabled ? valueOrDash(health.diagnostics.path) : "disabled"}`,
+		`runtime source: ${status.runtimeSourceReferencePath}`,
 		`info: ${status.serviceInfoPath}`,
 		`desired info: ${status.desiredRuntimeIdentityPath}`,
 		`log: ${status.logPath}`,

@@ -40,6 +40,7 @@ On first run, Pinano opens the model provider credentials view when no provider 
 
 API keys are also supported. Pinano can import supported API keys from the launch environment. Deployment-level API keys and other settings can also be configured declaratively; see [settings](docs/settings.md).
 
+When you have questions about Pinano itself, asking Pinano is usually best: by default the agent has read-only access to the running Pinano source and documentation.
 
 ## Common commands
 
@@ -106,7 +107,9 @@ Press `Esc Esc` on an empty editor to open `/rewind`. You can return to an earli
 
 By default, tools run in a native filesystem sandbox on MacOS and Linux. MacOS uses `sandbox-exec`; Linux uses Bubblewrap (`bwrap`). You can optionally configure named local, container, or SSH environments for tool execution.
 
-Sandbox paths default to `["."]`, resolved against the configured environment `cwd` when one is set, otherwise against the session's initial cwd; later `cwd` changes must stay under one of those paths. Native workers allow reads from sandbox paths plus system, toolchain, Pinano runtime paths, and the environment's tool home, while writes stay restricted to sandbox paths, temp directories, and that tool home. Native sandbox workers use a per-environment fake home under `$PINANO_HOME/environments/<environment-id>/home`; `HOME`, XDG roots, temp variables, and Pinano fallback-tool wrappers all point there so tools share state across projects without writing into project directories. On interactive TUI startup, Pinano probes the default local native sandbox first; if Linux `bwrap` is unavailable or unusable, or if MacOS `sandbox-exec` fails, Pinano shows a startup page that retries every 5 seconds and lets you continue by saving `sandbox.type: "none"` for that environment. Non-interactive tool execution still fails closed and tells you how to opt into `sandbox.type: "none"` explicitly.
+Sandboxed local environments include the session's starting working directory by default (`useSessionWd: true`). `mountPaths` adds static host paths; relative entries resolve from that starting directory. Pinano fixes this set when the worker starts. Later `cwd` changes are passed to tools but do not add mounts or writable paths. Native workers allow reads from mounted/writable paths plus system, toolchain, Pinano runtime paths, the service-created Pinano runtime source reference, and the environment's tool home, while writes stay restricted to mounted/writable paths, temp directories, and that tool home. Native sandbox workers use a per-environment fake home under `$PINANO_HOME/environments/<environment-id>/home`; `HOME`, XDG roots, temp variables, and Pinano fallback-tool wrappers all point there so tools share state across projects without writing into project directories. On interactive TUI startup, Pinano probes the default local native sandbox first; if Linux `bwrap` is unavailable or unusable, or if MacOS `sandbox-exec` fails, Pinano shows a startup page that retries every 5 seconds and lets you continue by saving `sandbox.type: "none"` for that environment. Non-interactive tool execution still fails closed and tells you how to opt into `sandbox.type: "none"` explicitly.
+
+By default, sandboxed tools only get narrow Pinano state mounts for the current session workspace and runtime source reference. To let tools inspect the full Pinano state directory, set `toolSandbox.pinanoStateMount` in `settings.json` or `default-settings.json` to `"readOnly"`. `"readWrite"` is also supported, but it gives tools direct write access to Pinano's live state and should be treated as a high-trust debugging mode. The setting only affects native sandboxes and Pinano-managed containers; existing containers and SSH targets must provide their own mounts.
 
 <details>
 <summary>Environment configuration</summary>
@@ -122,16 +125,22 @@ Create `~/.pinano/environments.json` to define explicit environments:
 			"sandbox": {
 				"type": "container",
 				"image": "ghcr.io/example/pinano-tools:latest",
-				"paths": [".", "../shared"]
+				"mountPaths": [
+					"/Users/me/dev",
+					{ "from": "/Users/me/.gitconfig", "to": "/home/node/.gitconfig", "readOnly": true }
+				],
+				"env": { "GH_TOKEN": "..." },
+				"network": "host",
+				"extraArgs": ["--add-host", "host.docker.internal:host-gateway"]
 			}
 		},
 		"existing-container": {
 			"target": "local",
-			"cwd": "/workspace/project",
 			"sandbox": {
 				"type": "container",
 				"engine": "docker",
-				"container": "pinano-tools"
+				"container": "pinano-tools",
+				"mountPaths": ["/Users/me/dev"]
 			}
 		},
 		"remote": {
@@ -144,7 +153,7 @@ Create `~/.pinano/environments.json` to define explicit environments:
 
 ```
 
-`target` describes where tools run. `sandbox.type: "native"` uses `sandbox-exec` on MacOS and `bwrap` on Linux. `sandbox.type: "container"` with `image` makes Pinano start and own the container; with `container` it execs into an already-running container. `sandbox.paths` are writable roots, resolved relative to the environment `cwd` when it is configured and otherwise the session's initial cwd. `sandbox.type: "none"` runs without a Pinano sandbox and should be treated as an explicit unsafe opt-out. The legacy `worker` field is still accepted for existing configs.
+`target` describes where tools run. `sandbox.type: "native"` uses `sandbox-exec` on MacOS and `bwrap` on Linux. `sandbox.type: "container"` with `image` makes Pinano start and own the container; with `container` it execs into an already-running container whose mounts must already exist. `mountPaths` entries can be strings or objects: a string mounts or allows that host path read/write at the same absolute path; an object uses `{ "from": "<host path>", "to": "<container path>", "readOnly": true }`, with `to` only supported for containers. Native read-only mounts must not be inside a writable mount. On service startup Pinano refreshes a code-only runtime source reference under the Pinano state directory (`$PINANO_HOME/data/services/global/runtime-source/current`); native and Pinano-managed container environments add it as a read-only mount unless an existing mount already covers it. Existing containers and SSH targets must provide their own access if they need that source. Container `env` is passed to managed containers and `docker exec` workers. `network` and `extraArgs` apply only to Pinano-managed containers; prefer typed fields and keep `extraArgs` for Docker/Podman options Pinano does not model yet. `useSessionWd` defaults to `true`; set it to `false` to avoid automatically using and mounting the session's starting working directory. `sandbox.type: "none"` runs without a Pinano sandbox and should be treated as an explicit unsafe opt-out. The legacy `worker` field and legacy `sandbox.paths` field are still accepted for existing configs.
 
 </details>
 
@@ -154,7 +163,7 @@ Pinano reads project instructions from `AGENTS.md` or `CLAUDE.md`:
 
 1. Global instructions under `~/.pinano/`.
 2. Instructions in ancestor directories of the current working directory.
-3. Additional instructions in subdirectories when a tool first touches files there.
+3. Additional instructions in subdirectories when files there are read or modified.
 
 ### `@import`
 

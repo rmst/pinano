@@ -584,7 +584,7 @@ function loadContextLoad(db, globalId) {
 	}
 	if (!row) return undefined
 	const files = db.prepare(`
-		SELECT path, scope_dir AS scopeDir, content, hash
+		SELECT path, scope_dir AS scopeDir, identity_path AS identityPath, content, hash
 		FROM entry_context_files
 		WHERE global_id = ?
 		ORDER BY ordinal ASC
@@ -749,9 +749,9 @@ function insertContextLoad(db, globalId, load) {
 	`).run(globalId, load.source ?? "unknown", load.cwd ?? null, load.loadedAt ?? new Date().toISOString(), load.disabled ? 1 : 0)
 	;(load.files ?? []).forEach((file, ordinal) => {
 		db.prepare(`
-			INSERT INTO entry_context_files (global_id, ordinal, path, scope_dir, content, hash)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`).run(globalId, ordinal, file.path, file.scopeDir ?? null, file.content ?? "", file.hash ?? null)
+			INSERT INTO entry_context_files (global_id, ordinal, path, scope_dir, identity_path, content, hash)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`).run(globalId, ordinal, file.path, file.scopeDir ?? null, file.identityPath ?? null, file.content ?? "", file.hash ?? null)
 	})
 }
 

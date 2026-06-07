@@ -8,25 +8,32 @@ import { messageHasRetryableModelError } from "../ai-apis/model-errors.js"
 import { contextLoadDisplayMessage } from "../session-manager/context-display.js"
 import { normalizeReasoningLevel } from "../reasoning.js"
 import { isModelIoLogEnabled } from "../ai-apis/model-io-log.js"
+import { contextFileIdentity } from "../session-manager/context-identity.js"
 import { ensureProjectContextMessage, isProjectContextMessage, loadProjectContextForCwd } from "./project-context.js"
 import { compact, summarizeMessages } from "./compaction.js"
 import { systemPromptFor } from "./agent-factory.js"
 import { toolProfileForModel } from "./model-instructions.js"
-import { modelRef, refreshModelFromRegistry, resolveModel } from "./models.js"
-import { branchSession, createSession, loadSessionPreview, openSession, sessionPreviewFromMessages } from "./session-store.js"
+import { modelRef, refreshModelFromRegistry, refreshModelWithProviderMetadata, resolveModel, resolveModelWithProviderMetadata } from "./models.js"
+import { branchSession, createSession, createSessionId, loadSessionPreview, openSession, sessionPreviewFromMessages } from "./session-store.js"
 import { sessionActivityAt } from "./session-activity.js"
 import { deriveSessionRunState, startedToolsWithoutDurableResult, synthesizeUnknownToolResultsForStartedTools } from "./session-run-state.js"
-import { completeEnvironmentPatch, getEnvironment, initialSessionEnvironment, loadEnvironmentRegistry } from "./environments.js"
+import { completeEnvironmentPatch, getEnvironment, initialSessionEnvironment, loadEnvironmentRegistry, resolveConfiguredEnvironmentId } from "./environments.js"
 import { handleFastCommand } from "./fast-mode.js"
 import { createPinanoJsApi } from "./pinano-js-api.js"
 import { restoreFilesToCheckpoint, appendFileRestoreEntry, deleteFileCheckpoints, fileCheckpointsForRestore } from "./file-checkpoints.js"
 import { messageKey } from "./session-state.js"
 import { activeContextFiles, buildModelMessagesForSession, contextFilesDisabledForAgent, conversationEntriesForModel } from "./session-context.js"
-import { environmentContextFor, prependEnvironmentContext } from "./environment-context.js"
+import { environmentContextFor, prependEnvironmentContext, sessionWorkspaceToolPathForEnvironment } from "./environment-context.js"
 import { summarizeContext } from "./context-summary.js"
 import { formatContextReport } from "./context-report.js"
 import { formatSystemReport } from "./project-context-display.js"
-import { isPromptImageMarkerText, promptContentWithImages } from "../prompt-images.js"
+import { sessionWorkspacePath } from "./paths.js"
+import { pinanoStateMountFromSettings } from "./settings.js"
+import { branchNoticeMessage, branchSessionWorkspace } from "./session-workspaces.js"
+import { DOCKER_PROXY_ROUTE, handleDockerProxyRequest } from "../proxy-tools/docker/host.js"
+import { GIT_WORKTREE_CUSTOM_TYPE, normalizeGitWorktreeEventPayload, sessionGitWorktreeStatuses } from "./git-worktree-events.js"
+import { internalHttpJsonResponse, internalHttpRequestBodyText } from "./worker-internal-http.js"
+import { isPromptImageMarkerText, promptContentWithImages, promptImageLabel, promptImagePlaceholders } from "../prompt-images.js"
 import {
 	SESSION_CUSTOM_TYPE_PROPERTIES,
 	SESSION_MODEL_WRITABLE_STATES,
@@ -59,12 +66,20 @@ const LEGACY_AGENT_VIEW_COMPLETION_WINDOW_MS = 48 * 60 * 60 * 1000
 const MODEL_RETRY_MAX_ATTEMPTS = 3
 const MODEL_RETRY_BASE_DELAY_MS = 1000
 
+function parseInternalJsonBody(request) {
+	try {
+		return JSON.parse(internalHttpRequestBodyText(request) || "{}")
+	} catch {
+		throw Object.assign(new Error("Invalid JSON body"), { status: 400 })
+	}
+}
+
 /**
  * @param {any} message
  * @param {{ retainedMaintenanceToolCallIds?: Set<string> }} [options]
  */
 export function projectVisibleMessage(message, options = {}) {
-	if (!message || isProjectContextMessage(message) || message.pinanoCompactionMemento || message.pinanoCompactionSummary) return undefined
+	if (!message || message.pinanoHidden || isProjectContextMessage(message) || message.pinanoCompactionMemento || message.pinanoCompactionSummary) return undefined
 	if (!message.pinanoAutomated && !message.pinanoMaintenance) return message
 	const retainedToolCallIds = options.retainedMaintenanceToolCallIds
 	if (message.role === "assistant") {
@@ -124,6 +139,90 @@ export function imageBlocksFromContent(content) {
 	return /** @type {any[]} */ (content)
 		.filter((block) => block?.type === "image")
 		.map((block) => ({ ...block }))
+}
+
+const PROMPT_IMAGE_LABEL_RE = /\[Image #\d+\]/g
+
+/** @param {string} text */
+function uniquePromptImageLabels(text) {
+	const seen = new Set()
+	return promptImagePlaceholders(text)
+		.map((item) => item.placeholder)
+		.filter((label) => {
+			if (seen.has(label)) return false
+			seen.add(label)
+			return true
+		})
+}
+
+/** @param {string} text @param {Map<string, string>} replacements */
+function replacePromptImageLabels(text, replacements) {
+	if (replacements.size === 0) return text
+	return text.replace(PROMPT_IMAGE_LABEL_RE, (label) => replacements.get(label) ?? label)
+}
+
+/** @param {any} message */
+function promptDraftPartFromMessage(message) {
+	return {
+		text: textFromContent(message?.content),
+		images: imageBlocksFromContent(message?.content),
+	}
+}
+
+/** @param {{ text: string, images: any[] }[]} parts */
+function promptDraftFromParts(parts) {
+	let nextImageNumber = 1
+	const textParts = []
+	const images = []
+	for (const part of parts) {
+		const labels = uniquePromptImageLabels(part.text)
+		const replacements = new Map()
+		const generatedLabels = []
+		for (let i = 0; i < part.images.length; i += 1) {
+			const nextLabel = promptImageLabel(nextImageNumber)
+			nextImageNumber += 1
+			if (labels[i]) replacements.set(labels[i], nextLabel)
+			else generatedLabels.push(nextLabel)
+			images.push(part.images[i])
+		}
+		const text = replacePromptImageLabels(part.text, replacements)
+		const generatedPrefix = generatedLabels.join("\n")
+		let restoredText = text
+		if (generatedPrefix) {
+			if (!text) restoredText = generatedPrefix
+			else if (labels.length > 0) restoredText = `${text}\n\n${generatedPrefix}`
+			else restoredText = `${generatedPrefix}\n\n${text}`
+		}
+		if (restoredText) textParts.push(restoredText)
+	}
+	return { text: textParts.join("\n\n"), images }
+}
+
+/** @param {any} message */
+function isCancellableUserMessage(message) {
+	return message?.role === "user" && !isAutomatedMaintenanceMessage(message) && !isProjectContextMessage(message)
+}
+
+/** @param {Agent} agent */
+function queuedCancellableUserMessages(agent) {
+	return (agent.getQueuedMessages?.() ?? [])
+		.map((item) => item?.message ?? item)
+		.filter(isCancellableUserMessage)
+}
+
+/** @param {Session} session @param {any} promptEntry */
+function cancellableBranchUserMessages(session, promptEntry) {
+	const branch = session.getBranch()
+	const promptIndex = branch.findIndex((entry) => entry.id === promptEntry.id)
+	const entries = promptIndex >= 0 ? branch.slice(promptIndex) : [promptEntry]
+	return entries
+		.filter((entry) => isHumanUserEntry(entry) && !isProjectContextMessage(entry.message))
+		.map((entry) => entry.message)
+}
+
+/** @param {any[]} messages */
+function promptDraftFromMessages(messages) {
+	return promptDraftFromParts(messages.map(promptDraftPartFromMessage))
 }
 
 /** @param {string} value @param {number} max */
@@ -346,27 +445,56 @@ function sessionConfigForAgent(agent, extra = {}) {
 	}
 }
 
+function sessionWorkspacePathMappingsForEnvironment(sourceId, targetId, sourceProps, sourceConfig, sourceRuntime) {
+	const registry = loadEnvironmentRegistry()
+	const environmentId = resolveConfiguredEnvironmentId(sourceProps.environmentId, registry)
+	const environment = getEnvironment(environmentId, registry)
+	const initialCwd = sourceConfig.worktree ?? sourceConfig.cwd ?? sourceRuntime.session.getMetadata?.()?.cwd ?? sourceRuntime.cwd
+	const sourceDir = sessionWorkspacePath(sourceId)
+	const targetDir = sessionWorkspacePath(targetId)
+	const pinanoStateMount = pinanoStateMountFromSettings(sourceRuntime.getSettings?.())
+	const sourceToolDir = sessionWorkspaceToolPathForEnvironment(environment, initialCwd, undefined, sourceDir, undefined, pinanoStateMount)
+	const targetToolDir = sessionWorkspaceToolPathForEnvironment(environment, initialCwd, undefined, targetDir, undefined, pinanoStateMount)
+	if (!sourceToolDir || !targetToolDir) return []
+	if (sourceToolDir === sourceDir && targetToolDir === targetDir) return []
+	return [{ sourceDir: sourceToolDir, targetDir: targetToolDir }]
+}
+
+function applyAgentModel(agent, cwd, nextModel) {
+	agent.state.model = nextModel
+	agent.state.systemPrompt = systemPromptFor(cwd, agent.state.model)
+	agent.refreshToolsForModel?.(agent.state.model)
+}
+
 function applySessionConfig(agent, session, cwd) {
 	const config = session.getSessionConfig?.() ?? {}
-	let modelChanged = false
+	let nextModel
 	if (config.model) {
-		agent.state.model = refreshModelFromRegistry(config.model, config.modelRef)
-		modelChanged = true
+		nextModel = refreshModelFromRegistry(config.model, config.modelRef)
 	} else if (config.modelRef) {
-		agent.state.model = resolveModel(config.modelRef)
-		modelChanged = true
+		nextModel = resolveModel(config.modelRef)
 	}
-	if (config.baseUrl && agent.state.model) {
-		agent.state.model = refreshModelFromRegistry({ ...agent.state.model, baseUrl: config.baseUrl }, config.modelRef)
-		modelChanged = true
+	if (config.baseUrl && (nextModel ?? agent.state.model)) {
+		nextModel = refreshModelFromRegistry({ ...(nextModel ?? agent.state.model), baseUrl: config.baseUrl }, config.modelRef)
 	}
-	if (modelChanged) {
-		agent.state.systemPrompt = systemPromptFor(cwd, agent.state.model)
-		agent.refreshToolsForModel?.(agent.state.model)
-	}
+	if (nextModel) applyAgentModel(agent, cwd, nextModel)
 	if (config.thinkingLevel) agent.state.thinkingLevel = normalizeReasoningLevel(config.thinkingLevel) ?? config.thinkingLevel
 	if (Object.prototype.hasOwnProperty.call(config, "serviceTier")) agent.state.serviceTier = config.serviceTier ?? undefined
 	if (Object.prototype.hasOwnProperty.call(config, "noContextFiles")) agent.contextFilesDisabled = config.noContextFiles === true
+}
+
+async function applySessionProviderMetadata(agent, session, cwd, settings = undefined) {
+	const config = session.getSessionConfig?.() ?? {}
+	let nextModel
+	if (config.model) {
+		nextModel = await refreshModelWithProviderMetadata(config.model, config.modelRef, { providers: settings?.providers })
+	} else if (config.modelRef) {
+		nextModel = await resolveModelWithProviderMetadata(config.modelRef, { providers: settings?.providers })
+	}
+	if (config.baseUrl && (nextModel ?? agent.state.model)) {
+		nextModel = await refreshModelWithProviderMetadata({ ...(nextModel ?? agent.state.model), baseUrl: config.baseUrl }, config.modelRef, { providers: settings?.providers })
+	}
+	if (nextModel) applyAgentModel(agent, cwd, nextModel)
 }
 
 export class SessionRuntime {
@@ -518,6 +646,8 @@ export class SessionRuntime {
 			cwd: props.cwd ?? this.cwd,
 			initialCwd: config.worktree ?? config.cwd ?? this.session.getMetadata?.()?.cwd ?? this.cwd,
 			environmentId: props.environmentId,
+			sessionWorkspacePath: sessionWorkspacePath(this.sessionId),
+			pinanoStateMount: pinanoStateMountFromSettings(this.getSettings?.()),
 		})
 	}
 
@@ -535,8 +665,8 @@ export class SessionRuntime {
 
 	async appendCwdContextLoad(cwd) {
 		if (!cwd || contextFilesDisabledForAgent(this.agent)) return
-		const loadedPaths = new Set(activeContextFiles(this.session).map((file) => file.path))
-		const files = loadProjectContextForCwd(cwd).filter((file) => !loadedPaths.has(file.path))
+		const loadedContextFiles = new Set(activeContextFiles(this.session).map(contextFileIdentity))
+		const files = loadProjectContextForCwd(cwd).filter((file) => !loadedContextFiles.has(contextFileIdentity(file)))
 		if (files.length === 0) return
 		const load = { source: "cwd", cwd, loadedAt: new Date().toISOString(), files }
 		const entryId = await this.session.appendContextLoad(load)
@@ -592,7 +722,22 @@ export class SessionRuntime {
 		if (this.session.getLeafId() !== scope.anchorEntryId) throw new Error("Session changed since automated maintenance started")
 	}
 
-	/** @param {{ op: string, sessionId?: string, patch?: any, scope?: any }} request */
+	async handleInternalGitEvent(request, workerContext = undefined) {
+		if (request.method !== "POST") return internalHttpJsonResponse({ error: "Method Not Allowed" }, 405)
+		const event = normalizeGitWorktreeEventPayload(parseInternalJsonBody(request), { workerContext })
+		if (!event) return internalHttpJsonResponse({ ok: true, recorded: false })
+		const entryId = await this.session.appendCustomEntry(GIT_WORKTREE_CUSTOM_TYPE, event)
+		return internalHttpJsonResponse({ ok: true, recorded: true, entryId }, 201)
+	}
+
+	async handleInternalHttpRequest(request, workerContext = undefined) {
+		const url = new URL(request.path || "/", "http://pinano.internal")
+		if (url.pathname === "/internal/git/events") return this.handleInternalGitEvent(request, workerContext)
+		if (url.pathname === DOCKER_PROXY_ROUTE) return handleDockerProxyRequest(request, workerContext, { sessionId: this.sessionId })
+		return internalHttpJsonResponse({ error: "Not Found" }, 404)
+	}
+
+	/** @param {{ op: string, sessionId?: string, patch?: any, scope?: any, request?: any, workerContext?: any }} request */
 	async handlePinanoApiRequest(request) {
 		const id = this.resolvePinanoSessionId(request.sessionId)
 		if (request.op === "session.get") {
@@ -616,6 +761,7 @@ export class SessionRuntime {
 			if (!info) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 			return { ...info, sessionWrite: write }
 		}
+		if (request.op === "internalHttp") return this.handleInternalHttpRequest(request.request ?? {}, request.workerContext)
 		throw new Error(`Unknown Pinano JS API operation: ${request.op}`)
 	}
 
@@ -940,6 +1086,10 @@ export class SessionRuntime {
 			tools: this.agent.state.tools,
 			messages: this.contextMessages(),
 		})
+	}
+
+	async worktrees() {
+		return sessionGitWorktreeStatuses(this.session)
 	}
 
 	async snapshot(options = {}) {
@@ -1282,10 +1432,13 @@ export class SessionRuntime {
 			return { ok: true, cancelled: false, reason: "prompt_entry_not_found" }
 		}
 
-		const text = textFromContent(entry.message.content)
-		const images = imageBlocksFromContent(entry.message.content)
+		const draft = promptDraftFromMessages([
+			...cancellableBranchUserMessages(this.session, entry),
+			...queuedCancellableUserMessages(this.agent),
+		])
 		this.session.moveTo(entry.parentId ?? null, { runId: prompt.runId })
 		this.hydrateAgentFromSession()
+		this.agent.clearAllQueues?.()
 		this.agent.state.errorMessage = undefined
 		this.refreshSessionPropertyCache({ source: { kind: "cancel_prompt" } })
 		this.db.finishRun(prompt.runId, { status: "completed", stopReason: "cancelled" })
@@ -1297,8 +1450,9 @@ export class SessionRuntime {
 		if (this.promptCancellation?.runId === prompt.runId) this.promptCancellation = undefined
 		this.bumpViewEpoch()
 		this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
+		this.emitRuntimeEvent({ type: "pending_user_messages_update", pendingUserMessages: this.pendingUserMessages() })
 		await this.invalidateSnapshot(this.sessionId)
-		return { ok: true, cancelled: true, text, images }
+		return { ok: true, cancelled: true, text: draft.text, images: draft.images }
 	}
 
 	softInterrupt() {
@@ -1412,7 +1566,7 @@ export class RuntimeManager {
 	 * @param {Session} [opts.session]
 	 * @param {string} [opts.sessionId]
 	 * @param {string} opts.cwd
-	 * @param {(info: { sessionId: string, session: Session, cwd: string }) => Agent} [opts.createAgent]
+	 * @param {(info: { sessionId: string, session: Session, cwd: string, getSettings?: () => any }) => Agent} [opts.createAgent]
 	 * @param {() => { model?: string, thinkingLevel?: string, models?: Record<string, any> }} [opts.getSettings]
 	 * @param {number} [opts.idleRuntimeTtlMs]
 	 * @param {number} [opts.maxIdleRuntimes]
@@ -1446,7 +1600,7 @@ export class RuntimeManager {
 		const manager = new RuntimeManager(opts, db, hub)
 		if (opts.session && opts.sessionId) {
 			manager.upsertSession(opts.session, opts.sessionId)
-			manager.createRuntime(opts.session, opts.sessionId)
+			await manager.createRuntime(opts.session, opts.sessionId)
 		}
 		manager.applyLegacyAgentViewFallbacks().catch(() => {})
 		return manager
@@ -1482,7 +1636,7 @@ export class RuntimeManager {
 		return next
 	}
 
-	createRuntime(session, id) {
+	async createRuntime(session, id) {
 		const existing = this.runtimes.get(id)
 		if (existing) {
 			if (existing.agent.isDead) {
@@ -1494,7 +1648,7 @@ export class RuntimeManager {
 			}
 		}
 		const cwd = session.getMetadata().cwd ?? this.cwd
-		const agent = this.createAgent({ sessionId: id, session, cwd })
+		const agent = this.createAgent({ sessionId: id, session, cwd, getSettings: this.opts.getSettings })
 		applySessionConfig(agent, session, cwd)
 		const runtime = new SessionRuntime({
 			sessionId: id,
@@ -1512,6 +1666,7 @@ export class RuntimeManager {
 			getSettings: this.opts.getSettings,
 			diagnostics: this.diagnostics,
 		})
+		await applySessionProviderMetadata(agent, session, cwd, this.opts.getSettings?.())
 		this.runtimes.set(id, runtime)
 		runtime.refreshSessionPropertyCache({ source: { kind: "runtime_create" } })
 		this.pruneIdleRuntimes()
@@ -1556,7 +1711,7 @@ export class RuntimeManager {
 			const cwd = opened.session.getMetadata().cwd ?? this.cwd
 			if (this.opts.noContextFiles !== true && opened.session.getSessionConfig?.().noContextFiles !== true) await ensureProjectContextMessage(opened.session, cwd)
 			this.upsertSession(opened.session, opened.id)
-			const runtime = this.createRuntime(opened.session, opened.id)
+			const runtime = await this.createRuntime(opened.session, opened.id)
 			endGetRuntime({ cache: "miss" })
 			return runtime
 		} finally {
@@ -1569,12 +1724,12 @@ export class RuntimeManager {
 		const opened = await createSession(initial.cwd)
 		if (this.opts.noContextFiles !== true) await ensureProjectContextMessage(opened.session, initial.cwd)
 		this.upsertSession(opened.session, opened.id)
-		const runtime = this.createRuntime(opened.session, opened.id)
+		const runtime = await this.createRuntime(opened.session, opened.id)
 		const settings = this.opts.getSettings?.()
 		if (settings?.defaultModel) {
 			const previousModel = runtime.agent.state.model
 			const previousPrompt = runtime.agent.state.systemPrompt
-			runtime.agent.state.model = resolveModel(settings.defaultModel, { providers: settings.providers })
+			runtime.agent.state.model = await resolveModelWithProviderMetadata(settings.defaultModel, { providers: settings.providers })
 			if (previousPrompt === systemPromptFor(initial.cwd, previousModel)) runtime.agent.state.systemPrompt = systemPromptFor(initial.cwd, runtime.agent.state.model)
 		}
 		const thinkingLevel = normalizeReasoningLevel(settings?.thinkingLevel)
@@ -1592,18 +1747,38 @@ export class RuntimeManager {
 	async branchSession(sourceId, options = {}) {
 		const sourceRuntime = await this.getRuntime(sourceId)
 		if (sourceRuntime.agent.state.isStreaming) throw Object.assign(new Error("Abort this session's running turn before branching."), { status: 409 })
-		const cwd = options.cwd ?? sourceRuntime.cwd ?? this.cwd
 		const sourceProps = sourceRuntime.effectiveSessionProperties()
+		const sourceConfig = sourceRuntime.session.getSessionConfig?.() ?? {}
+		const targetId = await createSessionId()
+		const sourceCwd = options.cwd ?? sourceProps.cwd ?? sourceRuntime.cwd ?? this.cwd
+		const workspaceBranch = await branchSessionWorkspace({
+			sourceSessionId: sourceId,
+			targetSessionId: targetId,
+			cwd: sourceCwd,
+			pathMappings: sessionWorkspacePathMappingsForEnvironment(sourceId, targetId, sourceProps, sourceConfig, sourceRuntime),
+		})
+		const cwd = workspaceBranch.cwd?.newPath ?? sourceCwd
 		const fallbackDescription = firstVisibleUserText(sourceRuntime.agent.state.messages)
-		const opened = await branchSession(sourceId, { cwd })
+		const opened = await branchSession(sourceId, { cwd, sessionId: targetId })
 		this.upsertSession(opened.session, opened.id)
-		const runtime = this.createRuntime(opened.session, opened.id)
-		applySessionConfig(runtime.agent, opened.session, cwd)
+		const runtime = await this.createRuntime(opened.session, opened.id)
 		const sourceDescription = cleanText(sourceProps.descriptionInUi || fallbackDescription || "Session branch", 148)
-		await runtime.appendSessionPropertyPatch({
+		const remappedWorktree = workspaceBranch.remapPath(sourceConfig.worktree)
+		await opened.session.appendConfigPatch(sessionConfigForAgent(runtime.agent, {
+			...sourceConfig,
+			cwd,
+			worktree: remappedWorktree ?? sourceConfig.worktree,
+		}))
+		const propertyPatch = {
 			state: sourceProps.state === "needs_input" ? "needs_input" : null,
 			descriptionInUi: sourceDescription.startsWith("(branched)") ? sourceDescription : `(branched) ${sourceDescription}`,
-		}, { kind: "branch" })
+			...(workspaceBranch.cwd?.changed ? { cwd } : {}),
+		}
+		await runtime.appendSessionPropertyPatch(propertyPatch, { kind: "branch" })
+		const notice = branchNoticeMessage(workspaceBranch)
+		const noticeEntryId = await runtime.session.appendMessage(notice)
+		runtime.agent.state.messages.push(notice)
+		runtime.agent.msgToEntryId.set(notice, noticeEntryId)
 		await this.invalidateSnapshot(opened.id)
 		return runtime
 	}
@@ -1720,7 +1895,8 @@ export class RuntimeManager {
 			const endPreviews = this.diagnostics?.span?.("RuntimeManager.loadSessionPreviews", { count: entries.length })
 			const previewRowsBySessionId = new Map()
 			try {
-				for (const row of this.db.loadSessionOverviewPreviewMessagesForSessions(entries.map((entry) => entry.id))) {
+				const ids = entries.map((entry) => entry.id)
+				for (const row of this.db.loadSessionOverviewPreviewMessagesForSessions(ids)) {
 					const rows = previewRowsBySessionId.get(row.sessionId) ?? []
 					rows.push(row)
 					previewRowsBySessionId.set(row.sessionId, rows)
@@ -1783,6 +1959,26 @@ export class RuntimeManager {
 	async systemReport(id = this.initialSessionId) {
 		if (!id) throw new Error("No session selected")
 		return (await this.getRuntime(id)).systemReport()
+	}
+
+	async worktrees(id = this.initialSessionId) {
+		if (!id) throw new Error("No session selected")
+		const existing = this.runtimes.get(id)
+		if (existing && !existing.agent.isDead) return existing.worktrees()
+		if (existing?.agent.isDead) {
+			existing.dispose()
+			this.runtimes.delete(id)
+		}
+		try {
+			const opened = await openSession(id)
+			return sessionGitWorktreeStatuses(opened.session)
+		} catch (/** @type {any} */ err) {
+			if (err?.code === "ENOENT" || /Session not found/.test(err?.message ?? "")) {
+				this.db.markSessionDeleted(id)
+				throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
+			}
+			throw err
+		}
 	}
 
 	async invalidateSnapshot(id, options = this.snapshotOptions) {

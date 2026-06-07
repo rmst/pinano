@@ -11,6 +11,7 @@ import { createHash } from "node:crypto"
 import { dirname } from "node:path"
 
 import { contextLoadDisplayMessage } from "./context-display.js"
+import { contextFileIdentityPath } from "./context-identity.js"
 
 /** @typedef {import("./types.js").SessionEntry} SessionEntry */
 /** @typedef {import("../agent-core/types.js").AgentMessage} AgentMessage */
@@ -41,6 +42,7 @@ function normalizeContextFile(file) {
 	return {
 		path: file?.path ?? "",
 		scopeDir: file?.scopeDir ?? dirname(file?.path ?? "."),
+		identityPath: file?.identityPath ?? contextFileIdentityPath(file?.path ?? ""),
 		content,
 		hash: file?.hash ?? createHash("sha256").update(content).digest("hex"),
 	}

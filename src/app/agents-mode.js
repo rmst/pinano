@@ -72,10 +72,13 @@ import { applySessionEvent, cloneSessionSnapshot, eventInvalidatesSessionList, e
 import { overviewRoute, routeToArg, routeToCliArgs, sessionRoute, settingsCredentialsRoute } from "./routes.js"
 import { reexecRuntime } from "./reexec-runtime.js"
 import { NativeSandboxStartupPage, nativeSandboxStartupIssue } from "./native-sandbox-onboarding.js"
+import { UPDATE_CHECK_NOTICE_MS, checkForUpdateNotice } from "./update-check.js"
 
 
 /** @typedef {import("./stderr-capture.js").StderrCapture} StderrCapture */
 /** @typedef {import("./routes.js").PinanoRoute} PinanoRoute */
+
+const OVERVIEW_AGE_WIDTH = 3
 
 /** @param {string} text */
 function stripAnsi(text) {
@@ -88,6 +91,11 @@ function stripAnsi(text) {
  */
 function padToWidth(text, width) {
 	return text + " ".repeat(Math.max(0, width - visibleWidth(text)))
+}
+
+/** @param {string} text */
+function modelLineDivider(text) {
+	return theme.dim(text)
 }
 
 /**
@@ -176,7 +184,7 @@ function leftRightLine(left, right, width) {
 /** @param {Array<[string, string]>} hints @param {number} width */
 function renderKeyHints(hints, width) {
 	const line = hints
-		.map(([key, label]) => `${theme.cyan(key)} ${theme.dim(label)}`)
+		.map(([key, label]) => label ? `${theme.cyan(key)} ${theme.dim(label)}` : theme.cyan(key))
 		.join(theme.dim(" · "))
 	return [fit(line, width)]
 }
@@ -216,9 +224,9 @@ export function overviewModelStatusText(settings) {
 function overviewModelStatusLine(settings, usageStatus) {
 	const label = overviewModelLabel(settings)
 	if (!label) return ""
-	const base = [theme.cyan(label), theme.dim(`reasoning=${reasoningLevelLabel(settings?.thinkingLevel)}`)].join(theme.dim(" │ "))
+	const base = [theme.cyan(label), theme.dim(`reasoning=${reasoningLevelLabel(settings?.thinkingLevel)}`)].join(modelLineDivider(" │ "))
 	return usageStatus?.text
-		? `${base}${theme.dim(" | ")}${colorUsageStatus(usageStatus.text, usageStatus.tone)}`
+		? `${base}${modelLineDivider(" | ")}${colorUsageStatus(usageStatus.text, usageStatus.tone)}`
 		: base
 }
 
@@ -295,7 +303,20 @@ function relativeAge(iso) {
 	if (minutes < 60) return `${minutes}m`
 	const hours = Math.floor(minutes / 60)
 	if (hours < 48) return `${hours}h`
-	return `${Math.floor(hours / 24)}d`
+	const days = Math.floor(hours / 24)
+	if (days < 100) return `${days}d`
+	if (days >= 365) {
+		const years = Math.floor(days / 365)
+		return `${Math.min(99, Math.max(1, years))}y`
+	}
+	const weeks = Math.floor(days / 7)
+	return `${weeks}w`
+}
+
+/** @param {string} iso */
+function overviewAgeText(iso) {
+	const age = relativeAge(iso)
+	return age ? theme.dim(age.padStart(OVERVIEW_AGE_WIDTH, " ")) : ""
 }
 
 /** @param {string | undefined} iso */
@@ -776,10 +797,10 @@ export class AgentTable {
 	 */
 	renderRow(session, selected, width) {
 		const description = session.agentView?.description || session.preview?.first?.text || session.preview?.lastUser?.text || this.activity.get(session.id) || session.id.slice(0, 8)
-		const age = relativeAge(session.updatedAt)
+		const age = overviewAgeText(session.updatedAt)
 		const prefix = `${selected ? "›" : " "} ${this.iconFor(session)} `
-		const suffix = age ? ` ${theme.dim(age)}` : ""
-		const available = Math.max(10, width - visibleWidth(stripAnsi(prefix)) - visibleWidth(stripAnsi(suffix)))
+		const renderedSuffix = age ? ` ${age}` : ""
+		const available = Math.max(10, width - visibleWidth(stripAnsi(prefix)) - visibleWidth(stripAnsi(renderedSuffix)))
 		const projectLabel = this.projectLabelFor(session)
 		const labelWidth = projectLabel ? Math.max(1, Math.min(24, Math.floor(available * 0.3))) : 0
 		const renderedLabel = projectLabel ? truncateToWidth(projectLabel, labelWidth, "", false) : ""
@@ -787,7 +808,7 @@ export class AgentTable {
 		const rowBody = renderedLabel
 			? `${theme.dim(renderedLabel)} ${fit(description.replace(/\s+/g, " "), descriptionWidth)}`
 			: fit(description.replace(/\s+/g, " "), available)
-		const text = `${prefix}${rowBody}${suffix}`
+		const text = `${prefix}${rowBody}${renderedSuffix}`
 		return fit(text, width)
 	}
 
@@ -860,6 +881,28 @@ class OverviewModelLine {
 	}
 }
 
+export class OverviewNoticeLine {
+	/** @param {() => ({ text: string, tone?: "normal" | "warn" | "error" } | undefined)} notice */
+	constructor(notice) {
+		this.notice = notice
+	}
+	invalidate() {}
+	lineCount() {
+		return this.notice()?.text ? 1 : 0
+	}
+	/** @param {number} width */
+	render(width) {
+		const notice = this.notice()
+		if (!notice?.text) return []
+		const render = notice.tone === "warn"
+			? theme.yellow
+			: notice.tone === "error"
+				? theme.red
+				: theme.dim
+		return [render(fit(notice.text, width))]
+	}
+}
+
 export class OverviewKeyHints {
 	/** @param {() => { filterMode?: boolean, peeking?: boolean, hasText?: boolean }} state */
 	constructor(state) {
@@ -877,32 +920,30 @@ export class OverviewKeyHints {
 		if (state.peeking && state.hasText) return renderKeyHints([
 			["Enter", "reply"],
 			["Ctrl+J", "newline"],
-			["Ctrl+V", "image"],
 			["Esc", "clear"],
-			["/help", "more"],
+			["/help", ""],
 		], width)
 		if (state.hasText) return renderKeyHints([
 			["Enter", "dispatch"],
 			["Ctrl+J", "newline"],
-			["Ctrl+V", "image"],
 			["Esc", "clear"],
-			["/help", "more"],
+			["/help", ""],
 		], width)
 		if (state.peeking) return renderKeyHints([
 			["Enter/→", "open"],
 			["↑/↓", "move"],
 			["Ctrl+F", "filter"],
-			["Ctrl+V", "image"],
 			["Ctrl+D", "done"],
-			["/help", "more"],
+			["Ctrl+E", "defer"],
+			["/help", ""],
 		], width)
 		return renderKeyHints([
 			["Enter/→", "open"],
 			["↑/↓", "move"],
 			["Ctrl+F", "filter"],
-			["Ctrl+V", "image"],
 			["Ctrl+D", "done"],
-			["/help", "more"],
+			["Ctrl+E", "defer"],
+			["/help", ""],
 		], width)
 	}
 }
@@ -919,7 +960,6 @@ export class SessionKeyHints {
 		if (state.hasText) return renderKeyHints([
 			["Enter", "send"],
 			["Ctrl+J", "newline"],
-			["Ctrl+V", "image"],
 			["Esc Esc", "clear"],
 			["Ctrl+C", "detach"],
 			["/help", "more"],
@@ -928,7 +968,7 @@ export class SessionKeyHints {
 			["←", "back"],
 		])
 		if (state.interruptible) hints.push(["Esc", "interrupt"])
-		hints.push(["Ctrl+V", "image"], ["Ctrl+C", "detach"], ["/help", "more"])
+		hints.push(["Ctrl+C", "detach"], ["/help", "more"])
 		return renderKeyHints(hints, width)
 	}
 }
@@ -1702,18 +1742,6 @@ async function showCredentialsSettings(tui, options = {}) {
 	})
 }
 
-async function updateScopedModelsSetting(ctx, settings, notify) {
-	const models = await availableModelEntries(settings)
-	const rows = rowsForModels(models, { scopedModelIds: settings.scopedModelIds })
-	const id = await pickModel(ctx, rows, { mode: "toggle", title: "Scoped models", subtitle: "Pick a model to add/remove from the scoped shortlist." }) ?? ""
-	if (!id) return
-	const next = settings.scopedModelIds.includes(id)
-		? settings.scopedModelIds.filter((existing) => existing !== id)
-		: [...settings.scopedModelIds, id]
-	await updateSetting("scopedModelIds", next)
-	notify(`scoped models: ${next.join(", ") || "(empty)"}`)
-}
-
 async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultModel, setDefaultReasoning, refreshAuthCache } = {}) {
 	const write = notify ?? (() => {})
 	while (true) {
@@ -1722,12 +1750,8 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 			{ value: "credentials", label: "credentials", description: "manage ChatGPT subscription OAuth and API keys" },
 			{ value: "model", label: `model: ${currentDefaultModelRef(settings)}`, description: "default model for new sessions" },
 			{ value: "thinkingLevel", label: `reasoning: ${reasoningLevelLabel(settings.thinkingLevel)}`, description: "default reasoning effort for new sessions" },
-			{ value: "autocompactThreshold", label: `autocompactThreshold: ${settings.autocompactThreshold}`, description: "fraction of context window before auto-compaction" },
-			{ value: "scopedModelIds", label: `scopedModelIds: ${settings.scopedModelIds.length} model(s)`, description: "model shortlist shown by the model selector" },
-			{ value: "doubleEscapeAction", label: `doubleEscapeAction: ${settings.doubleEscapeAction}`, description: "Esc Esc behavior" },
 			{ value: "web", label: `web: ${settings.web ? "on" : "off"}`, description: "enable Pinano Web CLI and /web commands" },
-			{ value: "showThinkingOutput", label: `showThinkingOutput: ${settings.showThinkingOutput ? "on" : "off"}`, description: "show model reasoning text in the transcript" },
-			{ value: "showToolOutput", label: `showToolOutput: ${settings.showToolOutput ? "on" : "off"}`, description: "show successful tool result bodies in the transcript" },
+			{ value: "updateCheck", label: `updateCheck: ${settings.updateCheck ? "on" : "off"}`, description: "check GitHub once per day for new Pinano releases" },
 		])
 		if (!choice) return
 		if (choice === "credentials") {
@@ -1741,7 +1765,7 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 				continue
 			}
 			const current = currentDefaultModelRef(settings)
-			const rows = rowsForModels(models, { currentId: current, scopedModelIds: settings.scopedModelIds })
+			const rows = rowsForModels(models, { currentId: current })
 			const chosen = await pickModel(ctx, rows, { initialSelectedValue: current, title: "Default model", subtitle: "Pick the default model for new sessions." }) ?? ""
 			if (!chosen) continue
 			const updated = await setDefaultModel?.(chosen) ?? await updateDefaultModel(chosen, settings)
@@ -1757,19 +1781,6 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 			write(`default reasoning → ${level}`)
 			continue
 		}
-		if (choice === "scopedModelIds") {
-			await updateScopedModelsSetting(ctx, settings, write)
-			await onSettingsChanged?.(await loadSettings())
-			continue
-		}
-		if (choice === "doubleEscapeAction") {
-			const order = ["rewind", "none"]
-			const next = order[(order.indexOf(settings.doubleEscapeAction) + 1) % order.length]
-			const updated = await updateSetting("doubleEscapeAction", /** @type {any} */ (next))
-			await onSettingsChanged?.(updated)
-			write(`doubleEscapeAction → ${next}`)
-			continue
-		}
 		if (choice === "web") {
 			const next = !settings.web
 			const updated = await updateSetting("web", next)
@@ -1777,31 +1788,12 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 			write(`web → ${next ? "on" : "off"}`)
 			continue
 		}
-		if (choice === "showThinkingOutput") {
-			const next = !settings.showThinkingOutput
-			const updated = await updateSetting("showThinkingOutput", next)
+		if (choice === "updateCheck") {
+			const next = !settings.updateCheck
+			const updated = await updateSetting("updateCheck", next)
 			await onSettingsChanged?.(updated)
-			write(`showThinkingOutput → ${next ? "on" : "off"}`)
+			write(`updateCheck → ${next ? "on" : "off"}`)
 			continue
-		}
-		if (choice === "showToolOutput") {
-			const next = !settings.showToolOutput
-			const updated = await updateSetting("showToolOutput", next)
-			await onSettingsChanged?.(updated)
-			write(`showToolOutput → ${next ? "on" : "off"}`)
-			continue
-		}
-		if (choice === "autocompactThreshold") {
-			const raw = await promptForInput(ctx.tui, `autocompactThreshold (${settings.autocompactThreshold})`)
-			if (raw == null) continue
-			const parsed = Number(raw.trim())
-			if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
-				write(`invalid value: ${raw}`)
-				continue
-			}
-			const updated = await updateSetting("autocompactThreshold", parsed)
-			await onSettingsChanged?.(updated)
-			write(`autocompactThreshold → ${parsed}`)
 		}
 	}
 }
@@ -1884,16 +1876,58 @@ class SessionInfoLine {
 		this.getSnapshot = getSnapshot
 	}
 
+	/** @param {any} snapshot */
+	descriptionFor(snapshot) {
+		const explicit = singleLine(snapshot?.agentView?.descriptionInUi ?? snapshot?.agentView?.description)
+		if (explicit) return explicit
+		const messages = Array.isArray(snapshot?.messages) ? snapshot.messages : []
+		const firstUser = messages.find((message) => message?.role === "user")
+		return singleLine(flattenContent(firstUser?.content)) || "ready"
+	}
+
 	/** @param {number} width */
 	render(width) {
 		const snapshot = this.getSnapshot()
-		const cwd = singleLine(snapshot?.cwd) || "?"
-		const description = singleLine(snapshot?.agentView?.descriptionInUi ?? snapshot?.agentView?.description)
-		const text = description
-			? `${theme.cyan(cwd)}${theme.dim(" │ ")}${theme.dim(description)}`
-			: theme.cyan(cwd)
-		return [truncateToWidth(text, Math.max(1, width), "", true)]
+		const project = singleLine(snapshot?.agentView?.projectTag)
+		const description = this.descriptionFor(snapshot)
+		const parts = []
+		if (project) parts.push(theme.cyan(project))
+		if (description) parts.push(theme.dim(description))
+		return [fit(parts.join(modelLineDivider(" │ ")), Math.max(1, width))]
 	}
+}
+
+function worktreeRef(worktree) {
+	if (worktree?.branch) return worktree.branch
+	if (worktree?.detached) return `detached ${worktree.detached}`
+	return ""
+}
+
+function formatWorktreeInfoLine(worktree) {
+	const status = singleLine(worktree?.status) || "unknown"
+	const ref = worktreeRef(worktree)
+	const path = worktree?.path ? compactHomePath(worktree.path) : "?"
+	return `  ${[status, ref, path].filter(Boolean).join("  ")}`
+}
+
+export function sessionInfoBody(snapshot, sessionId, worktrees = []) {
+	const lines = [
+		`id:        ${sessionId}`,
+		`cwd:       ${snapshot?.cwd ?? "?"}`,
+		`model:     ${snapshot?.model?.id ?? "?"}`,
+		`provider:  ${snapshot?.model?.provider ?? "?"}`,
+		`reasoning: ${reasoningLevelLabel(snapshot?.thinkingLevel)}`,
+		`fast:      ${snapshot?.serviceTier === "priority" && isFastModeEligibleModel(snapshot?.model) ? "on" : "off"}`,
+		`streaming: ${snapshot?.isStreaming ? "yes" : "no"}`,
+		`messages:  ${snapshot?.messages?.length ?? 0}`,
+	]
+	if (!Array.isArray(worktrees) || worktrees.length === 0) {
+		lines.push("worktrees: none")
+	} else {
+		lines.push(`worktrees: ${worktrees.length}`)
+		lines.push(...worktrees.map(formatWorktreeInfoLine))
+	}
+	return lines.join("\n")
 }
 
 export class Chat {
@@ -2410,16 +2444,8 @@ export class Chat {
 			return
 		}
 		if (name === "session") {
-			await this.showModal("Session", [
-				`id:        ${this.sessionId}`,
-				`cwd:       ${this.snapshot?.cwd ?? "?"}`,
-				`model:     ${this.snapshot?.model?.id ?? "?"}`,
-				`provider:  ${this.snapshot?.model?.provider ?? "?"}`,
-				`reasoning: ${reasoningLevelLabel(this.snapshot?.thinkingLevel)}`,
-				`fast:      ${this.snapshot?.serviceTier === "priority" && isFastModeEligibleModel(this.snapshot?.model) ? "on" : "off"}`,
-				`streaming: ${this.snapshot?.isStreaming ? "yes" : "no"}`,
-				`messages:  ${this.snapshot?.messages?.length ?? 0}`,
-			].join("\n"))
+			const worktrees = this.client.worktrees ? await this.client.worktrees(this.sessionId) : []
+			await this.showModal("Session", sessionInfoBody(this.snapshot, this.sessionId, worktrees))
 			return
 		}
 		if (name === "branch") {
@@ -3078,8 +3104,10 @@ export async function runServiceTuiMode(options) {
 	let promptLabel = /** @type {PromptLabel | undefined} */ (undefined)
 	let overviewModelLine = /** @type {OverviewModelLine | undefined} */ (undefined)
 	let overviewUsageStatus = /** @type {{ text: string, tone: "normal" | "warn" | "error" } | undefined} */ (undefined)
+	let overviewBottomNotice = /** @type {{ text: string, tone?: "normal" | "warn" | "error" } | undefined} */ (undefined)
 	let overviewSpinnerFrameIndex = 0
 	const overviewSpinnerFrame = () => LOADER_SPINNER_FRAMES[overviewSpinnerFrameIndex] ?? "✽"
+	const overviewNoticeLine = new OverviewNoticeLine(() => overviewBottomNotice)
 	const table = new AgentTable({
 		cwd: options.cwd,
 		spinnerFrame: overviewSpinnerFrame,
@@ -3088,7 +3116,8 @@ export async function runServiceTuiMode(options) {
 			- overviewKeyHintLines
 			- (promptLabel?.lineCount() ?? 0)
 			- editor.getRenderedLineCount(width)
-			- (overviewModelLine?.lineCount() ?? 0),
+			- (overviewModelLine?.lineCount() ?? 0)
+			- overviewNoticeLine.lineCount(),
 		getEmptyLines: () => hasModelProvider ? [
 			"No sessions yet.",
 		] : [
@@ -3152,10 +3181,29 @@ export async function runServiceTuiMode(options) {
 		if (shouldAnimateOverviewSpinner()) startOverviewSpinner()
 		else stopOverviewSpinner()
 	}
+	/** @type {ReturnType<typeof setTimeout> | undefined} */
+	let overviewBottomNoticeTimer = undefined
+	const clearOverviewBottomNoticeTimer = () => {
+		if (overviewBottomNoticeTimer) clearTimeout(overviewBottomNoticeTimer)
+		overviewBottomNoticeTimer = undefined
+	}
 	const requestShellRender = (force = false) => {
 		editor.invalidate()
 		syncOverviewSpinner()
 		tui.requestRender(force)
+	}
+	const setOverviewBottomNotice = (notice, { timeoutMs } = {}) => {
+		clearOverviewBottomNoticeTimer()
+		overviewBottomNotice = notice
+		if (notice?.text && timeoutMs) {
+			overviewBottomNoticeTimer = setTimeout(() => {
+				overviewBottomNotice = undefined
+				overviewBottomNoticeTimer = undefined
+				requestShellRender()
+			}, timeoutMs)
+			overviewBottomNoticeTimer.unref?.()
+		}
+		requestShellRender()
 	}
 	const overviewPromptAttachmentsForText = (text) => promptAttachmentsForText(overviewPromptImages, text)
 	const clearOverviewPromptImagesForText = (text) => {
@@ -3322,6 +3370,7 @@ export async function runServiceTuiMode(options) {
 		exiting = true
 		scheduleRowsRefresh.cancel()
 		scheduleCodexUsageRefresh.cancel()
+		clearOverviewBottomNoticeTimer()
 		stopOverviewSpinner()
 		currentChat?.dispose()
 		if (unsubscribe) {
@@ -3350,6 +3399,7 @@ export async function runServiceTuiMode(options) {
 		root.addChild(promptLabel)
 		root.addChild(editor)
 		root.addChild(overviewModelLine)
+		root.addChild(overviewNoticeLine)
 		syncOverviewSpinner()
 	}
 
@@ -3479,6 +3529,7 @@ export async function runServiceTuiMode(options) {
 		settings = nextSettings
 		webEnabled = nextSettings.web === true
 		messageRenderOptions = messageRenderOptionsFromSettings(nextSettings)
+		if (nextSettings.updateCheck !== true) setOverviewBottomNotice(undefined)
 		if (currentChat) currentChat.webEnabled = webEnabled
 		requestShellRender()
 	}
@@ -3506,10 +3557,7 @@ export async function runServiceTuiMode(options) {
 				setOverviewNotice("no authenticated models available; open /credentials first")
 				return
 			}
-			const rows = rowsForModels(models, {
-				currentId: currentDefaultModelRef(settings),
-				scopedModelIds: settings.scopedModelIds,
-			})
+			const rows = rowsForModels(models, { currentId: currentDefaultModelRef(settings) })
 			chosen = await pickModel(overviewCommandCtx, rows, { initialSelectedValue: currentDefaultModelRef(settings), title: "Default model", subtitle: "Pick the default model for new sessions." }) ?? ""
 			if (!chosen) return
 		}
@@ -3790,11 +3838,7 @@ export async function runServiceTuiMode(options) {
 					return { consume: true }
 				}
 				if (doubleEscape.press()) {
-					loadSettings()
-						.then((settings) => settings.doubleEscapeAction)
-						.then((action) => {
-							if (action !== "none") return currentChat?.handleSlash("rewind")
-						})
+					currentChat?.handleSlash("rewind")
 						.catch((err) => {
 							if (showStaleRuntime(err)) return
 							currentChat?.appendLine(theme.red(`[escape error] ${err?.message ?? err}`))
@@ -3950,6 +3994,14 @@ export async function runServiceTuiMode(options) {
 		await openCredentialsSettingsPage()
 	} else if (!staleRuntimeActive && !(await hasConfiguredProviderCredentials())) {
 		await openCredentialsSettingsPage({ onboarding: true })
+	}
+	if (!staleRuntimeActive && currentRoute.type === "overview") {
+		void checkForUpdateNotice(settings)
+			.then((notice) => {
+				if (!notice || staleRuntimeActive || currentRoute.type !== "overview") return
+				setOverviewBottomNotice({ text: notice.message, tone: "warn" }, { timeoutMs: UPDATE_CHECK_NOTICE_MS })
+			})
+			.catch(() => {})
 	}
 
 	await new Promise(() => {})

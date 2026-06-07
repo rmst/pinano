@@ -9,6 +9,7 @@ import {
 import { defaultNativeSandboxEnvironment, disableEnvironmentSandbox, loadEnvironmentRegistry } from "./environments.js"
 import { theme } from "./theme.js"
 import { probeNativeSandbox } from "./worker-launchers.js"
+import { downloadBundledBubblewrap as downloadBundledBubblewrapAsset } from "./bundled-bwrap.js"
 
 export const nativeSandboxOnboardingPollMs = 5000
 
@@ -43,11 +44,24 @@ function titleForPlatform(platform) {
 	return "Native sandboxing is unavailable"
 }
 
-/** @param {string} platform */
-function bodyForPlatform(platform) {
+function canDownloadBundledBubblewrapFromProbe(probe) {
+	return Boolean(probe?.downloadableBundledBubblewrap)
+}
+
+/** @param {string} platform @param {any} [probe] */
+function bodyForPlatform(platform, probe) {
 	if (platform === "linux") {
-		return [
+		const base = [
 			"Pinano uses bubblewrap (bwrap) for Linux native tool sandboxing. The default local environment is configured for native sandboxing, but the sandbox probe failed.",
+		]
+		if (canDownloadBundledBubblewrapFromProbe(probe)) {
+			return [
+				...base,
+				"System bwrap was not found. Pinano can download a pinned static Bubblewrap binary from the Pinano release assets, verify its digest, cache it under PINANO_HOME, and retry the sandbox.",
+			]
+		}
+		return [
+			...base,
 			"Install bubblewrap, or enable unprivileged user namespaces if your distro requires it, and keep this page open; Pinano checks again automatically.",
 		]
 	}
@@ -81,6 +95,7 @@ export class NativeSandboxStartupPage extends RetainedComponent {
 	 * @param {object} options
 	 * @param {{ target: { environmentId: string, platform: string }, probe: any }} options.issue
 	 * @param {() => Promise<any>} [options.probe]
+	 * @param {() => Promise<any>} [options.downloadBundledBubblewrap]
 	 * @param {() => Promise<void>} [options.disableSandbox]
 	 * @param {number} [options.pollIntervalMs]
 	 * @param {() => void} [options.requestRender]
@@ -90,11 +105,13 @@ export class NativeSandboxStartupPage extends RetainedComponent {
 		this.issue = options.issue
 		this.latestProbe = options.issue.probe
 		this.probe = options.probe ?? (() => probeNativeSandbox({ platform: this.issue.target.platform }))
+		this.downloadBundledBubblewrap = options.downloadBundledBubblewrap ?? (() => downloadBundledBubblewrapAsset({ platform: this.issue.target.platform }))
 		this.disableSandbox = options.disableSandbox ?? (() => disableEnvironmentSandbox(this.issue.target.environmentId))
 		this.pollIntervalMs = options.pollIntervalMs ?? nativeSandboxOnboardingPollMs
 		this.requestRender = options.requestRender ?? (() => {})
 		this.status = `Waiting; checking again every ${pollSeconds(this.pollIntervalMs)}s.`
 		this.saving = false
+		this.downloading = false
 		this.polling = false
 		this.resolved = false
 		this.timer = undefined
@@ -133,7 +150,7 @@ export class NativeSandboxStartupPage extends RetainedComponent {
 	}
 
 	async pollOnce() {
-		if (this.resolved || this.saving || this.polling) return
+		if (this.resolved || this.saving || this.downloading || this.polling) return
 		this.polling = true
 		this.setStatus("Checking native sandbox...")
 		try {
@@ -154,8 +171,36 @@ export class NativeSandboxStartupPage extends RetainedComponent {
 		}
 	}
 
+	async downloadBundledBubblewrapAndRetry() {
+		if (this.resolved || this.saving || this.downloading) return
+		if (!canDownloadBundledBubblewrapFromProbe(this.latestProbe)) {
+			this.setStatus("No bundled Bubblewrap download is available for this sandbox failure.")
+			return
+		}
+		this.downloading = true
+		this.setStatus("Downloading bundled Bubblewrap...")
+		try {
+			const download = await this.downloadBundledBubblewrap()
+			if (this.resolved) return
+			this.setStatus(download?.reused ? "Bundled Bubblewrap is already cached. Checking sandbox..." : "Bundled Bubblewrap downloaded. Checking sandbox...")
+			const result = await this.probe()
+			if (this.resolved) return
+			this.latestProbe = result
+			if (result.ok) {
+				this.setStatus("Native sandbox is available. Continuing...")
+				this.finish({ action: "sandbox-ready" })
+				return
+			}
+			this.setStatus(`Downloaded Bubblewrap, but the sandbox is still unavailable; checking again every ${pollSeconds(this.pollIntervalMs)}s.`)
+		} catch (err) {
+			if (!this.resolved) this.setStatus(`Could not download bundled Bubblewrap: ${err?.message ?? err}`)
+		} finally {
+			this.downloading = false
+		}
+	}
+
 	async continueWithoutSandbox() {
-		if (this.resolved || this.saving) return
+		if (this.resolved || this.saving || this.downloading) return
 		this.saving = true
 		this.setStatus("Saving unsandboxed environment...")
 		try {
@@ -172,6 +217,10 @@ export class NativeSandboxStartupPage extends RetainedComponent {
 	/** @param {string} data */
 	handleInput(data) {
 		if (isKeyRelease(data)) return
+		if (this.issue.target.platform === "linux" && (matchesKey(data, "d") || data === "D")) {
+			void this.downloadBundledBubblewrapAndRetry()
+			return
+		}
 		if (matchesKey(data, "enter") || matchesKey(data, "escape")) {
 			void this.continueWithoutSandbox()
 		}
@@ -186,16 +235,26 @@ export class NativeSandboxStartupPage extends RetainedComponent {
 		const platform = this.issue.target.platform
 		const probeDetail = singleLine(this.latestProbe?.detail)
 		const command = singleLine(this.latestProbe?.command)
+		const downloadInfo = this.latestProbe?.downloadableBundledBubblewrap
 		const lines = [
 			line(),
 			line(),
 			line(theme.bold(titleForPlatform(platform))),
 			line(),
-			...bodyForPlatform(platform).flatMap((paragraph) => [...wrap(paragraph), line()]),
+			...bodyForPlatform(platform, this.latestProbe).flatMap((paragraph) => [...wrap(paragraph), line()]),
 			line(theme.dim(`Environment: ${this.issue.target.environmentId}`)),
 			...(command ? [line(theme.dim(`Probe command: ${command}`))] : []),
+			...(downloadInfo ? [
+				line(theme.dim(`Bundled asset: ${downloadInfo.assetName}`)),
+				line(theme.dim(`Pinano release: ${downloadInfo.releaseTag}`)),
+				line(theme.dim(`Source: OpenAI Codex ${downloadInfo.sourceReleaseTag}`)),
+			] : []),
 			...(probeDetail ? [line(), ...wrap(theme.fg("warning", `Last probe: ${probeDetail}`))] : []),
 			line(),
+			...(downloadInfo ? [
+				...wrap(`Press ${theme.cyan("D")} to download bundled Bubblewrap and retry native sandboxing.`),
+				line(),
+			] : []),
 			...wrap(`Press ${theme.cyan("Enter")} or ${theme.cyan("Esc")} to continue without native sandboxing. Pinano will save sandbox.type "none" for this environment.`),
 			line(`${theme.cyan("Ctrl+C")} exit`),
 			line(),

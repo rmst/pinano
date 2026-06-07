@@ -172,7 +172,9 @@
  * @property {number} [contextWindow]
  * @property {number} [maxTokens]
  * @property {number|false|null} [responseHeaderTimeoutMs] Override Responses transport timeout before response headers.
- * @property {number|false|null} [streamInactivityTimeoutMs] Override timeout while waiting for SSE stream data after response headers.
+ * @property {number|false|null} [streamInactivityTimeoutMs] Override timeout while waiting for raw SSE stream data after response headers.
+ * @property {number|false|null} [firstStreamEventTimeoutMs] Override timeout while waiting for the first parsed SSE event after response headers.
+ * @property {number|false|null} [streamEventInactivityTimeoutMs] Override timeout while waiting for parsed SSE events after the first event.
  * @property {Record<string, string>} [headers] Extra HTTP headers
  * @property {OpenAICompat} [compat]
  * @property {boolean} [supportsTextVerbosity]
@@ -194,7 +196,9 @@
  * @property {AbortSignal} [signal]
  * @property {string} [sessionId] Sent as prompt_cache_key when supported
  * @property {number|false|null} [responseHeaderTimeoutMs] Override Responses transport timeout before response headers.
- * @property {number|false|null} [streamInactivityTimeoutMs] Override timeout while waiting for SSE stream data after response headers.
+ * @property {number|false|null} [streamInactivityTimeoutMs] Override timeout while waiting for raw SSE stream data after response headers.
+ * @property {number|false|null} [firstStreamEventTimeoutMs] Override timeout while waiting for the first parsed SSE event after response headers.
+ * @property {number|false|null} [streamEventInactivityTimeoutMs] Override timeout while waiting for parsed SSE events after the first event.
  * @property {string} [serviceTier]
  * @property {Record<string, string>} [headers]
  * @property {(payload: any, model: Model) => any} [onPayload]

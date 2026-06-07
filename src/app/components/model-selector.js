@@ -1,6 +1,6 @@
 // Full-width model selector shown via the chat `showSelector` swap.
 // Mirrors pi's model selector shape: search input, provider badges, current
-// marker, and an optional all/scoped toggle when scoped models are configured.
+// marker, and model metadata.
 
 import {
 	Container,
@@ -24,11 +24,7 @@ import { modelEntryMatches, modelRef, modelRefMatches } from "../models.js"
  * @property {string} value
  * @property {ModelEntry} entry
  * @property {boolean} [current]
- * @property {boolean} [scoped]
  */
-
-/** @typedef {"select" | "toggle"} ModelSelectorMode */
-/** @typedef {"all" | "scoped"} ModelScope */
 
 /** @implements {Component} */
 class DynamicBorder {
@@ -88,22 +84,12 @@ function costText(entry) {
  */
 class ModelList {
 	/** @type {ModelRow[]} */
-	allRows
-	/** @type {ModelRow[]} */
-	scopedRows
-	/** @type {ModelRow[]} */
-	activeRows
+	rows
 	/** @type {ModelRow[]} */
 	filteredRows
 	selectedIndex = 0
-	/** @type {ModelScope} */
-	scope
-	/** @type {ModelSelectorMode} */
-	mode
 	/** @type {Input} */
 	searchInput
-	/** @type {(scope: ModelScope) => void} */
-	onScopeChange
 	focused = false
 
 	/** @type {((row: ModelRow) => void) | undefined} */
@@ -114,22 +100,14 @@ class ModelList {
 	/**
 	 * @param {ModelRow[]} rows
 	 * @param {{
-	 *   mode: ModelSelectorMode,
 	 *   initialSelectedValue?: string,
-	 *   initialScope?: ModelScope,
 	 *   searchInput: Input,
-	 *   onScopeChange: (scope: ModelScope) => void,
 	 * }} opts
 	 */
 	constructor(rows, opts) {
-		this.allRows = rows
-		this.scopedRows = rows.filter((r) => r.scoped)
-		this.scope = opts.initialScope ?? "all"
-		this.mode = opts.mode
+		this.rows = rows
 		this.searchInput = opts.searchInput
-		this.onScopeChange = opts.onScopeChange
-		this.activeRows = this.scope === "scoped" ? this.scopedRows : this.allRows
-		this.filteredRows = this.activeRows
+		this.filteredRows = this.rows
 		const initial = opts.initialSelectedValue
 			? this.filteredRows.findIndex((r) => r.value === opts.initialSelectedValue)
 			: this.filteredRows.findIndex((r) => r.current)
@@ -138,36 +116,15 @@ class ModelList {
 
 	invalidate() {}
 
-	/** @param {ModelScope} scope */
-	setScope(scope) {
-		if (this.scope === scope) return
-		this.scope = scope
-		this.activeRows = this.scope === "scoped" ? this.scopedRows : this.allRows
-		const currentIndex = this.activeRows.findIndex((r) => r.current)
-		this.selectedIndex = currentIndex >= 0 ? currentIndex : 0
-		this.filter(this.searchInput.getValue())
-		this.onScopeChange(this.scope)
-	}
-
-	/** @returns {ModelScope} */
-	getScope() {
-		return this.scope
-	}
-
-	/** @returns {boolean} */
-	hasScopedRows() {
-		return this.scopedRows.length > 0
-	}
-
 	/** @param {string} query */
 	filter(query) {
 		this.filteredRows = query
 			? fuzzyFilter(
-					this.activeRows,
+					this.rows,
 					query,
 					({ entry, value }) => `${value} ${entry.id} ${entry.displayName} ${entry.provider} ${providerLabel(entry)}`,
 				)
-			: this.activeRows
+			: this.rows
 		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredRows.length - 1))
 	}
 
@@ -182,8 +139,6 @@ class ModelList {
 		const cursor = selected ? theme.fg("accent", "› ") : "  "
 		const provider = theme.fg("muted", `[${providerLabel(entry)}]`)
 		const check = row.current ? theme.fg("success", " ✓") : ""
-		const scoped = this.mode === "toggle" && row.scoped ? theme.fg("accent", " scoped") : ""
-		const toggle = this.mode === "toggle" ? (row.scoped ? theme.fg("success", "[x] ") : theme.fg("muted", "[ ] ")) : ""
 		const title = selected ? theme.fg("accent", entry.id) : entry.id
 		const summaryParts = [
 			entry.displayName,
@@ -191,7 +146,7 @@ class ModelList {
 			`${formatTokens(entry.maxTokens)} out`,
 			costText(entry),
 		]
-		const prefix = `${cursor}${toggle}${title} ${provider}${check}${scoped}`
+		const prefix = `${cursor}${title} ${provider}${check}`
 		const summary = theme.fg("dim", `  ${summaryParts.join(" · ")}`)
 		const remaining = Math.max(1, width - visibleWidth(prefix) - 1)
 		return [prefix + truncateToWidth(summary, remaining, "…")]
@@ -227,10 +182,6 @@ class ModelList {
 	handleInput(keyData) {
 		const data = typeof keyData === "string" ? keyData : keyData.toString("binary")
 		const kb = getKeybindings()
-		if (kb.matches(data, "tui.input.tab") && this.hasScopedRows()) {
-			this.setScope(this.scope === "all" ? "scoped" : "all")
-			return
-		}
 		if (kb.matches(data, "tui.select.up")) {
 			if (this.filteredRows.length === 0) return
 			this.selectedIndex = this.selectedIndex === 0 ? this.filteredRows.length - 1 : this.selectedIndex - 1
@@ -261,8 +212,6 @@ export class ModelSelectorComponent extends Container {
 	searchInput
 	/** @type {ModelList} */
 	list
-	/** @type {Text | undefined} */
-	scopeText
 	_focused = false
 
 	/** @type {((row: ModelRow) => void) | undefined} */
@@ -283,7 +232,6 @@ export class ModelSelectorComponent extends Container {
 	/**
 	 * @param {ModelRow[]} rows
 	 * @param {{
-	 *   mode?: ModelSelectorMode,
 	 *   initialSelectedValue?: string,
 	 *   title?: string,
 	 *   subtitle?: string,
@@ -292,17 +240,13 @@ export class ModelSelectorComponent extends Container {
 	 */
 	constructor(rows, opts = {}) {
 		super()
-		const mode = opts.mode ?? "select"
 		this.addChild(new Spacer(1))
-		this.addChild(new Text(theme.bold(opts.title ?? (mode === "toggle" ? "Scoped models" : "Select model")), 1, 0))
+		this.addChild(new Text(theme.bold(opts.title ?? "Select model"), 1, 0))
 		this.addChild(
 			new Text(
 				theme.fg(
 					"muted",
-					opts.subtitle ??
-						(mode === "toggle"
-							? "Enter toggles the selected model. OAuth-backed models are listed first."
-							: "Type to search. OAuth-backed models are listed first."),
+					opts.subtitle ?? "Type to search. OAuth-backed models are listed first.",
 				),
 				1,
 				0,
@@ -317,20 +261,12 @@ export class ModelSelectorComponent extends Container {
 		this.searchInput.onEscape = () => this.onCancel?.()
 
 		this.list = new ModelList(rows, {
-			mode,
 			initialSelectedValue: opts.initialSelectedValue,
-			initialScope: mode === "toggle" ? "all" : undefined,
 			searchInput: this.searchInput,
-			onScopeChange: (scope) => this.updateScopeText(scope),
 		})
 		this.list.onSelect = (row) => this.onSelect?.(row)
 		this.list.onCancel = () => this.onCancel?.()
 
-		if (mode === "toggle" && this.list.hasScopedRows()) {
-			this.scopeText = new Text("", 1, 0)
-			this.updateScopeText(this.list.getScope())
-			this.addChild(this.scopeText)
-		}
 		this.addChild(new Spacer(1))
 		this.addChild(new DynamicBorder())
 		this.addChild(new Spacer(1))
@@ -343,14 +279,6 @@ export class ModelSelectorComponent extends Container {
 		if (rows.length === 0) {
 			setTimeout(() => this.onCancel?.(), 0)
 		}
-	}
-
-	/** @param {ModelScope} scope */
-	updateScopeText(scope) {
-		if (!this.scopeText) return
-		const all = scope === "all" ? theme.fg("accent", "all") : theme.fg("muted", "all")
-		const scoped = scope === "scoped" ? theme.fg("accent", "scoped") : theme.fg("muted", "scoped")
-		this.scopeText.setText(`${theme.fg("muted", "Scope: ")}${all}${theme.fg("muted", " | ")}${scoped}${theme.fg("muted", "  Tab to switch")}`)
 	}
 
 	/** @returns {Focusable} */
@@ -371,7 +299,7 @@ export class ModelSelectorComponent extends Container {
 
 /**
  * @param {ModelEntry[]} models
- * @param {{ currentId?: string, currentProvider?: string, scopedModelIds?: string[] }} [opts]
+ * @param {{ currentId?: string, currentProvider?: string }} [opts]
  * @returns {ModelRow[]}
  */
 export function rowsForModels(models, opts = {}) {
@@ -381,7 +309,6 @@ export function rowsForModels(models, opts = {}) {
 			value,
 			entry,
 			current: opts.currentId ? (opts.currentProvider ? modelEntryMatches(entry, opts.currentId, /** @type {any} */ (opts.currentProvider)) : modelRefMatches(entry, opts.currentId)) : false,
-			scoped: (opts.scopedModelIds ?? []).some((id) => modelRefMatches(entry, id)),
 		}
 	})
 }
@@ -390,7 +317,6 @@ export function rowsForModels(models, opts = {}) {
  * @param {ShowSelectorCtx} ctx
  * @param {ModelRow[]} rows
  * @param {{
- *   mode?: ModelSelectorMode,
  *   initialSelectedValue?: string,
  *   title?: string,
  *   subtitle?: string,

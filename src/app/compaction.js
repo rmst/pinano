@@ -7,7 +7,8 @@
 // conversation history.
 //
 // Strategy:
-//   - threshold:   compact when usage > settings.autocompactThreshold * contextWindow
+//   - threshold:   compact when usage reaches the internal threshold fraction
+//                  of the model context window
 //   - replacement: recent real user messages are retained as hidden model
 //                  mementos, followed by a user-role handoff summary
 //                  (`pinanoCompactionSummary: true`). A separate display marker

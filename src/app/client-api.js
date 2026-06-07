@@ -169,6 +169,7 @@ export function createManagerClientApi(options) {
 		snapshot,
 		contextReport: (id) => manager.contextReport(resolveId(id || manager.initialSessionId)),
 		systemReport: (id) => manager.systemReport(resolveId(id || manager.initialSessionId)),
+		worktrees: (id) => manager.worktrees(resolveId(id || manager.initialSessionId)),
 		streamEvents: async (id, signal, options = {}) => {
 			if (id) return hub.stream({ type: "snapshot", sessionId: id, snapshot: await snapshot(id, options) }, signal)
 			return hub.stream({ type: "sessions", sessions: await manager.sessions(sessionListCwd) }, signal)
@@ -300,6 +301,7 @@ export function createServiceClientApi(options) {
 		snapshot,
 		contextReport: async (id) => client.contextReport(id || await ensureInitialSessionId()),
 		systemReport: async (id) => client.systemReport(id || await ensureInitialSessionId()),
+		worktrees: async (id) => client.worktrees(id || await ensureInitialSessionId()),
 		streamEvents: async (id) => {
 			let unsubscribe = () => {}
 			const stream = new ReadableStream({
@@ -463,6 +465,7 @@ export function registerClientApiRoutes(app, api, options = {}) {
 	app.get(path("/sessions/:id/snapshot"), snapshotById)
 	app.get(path("/sessions/:id/context-report"), safe(async (context) => json({ lines: await api.contextReport(sessionId(context)) })))
 	app.get(path("/sessions/:id/system-report"), safe(async (context) => json({ lines: await api.systemReport(sessionId(context)) })))
+	app.get(path("/sessions/:id/worktrees"), safe(async (context) => json({ worktrees: await api.worktrees(sessionId(context)) })))
 	app.post(path("/sessions/:id/prompt"), safe(async (context) => json(await api.prompt(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
 	app.post(path("/sessions/:id/draft"), safe(async (context) => json(await api.draft(sessionId(context), await jsonBody(context)))))
 	app.post(path("/sessions/:id/continue"), safe(async (context) => json(await api.continueRun(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))

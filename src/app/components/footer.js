@@ -1,4 +1,4 @@
-// Bottom status bar — model | thinking | cost | context used %.
+// Bottom status bar — model | thinking | cost | context %.
 //
 // Renders as a single Text component. Calling `update()` recomputes the line
 // and asks the TUI to repaint.
@@ -94,9 +94,9 @@ export class Footer {
 
 		const segments = [
 			theme.cyan(modelLabel),
-			theme.dim(`reasoning=${thinking}`),
+			theme.dim(`reasoning:${thinking}`),
 			...(billingSegment ? [theme.dim(billingSegment)] : []),
-			theme.dim(`ctx used=${ctxUsedStr}`),
+			theme.dim(`context:${ctxUsedStr}`),
 		]
 		const stderrCount = this.getStderrCount()
 		if (stderrCount > 0) segments.push(theme.red(`log=${stderrCount}`))

@@ -153,7 +153,7 @@ export function isHumanUserEntry(entry) {
 	return entry?.type === "message" && entry.message?.role === "user" && !isAutomatedMaintenanceMessage(entry.message)
 }
 
-const sessionPropertyPromptKeys = ["state", "descriptionInUi", "projectTag", "cwd", "environmentId"]
+const sessionPropertyPromptKeys = ["state", "descriptionInUi", "projectTag"]
 
 /** @param {any} props */
 function formatCurrentSessionProperties(props) {
@@ -162,16 +162,23 @@ function formatCurrentSessionProperties(props) {
 	return JSON.stringify(current)
 }
 
+/** @param {any} props */
+function metadataMaintenanceInstruction(props) {
+	if (props && (!props.descriptionInUi || !props.projectTag)) return "projectTag and descriptionInUi must be updated using sessionWrite."
+	return "Update projectTag or descriptionInUi only if they are stale or misleading."
+}
+
 /** @param {any} [props] */
 export function createMaintenancePromptMessage(props = undefined) {
 	const current = props ? formatCurrentSessionProperties(props) : "unavailable"
+	const instruction = metadataMaintenanceInstruction(props)
 	return {
 		role: "user",
 		pinanoAutomated: true,
 		pinanoMaintenance: "session_properties",
 		content: [{
 			type: "text",
-			text: `[Hidden session metadata check]\nPrevious session metadata was: ${current}. Update session metadata that is no longer correct. Update projectTag or descriptionInUi if they are missing, stale or misleading. With sessionWrite never include fields whose values should remain unchanged!`,
+			text: `[Hidden session metadata check]\nPrevious session metadata was: ${current}. ${instruction} With sessionWrite never include fields whose values should remain unchanged!`,
 		}],
 		timestamp: Date.now(),
 	}

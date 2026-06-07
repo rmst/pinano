@@ -1,4 +1,5 @@
 const BEARER_AUTH = /^\s*Bearer\s+(.+?)\s*$/i
+export const PINANO_DEBUG_REQUEST_HEADER = "X-Pinano-Debug"
 
 export function bearerTokenFromHeader(value) {
 	if (typeof value !== "string") return ""
@@ -36,4 +37,16 @@ export function authenticateRequest(req, token, options = {}) {
 		authorization: req.headers.get("authorization"),
 		origin: req.headers.get("origin"),
 	}, token, options)
+}
+
+export function rejectBrowserDebugRequestParts({ origin, referer, secFetchSite, secFetchMode, secFetchDest, secFetchUser }) {
+	if (origin) return { ok: false, status: 403, error: "Forbidden browser origin" }
+	if (referer) return { ok: false, status: 403, error: "Forbidden browser referrer" }
+	if (secFetchSite || secFetchMode || secFetchDest || secFetchUser) return { ok: false, status: 403, error: "Forbidden browser request" }
+	return { ok: true }
+}
+
+export function requireDebugRequestHeaderParts({ debugHeader }) {
+	if (debugHeader !== "1") return { ok: false, status: 403, error: `Missing ${PINANO_DEBUG_REQUEST_HEADER}: 1` }
+	return { ok: true }
 }

@@ -45,6 +45,7 @@ import { CODEX_TOOL_PROFILE, DEFAULT_TOOL_PROFILE, GPT_5_4_MINI_PINANO_INSTRUCTI
  * @property {string} [maintenanceModelRef]
  * @property {"default" | "codex"} [toolProfile]
  * @property {string[]} [tags]
+ * @property {boolean} [_contextWindowExplicit]
  */
 
 const OPENAI_BASE = "https://api.openai.com/v1"
@@ -53,6 +54,10 @@ const MOONSHOT_BASE = "https://api.moonshot.ai/v1"
 const DEEPSEEK_BASE = "https://api.deepseek.com"
 const TEXT_ONLY_INPUT = ["text"]
 const VISION_INPUT = ["text", "image"]
+const MODEL_METADATA_TIMEOUT_MS = 1000
+const MODEL_METADATA_SUCCESS_CACHE_MS = 30_000
+const MODEL_METADATA_FAILURE_CACHE_MS = 2_000
+const modelMetadataFetchCache = new Map()
 
 const KIMI_COMPAT = {
 	supportsStore: false,
@@ -326,6 +331,11 @@ function positiveNumber(value, fallback) {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
 }
 
+/** @param {unknown} value */
+function positiveNumberOrUndefined(value) {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
 /** @param {unknown} value @param {number} fallback */
 function finiteNumber(value, fallback) {
 	return typeof value === "number" && Number.isFinite(value) ? value : fallback
@@ -380,6 +390,183 @@ function stringArray(value, fallback) {
 	return Array.isArray(value) ? value.filter((item) => typeof item === "string") : fallback
 }
 
+/** @param {string} baseUrl @param {string} suffix */
+function appendPath(baseUrl, suffix) {
+	try {
+		const url = new URL(baseUrl)
+		const path = url.pathname.replace(/\/+$/, "")
+		url.pathname = `${path}${suffix}`
+		url.search = ""
+		url.hash = ""
+		return url.toString()
+	} catch {
+		return undefined
+	}
+}
+
+/** @param {string} baseUrl */
+function openAiModelsUrl(baseUrl) {
+	return appendPath(baseUrl, "/models")
+}
+
+/** @param {string} baseUrl */
+function llamaPropsUrl(baseUrl) {
+	try {
+		const url = new URL(baseUrl)
+		const path = url.pathname.replace(/\/+$/, "")
+		url.pathname = path.endsWith("/v1") ? path.slice(0, -3) || "/" : path || "/"
+		url.search = ""
+		url.hash = ""
+		return appendPath(url.toString(), "/props")
+	} catch {
+		return undefined
+	}
+}
+
+/**
+ * @param {string} url
+ * @param {{ headers?: Record<string, string>, fetchFn?: typeof fetch, timeoutMs?: number }} [options]
+ */
+async function fetchJsonUncached(url, options = {}) {
+	const fetchFn = options.fetchFn ?? globalThis.fetch
+	if (typeof fetchFn !== "function") return undefined
+	const controller = new AbortController()
+	const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? MODEL_METADATA_TIMEOUT_MS)
+	try {
+		const response = await fetchFn(url, {
+			headers: options.headers,
+			signal: controller.signal,
+		})
+		if (!response.ok) return undefined
+		return await response.json()
+	} catch {
+		return undefined
+	} finally {
+		clearTimeout(timer)
+	}
+}
+
+/** @param {string} url @param {Record<string, string> | undefined} headers */
+function fetchCacheKey(url, headers) {
+	return JSON.stringify([url, headers ? Object.entries(headers).sort(([a], [b]) => a.localeCompare(b)) : []])
+}
+
+/**
+ * @param {string} url
+ * @param {{ headers?: Record<string, string>, fetchFn?: typeof fetch, timeoutMs?: number }} [options]
+ */
+async function fetchJsonWithTimeout(url, options = {}) {
+	if (options.fetchFn) return fetchJsonUncached(url, options)
+	const key = fetchCacheKey(url, options.headers)
+	const now = Date.now()
+	const cached = modelMetadataFetchCache.get(key)
+	if (cached && cached.expiresAt > now) return cached.promise
+
+	const promise = fetchJsonUncached(url, options)
+	const cacheEntry = { promise, expiresAt: now + MODEL_METADATA_FAILURE_CACHE_MS }
+	modelMetadataFetchCache.set(key, cacheEntry)
+	promise.then((value) => {
+		if (modelMetadataFetchCache.get(key) !== cacheEntry) return
+		cacheEntry.expiresAt = Date.now() + (value === undefined ? MODEL_METADATA_FAILURE_CACHE_MS : MODEL_METADATA_SUCCESS_CACHE_MS)
+	})
+	return promise
+}
+
+/** @param {ModelEntry} entry @param {string | undefined} apiKey */
+function metadataHeaders(entry, apiKey) {
+	const headers = { ...(entry.headers ?? {}) }
+	if (apiKey && !headers.Authorization && !headers.authorization) headers.Authorization = `Bearer ${apiKey}`
+	return Object.keys(headers).length > 0 ? headers : undefined
+}
+
+/** @param {unknown} payload */
+function contextWindowFromProps(payload) {
+	const settings = plainObject(plainObject(payload).default_generation_settings)
+	return positiveNumberOrUndefined(settings.n_ctx)
+}
+
+/** @param {unknown} modelInfo */
+function contextWindowFromModelInfo(modelInfo) {
+	const info = plainObject(modelInfo)
+	const meta = plainObject(info.meta)
+	for (const value of [
+		meta.n_ctx,
+		meta.contextWindow,
+		meta.context_window,
+		meta.context_length,
+		meta.max_context_length,
+		meta.max_context_window,
+		meta.max_context_tokens,
+		meta.max_model_len,
+		info.contextWindow,
+		info.context_window,
+		info.context_length,
+		info.max_context_length,
+		info.max_context_window,
+		info.max_context_tokens,
+		info.max_model_len,
+	]) {
+		const n = positiveNumberOrUndefined(value)
+		if (n !== undefined) return n
+	}
+	return undefined
+}
+
+/**
+ * @param {unknown} payload
+ * @param {ModelEntry} entry
+ */
+function contextWindowFromModelsPayload(payload, entry) {
+	const record = plainObject(payload)
+	const models = Array.isArray(record.data) ? record.data : Array.isArray(payload) ? payload : []
+	const expectedIds = new Set([entry.id, entry.wireModel].filter((id) => typeof id === "string" && id))
+	const matching = models.find((item) => {
+		const info = plainObject(item)
+		if (typeof info.id === "string" && expectedIds.has(info.id)) return true
+		return stringArray(info.aliases, undefined)?.some((alias) => expectedIds.has(alias)) ?? false
+	}) ?? (models.length === 1 ? models[0] : undefined)
+	return contextWindowFromModelInfo(matching)
+}
+
+/**
+ * @param {ModelEntry} entry
+ * @param {{ apiKey?: string, fetchFn?: typeof fetch }} [options]
+ */
+async function providerModelMetadata(entry, options = {}) {
+	if (entry.provider !== "llamacpp") return undefined
+	const headers = metadataHeaders(entry, options.apiKey)
+	const propsUrl = llamaPropsUrl(entry.baseUrl)
+	const props = propsUrl ? await fetchJsonWithTimeout(propsUrl, { headers, fetchFn: options.fetchFn }) : undefined
+	const propsContextWindow = contextWindowFromProps(props)
+	if (propsContextWindow !== undefined) return { contextWindow: propsContextWindow }
+
+	const modelsUrl = openAiModelsUrl(entry.baseUrl)
+	const models = modelsUrl ? await fetchJsonWithTimeout(modelsUrl, { headers, fetchFn: options.fetchFn }) : undefined
+	const modelsContextWindow = contextWindowFromModelsPayload(models, entry)
+	return modelsContextWindow !== undefined ? { contextWindow: modelsContextWindow } : undefined
+}
+
+/**
+ * @param {ModelEntry} entry
+ * @param {{ apiKey?: string, fetchFn?: typeof fetch }} [options]
+ * @returns {Promise<ModelEntry>}
+ */
+async function modelEntryWithProviderMetadata(entry, options = {}) {
+	if (entry._contextWindowExplicit) return entry
+	const metadata = await providerModelMetadata(entry, options)
+	return metadata?.contextWindow ? { ...entry, contextWindow: metadata.contextWindow } : entry
+}
+
+/**
+ * @param {ModelEntry} entry
+ * @param {{ providers?: Record<string, import("./settings.js").ProviderSettings>, apiKey?: string }} [options]
+ */
+async function apiKeyForEntry(entry, options = {}) {
+	if (typeof options.apiKey === "string" && options.apiKey) return options.apiKey
+	const configuredKey = options.providers?.[entry.authProvider]?.apiKey
+	return (typeof configuredKey === "string" && configuredKey) || await resolveApiKey(entry.authProvider)
+}
+
 /**
  * @param {string} id
  * @param {{ provider?: ModelProvider }} [options]
@@ -414,6 +601,7 @@ function configuredModelEntry(provider, providerConfig, modelConfig, template) {
 	const baseTemplate = extended ?? template
 	const authProvider = validProvider(modelConfig.authProvider) ?? validProvider(providerConfig.authProvider) ?? provider
 	const sameTemplateModel = baseTemplate.id === id && baseTemplate.provider === provider
+	const contextWindowExplicit = positiveNumberOrUndefined(modelConfig.contextWindow) !== undefined
 	return {
 		...baseTemplate,
 		id,
@@ -433,6 +621,7 @@ function configuredModelEntry(provider, providerConfig, modelConfig, template) {
 		maintenanceModelRef: typeof modelConfig.maintenanceModelRef === "string" && modelConfig.maintenanceModelRef ? modelConfig.maintenanceModelRef : baseTemplate.maintenanceModelRef,
 		toolProfile: modelToolProfile(modelConfig.toolProfile, baseTemplate.toolProfile),
 		tags: stringArray(modelConfig.tags, baseTemplate.tags),
+		...(contextWindowExplicit ? { _contextWindowExplicit: true } : {}),
 	}
 }
 
@@ -447,11 +636,6 @@ export function configuredModelEntries(providers = {}) {
 		if (!provider) continue
 		const providerConfig = plainObject(value)
 		const overrides = plainObject(providerConfig.modelOverrides)
-		if (hasProviderModelOverrides(providerConfig)) {
-			for (const template of MODEL_REGISTRY.filter((m) => m.provider === provider)) {
-				entries.push(configuredModelEntry(provider, providerConfig, { id: template.id, ...plainObject(overrides[template.id]) }, template))
-			}
-		}
 		if (Array.isArray(providerConfig.models)) {
 			for (const modelValue of providerConfig.models) {
 				const modelConfig = plainObject(modelValue)
@@ -460,6 +644,11 @@ export function configuredModelEntries(providers = {}) {
 					?? findRegistryModelEntry(modelConfig.id, { provider })
 					?? defaultTemplateForProvider(provider)
 				entries.push(configuredModelEntry(provider, providerConfig, modelConfig, template))
+			}
+		}
+		if (hasProviderModelOverrides(providerConfig)) {
+			for (const template of MODEL_REGISTRY.filter((m) => m.provider === provider)) {
+				entries.push(configuredModelEntry(provider, providerConfig, { id: template.id, ...plainObject(overrides[template.id]) }, template))
 			}
 		}
 	}
@@ -517,25 +706,30 @@ export function canonicalModelRef(id, options = {}) {
 
 /**
  * @param {import("./settings.js").Settings | undefined} [settings]
+ * @param {{ fetchFn?: typeof fetch }} [options]
  * @returns {Promise<ModelEntry[]>}
  */
-export async function availableModelEntries(settings = undefined) {
+export async function availableModelEntries(settings = undefined, options = {}) {
 	const entries = allModelEntries(settings?.providers)
 	const providers = Array.from(new Set(entries.map((m) => m.authProvider)))
-	const available = new Set(
-		/** @type {ModelProvider[]} */ ((await Promise.all(providers.map(async (p) => {
+	const available = new Map(
+		(await Promise.all(providers.map(async (p) => {
 			const configuredKey = settings?.providers?.[p]?.apiKey
 			const apiKey = (typeof configuredKey === "string" && configuredKey) || await resolveApiKey(p)
-			return apiKey ? p : undefined
-		}))).filter(Boolean)),
+			return apiKey ? /** @type {[ModelProvider, string]} */ ([p, apiKey]) : undefined
+		}))).filter((entry) => entry !== undefined),
 	)
-	return entries
+	const sorted = entries
 		.filter((m) => available.has(m.authProvider))
 		.sort((a, b) => {
 			if (a.authProvider === "openai-codex" && b.authProvider !== "openai-codex") return -1
 			if (a.authProvider !== "openai-codex" && b.authProvider === "openai-codex") return 1
 			return 0
 		})
+	return Promise.all(sorted.map((entry) => modelEntryWithProviderMetadata(entry, {
+		apiKey: available.get(entry.authProvider),
+		fetchFn: options.fetchFn,
+	})))
 }
 
 /**
@@ -596,6 +790,39 @@ export function refreshModelFromRegistry(model, ref = undefined) {
 }
 
 /**
+ * Refresh a persisted model like `refreshModelFromRegistry`, then enrich
+ * llama.cpp metadata from the current provider when available.
+ *
+ * @param {any} model
+ * @param {string | undefined} [ref]
+ * @param {{ providers?: Record<string, import("./settings.js").ProviderSettings>, apiKey?: string, fetchFn?: typeof fetch }} [options]
+ * @returns {Promise<any>}
+ */
+export async function refreshModelWithProviderMetadata(model, ref = undefined, options = {}) {
+	if (!model?.id && !ref) return model
+	const refreshed = refreshModelFromRegistry(model, ref)
+	const entryRef = ref ?? (model?.provider && model?.id ? `${model.provider}/${model.id}` : model?.id)
+	const entry =
+		(entryRef ? findModelEntry(entryRef, { provider: model?.provider, providers: options.providers }) : undefined)
+		?? (refreshed?.id ? findModelEntry(refreshed.id, { provider: refreshed.provider, providers: options.providers }) : undefined)
+	if (!entry) return refreshed
+	const baseUrl = refreshed?.baseUrl ?? model?.baseUrl ?? entry.baseUrl
+	const modelEntry = { ...entry, baseUrl }
+	const apiKey = modelEntry.provider === "llamacpp" && !modelEntry._contextWindowExplicit ? await apiKeyForEntry(modelEntry, options) : undefined
+	const enriched = buildModel(await modelEntryWithProviderMetadata(modelEntry, {
+		apiKey,
+		fetchFn: options.fetchFn,
+	}), {
+		id: refreshed?.id ?? model?.id ?? entry.id,
+		baseUrl,
+	})
+	const next = { ...model, ...refreshed, ...enriched }
+	delete next.baseInstructions
+	delete next.compaction
+	return next
+}
+
+/**
  * Resolve a model from the curated registry plus declarative settings providers.
  * Unknown ids fall back to the selected provider's first registry template.
  *
@@ -608,4 +835,22 @@ export function resolveModel(id, options = {}) {
 	const parsed = parseModelRef(id)
 	const provider = validProvider(options.provider) ?? validProvider(parsed.provider) ?? "llamacpp"
 	return buildModel(defaultTemplateForProvider(provider), { id: parsed.id })
+}
+
+/**
+ * Resolve a model like `resolveModel`, enriching llama.cpp entries with
+ * provider metadata when the server exposes it. Explicit `contextWindow`
+ * settings are left untouched.
+ *
+ * @param {string} id
+ * @param {{ provider?: ModelProvider, providers?: Record<string, import("./settings.js").ProviderSettings>, apiKey?: string, fetchFn?: typeof fetch }} [options]
+ */
+export async function resolveModelWithProviderMetadata(id, options = {}) {
+	const entry = findModelEntry(id, { provider: options.provider, providers: options.providers })
+	if (!entry) return resolveModel(id, options)
+	const apiKey = entry.provider === "llamacpp" && !entry._contextWindowExplicit ? await apiKeyForEntry(entry, options) : undefined
+	return buildModel(await modelEntryWithProviderMetadata(entry, {
+		apiKey,
+		fetchFn: options.fetchFn,
+	}))
 }

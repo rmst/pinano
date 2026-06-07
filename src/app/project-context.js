@@ -6,9 +6,6 @@
 // legacy synthetic user-message helpers stay exported for old sessions and
 // hermetic print mode.
 
-import { homedir } from "node:os"
-import { join } from "node:path"
-
 import { loadProjectContextFiles } from "./context-files.js"
 import {
 	PROJECT_CONTEXT_HEADING,
@@ -16,7 +13,7 @@ import {
 	hasProjectContextMessage,
 	isProjectContextMessage,
 } from "./context-format.js"
-import { configRoot, isPinanoTestProcess, legacyConfigRoot } from "./paths.js"
+import { pinanoHomePath } from "./paths.js"
 
 /** @typedef {import("./context-files.js").ContextFile} ContextFile */
 
@@ -25,10 +22,7 @@ export { PROJECT_CONTEXT_HEADING, formatContextFilesAsUserMessage, hasProjectCon
 /** Default global agent dirs used by the session-startup path.
  * @returns {string[]} */
 export function defaultAgentDirs() {
-	const dirs = [configRoot(), legacyConfigRoot()]
-	const home = join(homedir(), ".pinano")
-	if (!isPinanoTestProcess() && !dirs.includes(home)) dirs.push(home)
-	return dirs
+	return [pinanoHomePath()]
 }
 
 /** Build a synthetic user message containing the project context, or null if

@@ -3,11 +3,12 @@
 // Startup loading (`context-files.ts`) walks cwd → root, so ancestor files
 // are captured at session start. Subdir files don't — they'd require knowing
 // in advance which subdirs the agent will visit. Instead we load them
-// on-demand: when a tool touches a path under cwd, we walk from that path up
-// to (but not past) cwd, picking up any context file we haven't yet seen. In
-// normal sessions the file is stored as a context-load snapshot and injected
-// through prompt assembly; no-session compatibility falls back to the legacy
-// inline tool-result notice.
+// on-demand: when a tool reads or mutates a concrete file under cwd, we walk
+// from that path up to (but not past) cwd, picking up any context file we
+// haven't yet seen. Directory discovery and broad searches do not load nested
+// context. In normal sessions the file is stored as a context-load snapshot
+// and injected through prompt assembly; no-session compatibility falls back to
+// the legacy inline tool-result notice.
 //
 // This matches Claude Code's behavior
 // (https://code.claude.com/docs/en/memory.md). Pi/upstream does not lazy-load.
@@ -17,8 +18,10 @@
 // sessions that still have lazy context inside tool_result messages keep their
 // previous conversation-history behavior; they are not migrated.
 
+import { statSync } from "node:fs"
 import { basename, isAbsolute, relative, resolve, dirname } from "node:path"
 
+import { contextFileIdentity } from "../session-manager/context-identity.js"
 import { loadContextFileFromDir } from "./context-files.js"
 import { LAZY_NOTICE_HEADING, PROJECT_CONTEXT_HEADING } from "./context-format.js"
 import { extractShellCommandPathInfo } from "./shell-paths.js"
@@ -42,7 +45,8 @@ export class LazyContextLoader {
 	/** @param {{ cwd: string, alreadyLoaded: Iterable<string> }} options */
 	constructor(options) {
 		this.cwd = resolve(options.cwd)
-		this.loaded = new Set(options.alreadyLoaded)
+		this.loaded = new Set()
+		this.markLoaded(options.alreadyLoaded)
 	}
 
 	/** @param {string} cwd */
@@ -59,7 +63,7 @@ export class LazyContextLoader {
 
 	/** @param {Iterable<string>} paths */
 	markLoaded(paths) {
-		for (const path of paths) this.loaded.add(path)
+		for (const path of paths) this.loaded.add(contextFileIdentity(path))
 	}
 
 	/**
@@ -96,17 +100,17 @@ export class LazyContextLoader {
 				/** @type {RegExpExecArray | null} */
 				let match
 				while ((match = re.exec(after))) {
-					this.loaded.add(match[1])
+					this.markLoaded([match[1]])
 				}
 			}
 		}
 	}
 
 	/**
-	 * For a tool-touched path, walk from `path` up to cwd looking for unseen
-	 * AGENTS.md/CLAUDE.md files. Returns newly-loaded files in root-most-first
-	 * order (matching the startup ancestor walk). Updates internal state so a
-	 * subsequent call won't return the same file again.
+	 * For a tool-read or tool-mutated file path, walk from `path` up to cwd
+	 * looking for unseen AGENTS.md/CLAUDE.md files. Returns newly-loaded files
+	 * in root-most-first order (matching the startup ancestor walk). Updates
+	 * internal state so a subsequent call won't return the same file again.
 	 *
 	 * Paths outside the cwd subtree are ignored — those would either already be
 	 * loaded by startup ancestor walk (if above cwd) or out of scope (siblings).
@@ -121,10 +125,10 @@ export class LazyContextLoader {
 		// → outside cwd subtree.
 		if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return []
 
-		// Walk from `abs` itself up to (but not including) cwd. Walking from
-		// `abs` covers the case where `abs` is a directory (ls/grep/find) — the
-		// dir's own AGENTS.md gets picked up. If `abs` is a regular file, the
-		// `<file>/AGENTS.md` lookup just returns null.
+		// Walk from `abs` itself up to (but not including) cwd. If `abs` is a
+		// regular file, the `<file>/AGENTS.md` lookup just returns null before
+		// the walk reaches its containing directories. This also keeps write-new-file
+		// triggers useful without needing the file to exist before the mutation.
 		/** @type {string[]} */
 		const dirs = []
 		let dir = abs
@@ -139,8 +143,9 @@ export class LazyContextLoader {
 		const out = []
 		for (const d of dirs) {
 			const file = loadContextFileFromDir(d)
-			if (file && !this.loaded.has(file.path)) {
-				this.loaded.add(file.path)
+			const key = file ? contextFileIdentity(file) : ""
+			if (file && !this.loaded.has(key)) {
+				this.loaded.add(key)
 				out.push(file)
 			}
 		}
@@ -165,7 +170,7 @@ export function formatLazyContextNotice(files) {
 	return out
 }
 
-const PATH_TOOLS = new Set(["read", "write", "edit", "ls", "grep", "find", "view_image"])
+const DIRECT_FILE_TOOLS = new Set(["read", "write", "edit", "grep", "view_image"])
 
 function isContextFilePath(path) {
 	return CONTEXT_FILE_NAMES.has(basename(path))
@@ -173,6 +178,14 @@ function isContextFilePath(path) {
 
 function resolvePathForCwd(path, cwd) {
 	return isAbsolute(path) ? path : resolve(cwd, path)
+}
+
+function isRegularFile(path) {
+	try {
+		return statSync(path).isFile()
+	} catch {
+		return false
+	}
 }
 
 function extractExecCommandPaths(args, cwd) {
@@ -184,7 +197,6 @@ function extractExecCommandPaths(args, cwd) {
 	const paths = []
 	/** @type {string[]} */
 	const manuallyLoadedContextPaths = []
-	if (typeof args?.workdir === "string") paths.push(baseCwd)
 	const extracted = extractShellCommandPathInfo(command, baseCwd)
 	paths.push(...extracted.paths)
 	manuallyLoadedContextPaths.push(...extracted.manuallyLoadedContextPaths)
@@ -199,7 +211,7 @@ function readManuallyLoadedContextPaths(args, cwd, result) {
 }
 
 /**
- * Pick path args from a tool call. For shell commands this is intentionally conservative: only literal existing paths passed to common read/list/search commands are returned.
+ * Pick file paths from a tool call that read or mutated concrete files. Directory listing and broad search tools intentionally return nothing; they reveal structure, not an adjacent file whose scoped instructions should enter context.
  *
  * @param {string} toolName
  * @param {any} args
@@ -214,12 +226,14 @@ export function extractToolPaths(toolName, args, cwd = process.cwd(), result = u
 		return { paths, manuallyLoadedContextPaths: [] }
 	}
 	if (toolName === "exec_command") return extractExecCommandPaths(args, cwd)
-	if (!PATH_TOOLS.has(toolName)) return { paths: [], manuallyLoadedContextPaths: [] }
+	if (!DIRECT_FILE_TOOLS.has(toolName)) return { paths: [], manuallyLoadedContextPaths: [] }
 	if (toolName === "read" && args && typeof args.path === "string") {
 		return { paths: [args.path], manuallyLoadedContextPaths: readManuallyLoadedContextPaths(args, cwd, result) }
 	}
+	if (toolName === "grep" && args && typeof args.path === "string") {
+		return { paths: isRegularFile(resolvePathForCwd(args.path, cwd)) ? [args.path] : [], manuallyLoadedContextPaths: [] }
+	}
 	if (args && typeof args.path === "string") return { paths: [args.path], manuallyLoadedContextPaths: [] }
-	// ls/grep/find default to cwd when path is omitted — nothing new to load.
 	return { paths: [], manuallyLoadedContextPaths: [] }
 }
 

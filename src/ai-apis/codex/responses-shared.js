@@ -78,6 +78,15 @@ function responseInputImage(block, model) {
 	}
 }
 
+function systemLikeMessageContent(content) {
+	if (typeof content === "string") return content
+	if (!Array.isArray(content)) return ""
+	return content
+		.filter((block) => block?.type === "text")
+		.map((block) => block.text ?? "")
+		.join("")
+}
+
 // ============================================================================
 // Message conversion: Context.messages -> Responses API `input` array
 // ============================================================================
@@ -105,7 +114,13 @@ export function convertResponsesMessages(model, context, options = {}) {
 	const customToolNames = new Set((context.tools ?? []).filter((tool) => tool.kind === "custom").map((tool) => tool.name))
 	const customCallIds = new Set()
 	for (const msg of transformedMessages) {
-		if (msg.role === "user") {
+		if (msg.role === "developer" || msg.role === "system") {
+			const content = systemLikeMessageContent(msg.content)
+			if (content) {
+				const role = msg.role === "developer" && model.reasoning ? "developer" : "system"
+				messages.push({ role, content: sanitizeSurrogates(content) })
+			}
+		} else if (msg.role === "user") {
 			if (typeof msg.content === "string") {
 				messages.push({
 					role: "user",

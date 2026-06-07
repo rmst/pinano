@@ -17,6 +17,7 @@ function enqueueClient(client, chunk) {
 		}
 		client.controller.enqueue(chunk)
 		client.queuedChunks += 1
+		client.lastEnqueueAt = Date.now()
 		return true
 	} catch {
 		client.release()
@@ -25,7 +26,7 @@ function enqueueClient(client, chunk) {
 }
 
 export function createEventHub(onActivity = () => {}, options = {}) {
-	/** @type {Map<string, { controller: ReadableStreamDefaultController<Uint8Array>, release: () => void, maxQueuedChunks: number, queuedChunks: number }>} */
+	/** @type {Map<string, { controller: ReadableStreamDefaultController<Uint8Array>, release: () => void, maxQueuedChunks: number, queuedChunks: number, createdAt: number, lastPullAt: number, lastEnqueueAt: number, initialEventType?: string, sessionId?: string }>} */
 	const clients = new Map()
 	let nextClientId = 1
 	const heartbeatIntervalMs = Number.isFinite(options.heartbeatIntervalMs) ? Math.max(0, options.heartbeatIntervalMs) : 10000
@@ -61,7 +62,18 @@ export function createEventHub(onActivity = () => {}, options = {}) {
 			return new Response(new ReadableStream({
 				start(controller) {
 					streamController = controller
-					const client = { controller, release, maxQueuedChunks, queuedChunks: 0 }
+					const now = Date.now()
+					const client = {
+						controller,
+						release,
+						maxQueuedChunks,
+						queuedChunks: 0,
+						createdAt: now,
+						lastPullAt: now,
+						lastEnqueueAt: now,
+						initialEventType: typeof initialEvent?.type === "string" ? initialEvent.type : undefined,
+						sessionId: typeof initialEvent?.sessionId === "string" ? initialEvent.sessionId : undefined,
+					}
 					clients.set(clientId, client)
 					signal?.addEventListener?.("abort", release, { once: true })
 					onActivity()
@@ -76,7 +88,10 @@ export function createEventHub(onActivity = () => {}, options = {}) {
 				},
 				pull() {
 					const client = clients.get(clientId)
-					if (client) client.queuedChunks = 0
+					if (client) {
+						client.queuedChunks = 0
+						client.lastPullAt = Date.now()
+					}
 				},
 			}), {
 				headers: {
@@ -96,8 +111,29 @@ export function createEventHub(onActivity = () => {}, options = {}) {
 			if (client) client.release()
 			else onActivity()
 		},
+		closeAll() {
+			for (const client of [...clients.values()]) client.release()
+			onActivity()
+		},
 		clientCount() {
 			return clients.size
+		},
+		inspect(now = Date.now()) {
+			return {
+				clientCount: clients.size,
+				maxQueuedChunks,
+				heartbeatIntervalMs,
+				clients: [...clients.entries()].map(([id, client]) => ({
+					id,
+					ageMs: now - client.createdAt,
+					idleMs: now - client.lastPullAt,
+					queuedChunks: client.queuedChunks,
+					maxQueuedChunks: client.maxQueuedChunks,
+					lastEnqueueAgeMs: now - client.lastEnqueueAt,
+					initialEventType: client.initialEventType,
+					sessionId: client.sessionId,
+				})),
+			}
 		},
 	}
 }

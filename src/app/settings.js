@@ -9,7 +9,8 @@ import { readFile, writeFile, mkdir } from "node:fs/promises"
 import { dirname } from "node:path"
 
 import { normalizeReasoningLevel } from "../reasoning.js"
-import { defaultSettingsPath, legacyDefaultSettingsPath, legacySettingsPath, settingsPath } from "./paths.js"
+import { defaultSettingsPath, settingsPath } from "./paths.js"
+import { normalizePinanoStateMount } from "./tool-state-mounts.js"
 
 /** @typedef {import("../reasoning.js").ReasoningLevel} ThinkingLevel */
 
@@ -55,6 +56,12 @@ import { defaultSettingsPath, legacyDefaultSettingsPath, legacySettingsPath, set
  * @property {string} [token]
  * @property {{ host?: string, port?: number | string, token?: string, publicUrl?: string, dev?: boolean }} [web]
  * @property {boolean | string | Record<string, unknown>} [diagnostics]
+ * @property {boolean | string | Record<string, unknown>} [debug]
+ */
+
+/**
+ * @typedef {object} ToolSandboxSettings
+ * @property {import("./tool-state-mounts.js").PinanoStateMountMode} pinanoStateMount
  */
 
 /**
@@ -62,11 +69,10 @@ import { defaultSettingsPath, legacyDefaultSettingsPath, legacySettingsPath, set
  * @property {string} defaultModel
  * @property {Record<string, ProviderSettings>} providers
  * @property {ServiceSettings} service
+ * @property {ToolSandboxSettings} toolSandbox
  * @property {ThinkingLevel} thinkingLevel
- * @property {string[]} scopedModelIds
- * @property {number} autocompactThreshold
- * @property {"rewind" | "none"} doubleEscapeAction
  * @property {boolean} web
+ * @property {boolean} updateCheck
  * @property {boolean} showThinkingOutput
  * @property {boolean} showToolOutput
  */
@@ -78,11 +84,10 @@ export const DEFAULT_SETTINGS = {
 	defaultModel: "openai-codex/gpt-5.5",
 	providers: {},
 	service: {},
+	toolSandbox: { pinanoStateMount: false },
 	thinkingLevel: "high",
-	scopedModelIds: ["openai-codex/gpt-5.5", "openai-codex/gpt-5.4-mini", "openai/gpt-5.5", "openai/gpt-5.4-mini"],
-	autocompactThreshold: 0.85,
-	doubleEscapeAction: "rewind",
 	web: false,
+	updateCheck: true,
 	showThinkingOutput: false,
 	showToolOutput: false,
 }
@@ -92,11 +97,10 @@ const SETTING_KEYS = /** @type {const} */ ([
 	"defaultModel",
 	"providers",
 	"service",
+	"toolSandbox",
 	"thinkingLevel",
-	"scopedModelIds",
-	"autocompactThreshold",
-	"doubleEscapeAction",
 	"web",
+	"updateCheck",
 	"showThinkingOutput",
 	"showToolOutput",
 ])
@@ -116,49 +120,31 @@ function pickSettingsKeys(parsed) {
 
 /**
  * @param {string} path
- * @returns {RawSettings | undefined}
+ * @returns {RawSettings}
  */
-function readSettingsFileMaybeSync(path) {
+function readSettingsFileSync(path) {
 	try {
 		const parsed = /** @type {Record<string, unknown>} */ (JSON.parse(readFileSync(path, "utf-8")))
 		return pickSettingsKeys(parsed)
 	} catch (/** @type {any} */ err) {
-		if (err.code === "ENOENT") return undefined
+		if (err.code === "ENOENT") return {}
 		throw err
 	}
 }
 
 /**
  * @param {string} path
- * @param {string} legacyPath
- * @returns {RawSettings}
+ * @returns {Promise<RawSettings>}
  */
-function readSettingsLayerSync(path, legacyPath) {
-	return { ...(readSettingsFileMaybeSync(legacyPath) ?? {}), ...(readSettingsFileMaybeSync(path) ?? {}) }
-}
-
-/**
- * @param {string} path
- * @returns {Promise<RawSettings | undefined>}
- */
-async function readSettingsFileMaybe(path) {
+async function readSettingsFile(path) {
 	try {
 		const text = await readFile(path, "utf-8")
 		const parsed = /** @type {Record<string, unknown>} */ (JSON.parse(text))
 		return pickSettingsKeys(parsed)
 	} catch (/** @type {any} */ err) {
-		if (err.code === "ENOENT") return undefined
+		if (err.code === "ENOENT") return {}
 		throw err
 	}
-}
-
-/**
- * @param {string} path
- * @param {string} legacyPath
- * @returns {Promise<RawSettings>}
- */
-async function readSettingsLayer(path, legacyPath) {
-	return { ...(await readSettingsFileMaybe(legacyPath) ?? {}), ...(await readSettingsFileMaybe(path) ?? {}) }
 }
 
 function plainObject(value) {
@@ -313,10 +299,12 @@ function cleanServiceSettings(value) {
 		if (typeof web.port === "number" || typeof web.port === "string") out.web.port = web.port
 		if (web.dev === true) out.web.dev = true
 	}
-	if (typeof raw.diagnostics === "boolean" || typeof raw.diagnostics === "string") out.diagnostics = raw.diagnostics
-	else {
-		const diagnostics = plainObject(raw.diagnostics)
-		if (Object.keys(diagnostics).length > 0) out.diagnostics = diagnostics
+	for (const key of ["diagnostics", "debug"]) {
+		if (typeof raw[key] === "boolean" || typeof raw[key] === "string") out[key] = raw[key]
+		else {
+			const value = plainObject(raw[key])
+			if (Object.keys(value).length > 0) out[key] = value
+		}
 	}
 	return Object.keys(out).length > 0 ? out : undefined
 }
@@ -328,14 +316,37 @@ function mergeServiceSettings(...sources) {
 		const service = cleanServiceSettings(source)
 		if (!service) continue
 		const web = service.web
-		const diagnostics = service.diagnostics
 		Object.assign(merged, service)
 		if (web) merged.web = { ...(merged.web ?? {}), ...web }
-		if (diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics)) {
-			merged.diagnostics = { ...(typeof merged.diagnostics === "object" && !Array.isArray(merged.diagnostics) ? merged.diagnostics : {}), ...diagnostics }
+		for (const key of ["diagnostics", "debug"]) {
+			const value = service[key]
+			if (value && typeof value === "object" && !Array.isArray(value)) {
+				merged[key] = { ...(typeof merged[key] === "object" && !Array.isArray(merged[key]) ? merged[key] : {}), ...value }
+			}
 		}
 	}
 	return merged
+}
+
+/** @param {unknown} value */
+function cleanToolSandboxSettings(value) {
+	const raw = plainObject(value)
+	const out = {}
+	if (Object.hasOwn(raw, "pinanoStateMount")) {
+		const mode = normalizePinanoStateMount(raw.pinanoStateMount)
+		if (mode !== undefined) out.pinanoStateMount = mode
+	}
+	return Object.keys(out).length > 0 ? out : undefined
+}
+
+/** @param {(ToolSandboxSettings | undefined)[]} sources */
+function mergeToolSandboxSettings(...sources) {
+	const merged = {}
+	for (const source of sources) {
+		const settings = cleanToolSandboxSettings(source)
+		if (settings) Object.assign(merged, settings)
+	}
+	return { pinanoStateMount: false, ...merged }
 }
 
 /** @param {string} ref */
@@ -407,29 +418,28 @@ function mergeSettings(defaultSettings, userSettings) {
 	const merged = { ...DEFAULT_SETTINGS, ...defaultSettings, ...userSettings }
 	merged.providers = mergeProviders(DEFAULT_SETTINGS.providers, defaultSettings.providers, userSettings.providers)
 	merged.service = mergeServiceSettings(DEFAULT_SETTINGS.service, defaultSettings.service, userSettings.service)
+	merged.toolSandbox = mergeToolSandboxSettings(DEFAULT_SETTINGS.toolSandbox, defaultSettings.toolSandbox, userSettings.toolSandbox)
 	merged.defaultModel = mergeDefaultModel(defaultSettings, userSettings)
 	merged.thinkingLevel = normalizeReasoningLevel(merged.thinkingLevel) ?? DEFAULT_SETTINGS.thinkingLevel
-	if (merged.doubleEscapeAction === "fork" || merged.doubleEscapeAction === "tree") merged.doubleEscapeAction = "rewind"
 	if (typeof merged.defaultModel !== "string" || !merged.defaultModel) merged.defaultModel = DEFAULT_SETTINGS.defaultModel
-	merged.scopedModelIds = stringArray(merged.scopedModelIds) ?? DEFAULT_SETTINGS.scopedModelIds
+	merged.updateCheck = typeof merged.updateCheck === "boolean" ? merged.updateCheck : DEFAULT_SETTINGS.updateCheck
 	delete merged.defaultProvider
 	return merged
 }
 
+/** @param {Pick<Settings, "toolSandbox"> | undefined} settings */
+export function pinanoStateMountFromSettings(settings) {
+	return normalizePinanoStateMount(settings?.toolSandbox?.pinanoStateMount) ?? false
+}
+
 /** @returns {Settings} */
 export function loadSettingsSync() {
-	return mergeSettings(
-		readSettingsLayerSync(defaultSettingsPath(), legacyDefaultSettingsPath()),
-		readSettingsLayerSync(settingsPath(), legacySettingsPath()),
-	)
+	return mergeSettings(readSettingsFileSync(defaultSettingsPath()), readSettingsFileSync(settingsPath()))
 }
 
 /** @returns {Promise<Settings>} */
 export async function loadSettings() {
-	return mergeSettings(
-		await readSettingsLayer(defaultSettingsPath(), legacyDefaultSettingsPath()),
-		await readSettingsLayer(settingsPath(), legacySettingsPath()),
-	)
+	return mergeSettings(await readSettingsFile(defaultSettingsPath()), await readSettingsFile(settingsPath()))
 }
 
 /** @param {Pick<Settings, "defaultModel">} settings */
@@ -442,9 +452,11 @@ export function defaultModelRef(settings) {
  * @returns {{ showThinkingOutput: boolean, showToolOutput: boolean }}
  */
 export function messageRenderOptionsFromSettings(settings) {
+	void settings
+	// These settings are accepted and persisted for future use, but transcript rendering remains locked down until the behavior is tested again.
 	return {
-		showThinkingOutput: settings.showThinkingOutput,
-		showToolOutput: settings.showToolOutput,
+		showThinkingOutput: false,
+		showToolOutput: false,
 	}
 }
 
@@ -472,8 +484,8 @@ export async function saveSettings(settings) {
  * @returns {Promise<Settings>}
  */
 export async function updateSettings(patch) {
-	const userSettings = await readSettingsLayer(settingsPath(), legacySettingsPath())
-	const defaultSettings = await readSettingsLayer(defaultSettingsPath(), legacyDefaultSettingsPath())
+	const userSettings = await readSettingsFile(settingsPath())
+	const defaultSettings = await readSettingsFile(defaultSettingsPath())
 	const current = mergeSettings(defaultSettings, userSettings)
 	await writeUserSettings(settingsForWrite({ ...userSettings, ...patch }, current))
 	return loadSettings()

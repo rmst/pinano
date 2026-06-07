@@ -1,8 +1,9 @@
-// Optional model wire-log logger.
+// Optional model wire-log logger and model-adjacent telemetry store.
 //
-// Disabled by default. Set service.modelIoLog=true in merged Pinano settings
-// to write every model API call to a separate SQLite database. All logging is best-effort: failures are
-// swallowed so observability can never break model calls.
+// Full model wire logging is disabled by default. Set service.modelIoLog=true in merged Pinano settings
+// to write every model API call to a separate SQLite database.
+// Subscription usage snapshots use the same database but are recorded independently. All writes
+// are best-effort: failures are swallowed so observability can never break model calls.
 
 import { mkdirSync } from "node:fs"
 import { dirname, join } from "node:path"
@@ -12,7 +13,7 @@ import { DatabaseSync } from "node:sqlite"
 import { configuredModelIoLogDbPath, isModelIoLogConfigured } from "../app/service-config.js"
 import { dataRoot } from "../app/paths.js"
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 const REDACTED = "[redacted]"
 const DEDUP_ARRAY_PATHS = ["$.input", "$.messages", "$.tools"]
 const RESPONSE_EVENT_TYPES = new Set([
@@ -63,6 +64,10 @@ function safeJson(value) {
 	}
 }
 
+function safeJsonOrNull(value) {
+	return value === undefined || value === null ? null : safeJson(value)
+}
+
 function tryJsonParse(text) {
 	if (typeof text !== "string" || text.length === 0) return undefined
 	try {
@@ -108,6 +113,10 @@ function safeOptions(options = {}) {
 		"reasoningSummary",
 		"textVerbosity",
 		"serviceTier",
+		"responseHeaderTimeoutMs",
+		"streamInactivityTimeoutMs",
+		"firstStreamEventTimeoutMs",
+		"streamEventInactivityTimeoutMs",
 	]) {
 		if (options[key] !== undefined) out[key] = options[key]
 	}
@@ -118,7 +127,7 @@ function safeOptions(options = {}) {
 function warnOnce(err) {
 	if (warned || process.env.PINANO_TEST === "1") return
 	warned = true
-	console.error(`pinano model I/O log disabled after error: ${err?.message ?? err}`)
+	console.error(`pinano model I/O database unavailable after error: ${err?.message ?? err}`)
 }
 
 function info(message) {
@@ -182,10 +191,26 @@ function createSchema(raw) {
 			error TEXT
 		)
 	`)
+	raw.exec(`
+		CREATE TABLE IF NOT EXISTS subscription_usage_snapshots (
+			id TEXT PRIMARY KEY,
+			sampled_at TEXT NOT NULL,
+			provider TEXT NOT NULL,
+			credential_id TEXT,
+			account_id TEXT,
+			base_url TEXT,
+			usage_url TEXT,
+			status TEXT NOT NULL,
+			payload_json TEXT,
+			error TEXT
+		)
+	`)
 	raw.exec("CREATE INDEX IF NOT EXISTS idx_model_requests_started_at ON model_requests(started_at DESC)")
 	raw.exec("CREATE INDEX IF NOT EXISTS idx_model_requests_session ON model_requests(session_id, started_at DESC)")
 	raw.exec("CREATE INDEX IF NOT EXISTS idx_model_request_payload_parts_blob ON model_request_payload_parts(blob_hash)")
 	raw.exec("CREATE INDEX IF NOT EXISTS idx_model_http_attempts_request ON model_http_attempts(request_id, attempt_index)")
+	raw.exec("CREATE INDEX IF NOT EXISTS idx_subscription_usage_snapshots_sampled_at ON subscription_usage_snapshots(sampled_at DESC)")
+	raw.exec("CREATE INDEX IF NOT EXISTS idx_subscription_usage_snapshots_provider ON subscription_usage_snapshots(provider, sampled_at DESC)")
 }
 
 function dropSchema(raw) {
@@ -194,6 +219,7 @@ function dropSchema(raw) {
 	raw.exec("DROP TABLE IF EXISTS model_request_payload_parts")
 	raw.exec("DROP TABLE IF EXISTS model_requests")
 	raw.exec("DROP TABLE IF EXISTS model_payload_blobs")
+	raw.exec("DROP TABLE IF EXISTS subscription_usage_snapshots")
 }
 
 function migrate(raw) {
@@ -203,7 +229,7 @@ function migrate(raw) {
 		let { user_version: version } = raw.prepare("PRAGMA user_version").get()
 		version = Number(version ?? 0)
 		if (version > SCHEMA_VERSION) throw new Error(`model I/O db schema ${version} is newer than supported ${SCHEMA_VERSION}`)
-		if (version < SCHEMA_VERSION) {
+		if (version < 2) {
 			// This is optional wire-log data. The v1 schema stored every SSE event
 			// and duplicated full request bodies, so migrating it faithfully would
 			// preserve mostly-bloated diagnostics. Start fresh and compact the file.
@@ -213,6 +239,7 @@ function migrate(raw) {
 			needsVacuum = version > 0
 		} else {
 			createSchema(raw)
+			if (version < SCHEMA_VERSION) raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
 		}
 		raw.exec("COMMIT")
 	} catch (err) {
@@ -269,6 +296,11 @@ function openDb() {
 			SET ended_at = ?, status = ?, response_body = COALESCE(?, response_body), stream_summary_json = COALESCE(?, stream_summary_json), error = ?
 			WHERE id = ?
 		`),
+		insertSubscriptionUsageSnapshot: raw.prepare(`
+			INSERT INTO subscription_usage_snapshots (
+				id, sampled_at, provider, credential_id, account_id, base_url, usage_url, status, payload_json, error
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`),
 		getRequest: raw.prepare("SELECT * FROM model_requests WHERE id = ?"),
 		listParts: raw.prepare(`
 			SELECT p.path, p.idx, b.json
@@ -282,14 +314,18 @@ function openDb() {
 	return { db, statements }
 }
 
-function withLog(fn, fallback) {
-	if (!isModelIoLogEnabled()) return fallback
+function withModelIoDb(fn, fallback) {
 	try {
 		return fn(openDb().statements)
 	} catch (err) {
 		warnOnce(err)
 		return fallback
 	}
+}
+
+function withLog(fn, fallback) {
+	if (!isModelIoLogEnabled()) return fallback
+	return withModelIoDb(fn, fallback)
 }
 
 function transaction(s, fn) {
@@ -469,6 +505,25 @@ export function finishModelRequest(request, { status, finalMessage = null, error
 	withLog((s) => {
 		s.finishRequest.run(nowIso(), status || "completed", finalMessage ? safeJson(finalMessage) : null, error, request.id)
 	}, undefined)
+}
+
+export function recordSubscriptionUsageSnapshot(snapshot = {}) {
+	return withModelIoDb((s) => {
+		const id = snapshot.id || randomUUID()
+		s.insertSubscriptionUsageSnapshot.run(
+			id,
+			snapshot.sampledAt || nowIso(),
+			snapshot.provider || "openai-codex",
+			snapshot.credentialId ?? null,
+			snapshot.accountId ?? null,
+			snapshot.baseUrl ?? null,
+			snapshot.usageUrl ?? null,
+			snapshot.status || (snapshot.error ? "error" : "ok"),
+			safeJsonOrNull(snapshot.payload),
+			snapshot.error ?? null,
+		)
+		return id
+	}, null)
 }
 
 function rowJson(row, key) {

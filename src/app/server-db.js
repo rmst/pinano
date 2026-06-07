@@ -17,7 +17,7 @@ import {
 	SESSION_CUSTOM_TYPE_REWIND,
 } from "./session-custom-types.js"
 
-const SCHEMA_VERSION = 22
+const SCHEMA_VERSION = 24
 const SESSION_PREVIEW_BATCH_SIZE = 200
 
 const HIDDEN_MESSAGE_EXTRA_SQL = `
@@ -800,6 +800,18 @@ const migrations = [
 		if (!columns.has("mutation_version")) db.exec("ALTER TABLE sessions ADD COLUMN mutation_version INTEGER NOT NULL DEFAULT 0")
 		if (!columns.has("mutation_run_id")) db.exec("ALTER TABLE sessions ADD COLUMN mutation_run_id TEXT")
 	},
+	// v22 → v23: persist context-file identity captured at load time. Older
+	// rows fall back to realpath(path) while they still exist.
+	(db) => {
+		if (tableExists(db, "entry_context_files") && !tableColumns(db, "entry_context_files").has("identity_path")) {
+			db.exec("ALTER TABLE entry_context_files ADD COLUMN identity_path TEXT")
+		}
+		if (tableExists(db, "context_files") && !tableColumns(db, "context_files").has("identity_path")) {
+			db.exec("ALTER TABLE context_files ADD COLUMN identity_path TEXT")
+		}
+	},
+	// v23 → v24: retired before release; kept as an empty migration slot so existing v24 databases remain compatible.
+	() => {},
 ]
 
 function tableExists(db, name) {
@@ -1019,6 +1031,15 @@ function promptDraftFromRow(row, overrides = {}) {
 		updatedByClientId: row?.updatedByClientId ?? undefined,
 		updatedByClientSeq: row?.updatedByClientSeq ?? undefined,
 		...overrides,
+	}
+}
+
+function parseJson(text, fallback = undefined) {
+	if (text === null || text === undefined) return fallback
+	try {
+		return JSON.parse(String(text))
+	} catch {
+		return fallback
 	}
 }
 
@@ -1565,6 +1586,32 @@ export function openServerDb(options = {}) {
 			lastUserText: lastUser ? flattenPreviewContent(lastUser.content) : null,
 		}
 	}
+	const ensureSessionOverviewsForSessions = (ids) => {
+		if (ids.length === 0) return new Map()
+		const cachedBySessionId = new Map(cachedOverviewsForSessions(ids).map((row) => [row.sessionId, row]))
+		const leaves = overviewLeavesForSessions(ids)
+		const staleLeaves = leaves.filter((row) => !cachedBySessionId.has(row.sessionId))
+		if (staleLeaves.length > 0) {
+			const staleIds = staleLeaves.map((row) => row.sessionId)
+			const messagesBySessionId = new Map()
+			for (const row of loadSessionPreviewMessagesForSessions(staleIds)) {
+				const messages = messagesBySessionId.get(row.sessionId) ?? []
+				messages.push(row)
+				messagesBySessionId.set(row.sessionId, messages)
+			}
+			for (const leaf of staleLeaves) {
+				cachedBySessionId.set(
+					leaf.sessionId,
+					upsertSessionOverview(
+						leaf.sessionId,
+						leaf.activeLeafEntryId ?? null,
+						messagesBySessionId.get(leaf.sessionId) ?? [],
+					),
+				)
+			}
+		}
+		return cachedBySessionId
+	}
 	const latestForCwdStmt = db.prepare(`
 		SELECT id FROM sessions
 		WHERE deleted_at IS NULL AND cwd = ?
@@ -1802,25 +1849,7 @@ export function openServerDb(options = {}) {
 			return loadSessionPreviewMessagesForSessions(ids)
 		},
 		loadSessionOverviewPreviewMessagesForSessions(ids) {
-			if (ids.length === 0) return []
-			const cachedBySessionId = new Map(cachedOverviewsForSessions(ids).map((row) => [row.sessionId, row]))
-			const leaves = overviewLeavesForSessions(ids)
-			const staleLeaves = leaves.filter((row) => !cachedBySessionId.has(row.sessionId))
-			if (staleLeaves.length > 0) {
-				const staleIds = staleLeaves.map((row) => row.sessionId)
-				const messagesBySessionId = new Map()
-				for (const row of loadSessionPreviewMessagesForSessions(staleIds)) {
-					const messages = messagesBySessionId.get(row.sessionId) ?? []
-					messages.push(row)
-					messagesBySessionId.set(row.sessionId, messages)
-				}
-				for (const leaf of staleLeaves) {
-					cachedBySessionId.set(
-						leaf.sessionId,
-						upsertSessionOverview(leaf.sessionId, leaf.activeLeafEntryId ?? null, messagesBySessionId.get(leaf.sessionId) ?? []),
-					)
-				}
-			}
+			const cachedBySessionId = ensureSessionOverviewsForSessions(ids)
 			return ids.flatMap((id) => {
 				const row = cachedBySessionId.get(id)
 				return row ? cachedPreviewRowsFromOverview(row) : []

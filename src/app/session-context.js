@@ -1,9 +1,10 @@
 import { insertContextAfterLatestResponsesCompaction, messageHasResponsesCompactionItem } from "../responses-compaction.js"
 import { modelCompactionHandoffMessage } from "./compaction-summary.js"
-import { buildContextBundleMessage, normalizeContextFiles } from "./context-format.js"
+import { contextFileIdentity } from "../session-manager/context-identity.js"
+import { buildContextBundleMessage, hashContextContent, normalizeContextFiles } from "./context-format.js"
 import { getEffectiveSessionProperties } from "./session-properties.js"
 
-/** @typedef {{ path: string, scopeDir: string, content: string, hash: string }} ContextSnapshotFile */
+/** @typedef {{ path: string, scopeDir: string, identityPath: string, content: string, hash: string }} ContextSnapshotFile */
 
 /** @param {any} agent */
 export function contextFilesDisabledForAgent(agent) {
@@ -11,20 +12,34 @@ export function contextFilesDisabledForAgent(agent) {
 }
 
 /** Return active context files for the current branch. Later loads for the
- * same path replace earlier ones; output order preserves the recorded load
- * order. The startup and lazy loaders already record files in instruction
- * precedence order, so prompt assembly remains an exact replay of snapshots.
+ * same real context file replace earlier ones; output order preserves the
+ * recorded load order. The startup and lazy loaders already record files in
+ * instruction precedence order, so prompt assembly remains an exact replay of
+ * snapshots.
  * @param {any} session
  * @param {string} [fromId]
  * @returns {ContextSnapshotFile[]} */
 export function activeContextFiles(session, fromId = undefined) {
 	const loads = session?.getContextLoads?.(fromId) ?? []
-	const byPath = new Map()
+	const byIdentity = new Map()
 	for (const load of loads) {
 		if (load.disabled) continue
-		for (const file of normalizeContextFiles(load.files ?? [])) byPath.set(file.path, file)
+		for (const file of normalizeContextFiles(load.files ?? [])) byIdentity.set(contextFileIdentity(file), file)
 	}
-	return [...byPath.values()]
+	return [...byIdentity.values()]
+}
+
+/** Return context snapshots as they should be injected into the model. Durable context state keeps every loaded file, but prompt assembly drops later exact-content duplicates so common worktree copies do not waste context.
+ * @param {ReadonlyArray<ContextSnapshotFile | { path: string, content: string, scopeDir?: string, identityPath?: string, hash?: string }>} files
+ * @returns {ContextSnapshotFile[]} */
+export function contextFilesForModel(files) {
+	const seenHashes = new Set()
+	return normalizeContextFiles([...files]).filter((file) => {
+		const hash = hashContextContent(file.content)
+		if (seenHashes.has(hash)) return false
+		seenHashes.add(hash)
+		return true
+	})
 }
 
 function pruneBeforeLatestResponsesCompaction(entries) {
@@ -81,7 +96,7 @@ export function conversationEntriesForModel(session, fromId = undefined) {
  * @param {string} cwd
  * @returns {any[]} */
 export function buildModelMessagesWithContextFiles(files, conversationMessages, cwd) {
-	const contextMessage = buildContextBundleMessage([...files], cwd)
+	const contextMessage = buildContextBundleMessage(contextFilesForModel(files), cwd)
 	return insertContextAfterLatestResponsesCompaction(contextMessage ? [contextMessage] : [], conversationMessages)
 }
 
@@ -123,5 +138,5 @@ export function buildModelMessagesForAgent(agent, conversationMessages = undefin
 
 /** @param {any} session @param {string} [cwd] */
 export function buildContextBundleForSession(session, cwd = undefined) {
-	return buildContextBundleMessage(activeContextFiles(session), cwd ?? session?.getMetadata?.().cwd ?? process.cwd())
+	return buildContextBundleMessage(contextFilesForModel(activeContextFiles(session)), cwd ?? session?.getMetadata?.().cwd ?? process.cwd())
 }
