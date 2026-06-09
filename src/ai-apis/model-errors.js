@@ -6,6 +6,7 @@ const RETRYABLE_MODEL_ERROR_PATTERNS = [
 	/exceeded request buffer limit while retrying upstream/i,
 	/response.?header.?timeout|no response headers received/i,
 	/stream.?inactivity|no sse data received/i,
+	/no (?:first )?sse event received/i,
 	/tls: stream read error|\bECONNRESET\b|\bEPIPE\b|\bETIMEDOUT\b/i,
 	/socket hang up|socket closed|connection (?:closed|reset|terminated)|stream (?:closed|terminated|disconnected)/i,
 	/^\s*(?:Error\s+)?(?:TypeError\s+)?terminated\s*$/i,
@@ -58,12 +59,15 @@ export function classifyModelError(error) {
 	const name = modelErrorName(error)
 	const message = modelErrorMessage(error)
 	const text = `${name ?? ""} ${message}`
+	const phase = name === "ResponseHeaderTimeoutError"
+		? "before_headers"
+		: name === "StreamEventTimeoutError"
+			? (/** @type {any} */ (error)?.phase === "stream_start" ? "before_first_event" : "stream_event_inactivity")
+			: name === "StreamInactivityTimeoutError" ? "stream_inactivity" : undefined
 	return {
 		retryable: RETRYABLE_MODEL_ERROR_PATTERNS.some((pattern) => pattern.test(text)),
 		code: name,
-		phase: name === "ResponseHeaderTimeoutError"
-			? "before_headers"
-			: name === "StreamInactivityTimeoutError" ? "stream_inactivity" : undefined,
+		phase,
 		message,
 	}
 }

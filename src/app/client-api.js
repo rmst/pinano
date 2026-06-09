@@ -95,7 +95,32 @@ const entryIdFromBody = (body) => {
 	return typeof value === "string" ? value : String(value ?? "")
 }
 
+const optionalEntryIdFromBody = (body) => {
+	const source = body && typeof body === "object" ? body : {}
+	const key = hasOwn(source, "entryId") ? "entryId" : hasOwn(source, "id") ? "id" : ""
+	if (!key) return undefined
+	const value = source[key]
+	if (typeof value !== "string" || !value) throw Object.assign(new Error("valid branch entryId is required"), { status: 400 })
+	return value
+}
+
 const settingsResponse = async (settings) => ({ settings: await settings })
+
+function cleanUiStateKey(value) {
+	const key = typeof value === "string" ? value : ""
+	if (!key) throw Object.assign(new Error("ui state key is required"), { status: 400 })
+	if (key.length > 2048) throw Object.assign(new Error("ui state key is too long"), { status: 400 })
+	return key
+}
+
+function uiStateResponse(key, value) {
+	const found = value !== undefined
+	return {
+		key,
+		found,
+		...(found ? { value } : {}),
+	}
+}
 
 /**
  * @param {string} ref
@@ -145,6 +170,7 @@ export function createManagerClientApi(options) {
 	const { manager, hub } = options
 	const sessionListCwd = options.sessionListCwd
 	const resolveId = options.resolveId || ((id) => id)
+	const uiStateStore = options.uiStateStore ?? options.db ?? manager.db
 	const currentSettings = () => options.getSettings ? options.getSettings() : loadSettings()
 	const setSettings = options.setSettings || (async (body) => {
 		if (hasOwn(body, "model")) {
@@ -169,12 +195,25 @@ export function createManagerClientApi(options) {
 		snapshot,
 		contextReport: (id) => manager.contextReport(resolveId(id || manager.initialSessionId)),
 		systemReport: (id) => manager.systemReport(resolveId(id || manager.initialSessionId)),
+		worktrees: (id) => manager.worktrees(resolveId(id || manager.initialSessionId)),
 		streamEvents: async (id, signal, options = {}) => {
 			if (id) return hub.stream({ type: "snapshot", sessionId: id, snapshot: await snapshot(id, options) }, signal)
 			return hub.stream({ type: "sessions", sessions: await manager.sessions(sessionListCwd) }, signal)
 		},
 		getSettings: () => settingsResponse(currentSettings()),
 		setSettings: async (body) => ({ ok: true, settings: await setSettings(body) }),
+		getUiState: async (key) => {
+			const cleanedKey = cleanUiStateKey(key)
+			return uiStateResponse(cleanedKey, uiStateStore.getUiState(cleanedKey))
+		},
+		setUiState: async (key, value) => {
+			const cleanedKey = cleanUiStateKey(key)
+			return { ok: true, ...uiStateResponse(cleanedKey, uiStateStore.setUiState(cleanedKey, value)) }
+		},
+		deleteUiState: async (key) => {
+			const cleanedKey = cleanUiStateKey(key)
+			return { ok: true, key: cleanedKey, deleted: uiStateStore.deleteUiState(cleanedKey) }
+		},
 		createSession: async (body) => {
 			const cwd = typeof body.cwd === "string" && body.cwd ? body.cwd : sessionListCwd || options.cwd
 			const prompt = typeof body.prompt === "string" ? body.prompt : ""
@@ -188,7 +227,9 @@ export function createManagerClientApi(options) {
 			const images = promptImagesFromBody(body)
 			if (!message.trim() && images.length === 0) throw Object.assign(new Error("message is required"), { status: 400 })
 			const runtime = await runtimeFor(id)
-			await runtime.prompt(message, body.streamingBehavior, images)
+			const submission = await runtime.beginPrompt(message, body.streamingBehavior, images)
+			if (submission.streamingBehavior) runtime.observePromptAccepted(submission)
+			else await runtime.waitForPromptAccepted(submission)
 			manager.setPromptDraft(resolveId(id), "", { clientId: body.draftClientId, clientSeq: body.draftClientSeq })
 			return mutationResult(resolveId(id))
 		},
@@ -231,7 +272,7 @@ export function createManagerClientApi(options) {
 			if (!level) throw Object.assign(new Error("valid reasoning level is required"), { status: 400 })
 			const runtime = await runtimeFor(id)
 			runtime.agent.state.thinkingLevel = /** @type {any} */ (level)
-			await runtime.session.appendConfigPatch({ version: 1, thinkingLevel: runtime.agent.state.thinkingLevel })
+			await runtime.session.appendConfigPatch({ thinkingLevel: runtime.agent.state.thinkingLevel })
 			await manager.invalidateSnapshot(resolveId(id))
 			return mutationResult(resolveId(id))
 		},
@@ -272,8 +313,12 @@ export function createManagerClientApi(options) {
 			})
 			return mutationResult(resolveId(id), { text, editorText: text, targetKind: "message" })
 		},
-		branch: async (id) => {
-			const runtime = await manager.branchSession(resolveId(id))
+		branch: async (id, body = {}) => {
+			const runtime = await manager.branchSession(resolveId(id), {
+				cwd: typeof body.cwd === "string" && body.cwd ? body.cwd : undefined,
+				entryId: optionalEntryIdFromBody(body),
+				restoreDraft: body.restoreDraft !== false,
+			})
 			return mutationResult(runtime.sessionId, {}, ["session", "sessions"])
 		},
 	}
@@ -300,6 +345,7 @@ export function createServiceClientApi(options) {
 		snapshot,
 		contextReport: async (id) => client.contextReport(id || await ensureInitialSessionId()),
 		systemReport: async (id) => client.systemReport(id || await ensureInitialSessionId()),
+		worktrees: async (id) => client.worktrees(id || await ensureInitialSessionId()),
 		streamEvents: async (id) => {
 			let unsubscribe = () => {}
 			const stream = new ReadableStream({
@@ -352,6 +398,19 @@ export function createServiceClientApi(options) {
 				return client.setDefaultReasoning(level)
 			}
 			throw Object.assign(new Error("no supported settings provided"), { status: 400 })
+		},
+		getUiState: async (key) => {
+			const cleanedKey = cleanUiStateKey(key)
+			const value = await client.getUiState(cleanedKey)
+			return uiStateResponse(cleanedKey, value)
+		},
+		setUiState: async (key, value) => {
+			const cleanedKey = cleanUiStateKey(key)
+			return client.setUiState(cleanedKey, value)
+		},
+		deleteUiState: async (key) => {
+			const cleanedKey = cleanUiStateKey(key)
+			return client.deleteUiState(cleanedKey)
 		},
 		createSession: async (body) => {
 			const images = promptImagesFromBody(body)
@@ -416,8 +475,12 @@ export function createServiceClientApi(options) {
 			const text = response.text ?? response.editorText ?? ""
 			return mutationResult(id, { ...response, text, editorText: text, targetKind: response.targetKind ?? targetKind ?? "message" })
 		},
-		branch: async (id) => {
-			const response = await client.branchSession(id)
+		branch: async (id, body = {}) => {
+			const response = await client.branchSession(id, {
+				cwd: typeof body.cwd === "string" && body.cwd ? body.cwd : undefined,
+				entryId: optionalEntryIdFromBody(body),
+				restoreDraft: body.restoreDraft !== false,
+			})
 			const nextId = response.sessionId || response.snapshot?.sessionId
 			return mutationResult(nextId, response, ["session", "sessions"])
 		},
@@ -456,6 +519,14 @@ export function registerClientApiRoutes(app, api, options = {}) {
 	app.post(path("/sessions"), safe(async (context) => json(await api.createSession(await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
 	app.get(path("/settings"), safe(async () => json(await api.getSettings())))
 	app.post(path("/settings"), safe(async (context) => json(await api.setSettings(await jsonBody(context)))))
+	app.get(path("/ui-state"), safe(async (context) => json(await api.getUiState(cleanUiStateKey(urlFor(context).searchParams.get("key"))))))
+	app.post(path("/ui-state"), safe(async (context) => {
+		const body = await jsonBody(context)
+		const key = cleanUiStateKey(body.key ?? urlFor(context).searchParams.get("key"))
+		if (!hasOwn(body, "value")) throw Object.assign(new Error("ui state value is required"), { status: 400 })
+		return json(await api.setUiState(key, body.value))
+	}))
+	app.delete(path("/ui-state"), safe(async (context) => json(await api.deleteUiState(cleanUiStateKey(urlFor(context).searchParams.get("key"))))))
 	if (options.includeCommands) app.get(path("/commands"), () => json({ commands: WEB_COMMANDS }))
 
 	const snapshotById = safe(async (context) => json(await api.snapshot(sessionId(context), routeSnapshotOptionsFromQuery(context))))
@@ -463,6 +534,7 @@ export function registerClientApiRoutes(app, api, options = {}) {
 	app.get(path("/sessions/:id/snapshot"), snapshotById)
 	app.get(path("/sessions/:id/context-report"), safe(async (context) => json({ lines: await api.contextReport(sessionId(context)) })))
 	app.get(path("/sessions/:id/system-report"), safe(async (context) => json({ lines: await api.systemReport(sessionId(context)) })))
+	app.get(path("/sessions/:id/worktrees"), safe(async (context) => json({ worktrees: await api.worktrees(sessionId(context)) })))
 	app.post(path("/sessions/:id/prompt"), safe(async (context) => json(await api.prompt(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
 	app.post(path("/sessions/:id/draft"), safe(async (context) => json(await api.draft(sessionId(context), await jsonBody(context)))))
 	app.post(path("/sessions/:id/continue"), safe(async (context) => json(await api.continueRun(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
@@ -478,5 +550,11 @@ export function registerClientApiRoutes(app, api, options = {}) {
 	app.post(path("/sessions/:id/bash"), safe(async (context) => json(await api.bash(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
 	app.get(path("/sessions/:id/rewind-targets"), safe(async (context) => json(await api.rewindTargets(sessionId(context)))))
 	app.post(path("/sessions/:id/rewind"), safe(async (context) => json(await api.rewind(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
-	app.post(path("/sessions/:id/branch"), safe(async (context) => json(await api.branch(sessionId(context), { cwd: cwdFilter(context) }, { snapshotOptions: routeSnapshotOptions() }))))
+	app.post(path("/sessions/:id/branch"), safe(async (context) => {
+		const cwd = cwdFilter(context)
+		return json(await api.branch(sessionId(context), {
+			...(await jsonBody(context)),
+			...(cwd ? { cwd } : {}),
+		}, { snapshotOptions: routeSnapshotOptions() }))
+	}))
 }

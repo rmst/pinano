@@ -122,6 +122,8 @@ export function streamOpenAIResponses(model, context, options) {
 				modelLog,
 				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,
 				streamInactivityTimeoutMs: options?.streamInactivityTimeoutMs,
+				firstStreamEventTimeoutMs: options?.firstStreamEventTimeoutMs,
+				streamEventInactivityTimeoutMs: options?.streamEventInactivityTimeoutMs,
 			})
 			await execute(bodyJson)
 

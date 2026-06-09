@@ -1,5 +1,3 @@
-const PROTECTED_METADATA_PATH_NAMES = [".git", ".agents", ".codex"]
-
 const SEATBELT_BASE_POLICY = String.raw`(version 1)
 
 ; Base policy adapted from Codex's Seatbelt sandbox profile.
@@ -129,6 +127,7 @@ const SEATBELT_PLATFORM_DEFAULTS = String.raw`; macOS platform defaults for ordi
   (subpath "/System/Library/OpenSSL")
   (subpath "/System/Library/PrivateFrameworks")
   (subpath "/System/Library/SubFrameworks")
+  (subpath "/System/Cryptexes")
   (subpath "/System/iOSSupport/System/Library/Frameworks")
   (subpath "/System/iOSSupport/System/Library/PrivateFrameworks")
   (subpath "/System/iOSSupport/System/Library/SubFrameworks")
@@ -137,7 +136,9 @@ const SEATBELT_PLATFORM_DEFAULTS = String.raw`; macOS platform defaults for ordi
   (subpath "/usr/lib")
   (subpath "/usr/libexec")
   (subpath "/usr/local")
-  (subpath "/usr/sbin"))
+  (subpath "/usr/sbin")
+  (subpath "/var/run/com.apple.security.cryptexd")
+  (subpath "/private/var/run/com.apple.security.cryptexd"))
 
 (allow file-read* file-test-existence
   (subpath "/Library/Apple/System/Library/Frameworks")
@@ -148,9 +149,12 @@ const SEATBELT_PLATFORM_DEFAULTS = String.raw`; macOS platform defaults for ordi
   (subpath "/System/Library/OpenSSL")
   (subpath "/System/Library/PrivateFrameworks")
   (subpath "/System/Library/SubFrameworks")
+  (subpath "/System/Cryptexes")
   (subpath "/System/iOSSupport/System/Library/Frameworks")
   (subpath "/System/iOSSupport/System/Library/PrivateFrameworks")
   (subpath "/System/iOSSupport/System/Library/SubFrameworks")
+  (subpath "/var/run/com.apple.security.cryptexd")
+  (subpath "/private/var/run/com.apple.security.cryptexd")
   (subpath "/usr/lib"))
 
 (allow system-mac-syscall (mac-policy-name "vnguard"))
@@ -258,12 +262,21 @@ const SEATBELT_PLATFORM_DEFAULTS = String.raw`; macOS platform defaults for ordi
 (allow file-read-metadata (subpath "/usr/sbin"))
 (allow file-read-data (subpath "/usr/libexec"))
 (allow file-read-metadata (subpath "/usr/libexec"))
+(allow file-read-data (subpath "/System/Cryptexes"))
+(allow file-read-metadata (subpath "/System/Cryptexes"))
+(allow file-read-data (subpath "/var/run/com.apple.security.cryptexd"))
+(allow file-read-metadata (subpath "/var/run/com.apple.security.cryptexd"))
+(allow file-read-data (subpath "/private/var/run/com.apple.security.cryptexd"))
+(allow file-read-metadata (subpath "/private/var/run/com.apple.security.cryptexd"))
 
 (allow file-read* (subpath "/Library/Preferences"))
 (allow file-read* (subpath "/Library/Developer"))
 (allow file-read* (subpath "/opt/homebrew"))
 (allow file-read* (subpath "/usr/local"))
 (allow file-read* (subpath "/Applications"))
+(allow file-read* (subpath "/System/Cryptexes"))
+(allow file-read* (subpath "/var/run/com.apple.security.cryptexd"))
+(allow file-read* (subpath "/private/var/run/com.apple.security.cryptexd"))
 
 (allow file-read* (regex "^/dev/fd/(0|1|2)$"))
 (allow file-write* (regex "^/dev/fd/(1|2)$"))
@@ -310,24 +323,6 @@ const SEATBELT_FULL_NETWORK_POLICY = String.raw`; Full network access, plus plat
 (allow sysctl-read
   (sysctl-name-regex #"^net.routetable"))`
 
-function regexEscape(value) {
-	return String(value).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")
-}
-
-function protectedMetadataNameRegex(root, name) {
-	let trimmed = String(root)
-	while (trimmed.length > 1 && trimmed.endsWith("/")) trimmed = trimmed.slice(0, -1)
-	const escapedRoot = regexEscape(trimmed)
-	const escapedName = regexEscape(name)
-	return trimmed === "/" ? `^/${escapedName}(/.*)?$` : `^${escapedRoot}/${escapedName}(/.*)?$`
-}
-
-function protectedMetadataRequirements(root) {
-	return PROTECTED_METADATA_PATH_NAMES
-		.map((name) => protectedMetadataNameRegex(root, name).replaceAll("\"", "\\\""))
-		.map((regex) => `(require-not (regex #"${regex}"))`)
-}
-
 function buildSeatbeltReadPolicy(roots) {
 	const params = []
 	const components = roots.map((root, index) => {
@@ -346,11 +341,7 @@ function buildSeatbeltWritePolicy(roots) {
 	const components = roots.map((root, index) => {
 		const key = `WRITABLE_ROOT_${index}`
 		params.push([key, root])
-		const requirements = [
-			`(subpath (param "${key}"))`,
-			...protectedMetadataRequirements(root),
-		]
-		return `(require-all ${requirements.join(" ")})`
+		return `(subpath (param "${key}"))`
 	})
 	return {
 		params,

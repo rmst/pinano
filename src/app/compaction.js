@@ -7,7 +7,8 @@
 // conversation history.
 //
 // Strategy:
-//   - threshold:   compact when usage > settings.autocompactThreshold * contextWindow
+//   - threshold:   compact when usage reaches the internal threshold fraction
+//                  of the model context window
 //   - replacement: recent real user messages are retained as hidden model
 //                  mementos, followed by a user-role handoff summary
 //                  (`pinanoCompactionSummary: true`). A separate display marker
@@ -34,6 +35,7 @@ import {
 import { resolveModelStreamOptions } from "./model-auth.js"
 import { isFastModeEligibleModel } from "./fast-mode.js"
 import { buildModelMessagesForAgent } from "./session-context.js"
+import { prependEnvironmentContext } from "./environment-context.js"
 import { isProjectContextMessage } from "./project-context.js"
 import { lastReportedTokens } from "./context-summary.js"
 import {
@@ -98,17 +100,19 @@ export function shouldCompact(agent, threshold) {
 /**
  * @param {Agent} agent
  * @param {any} ctx
- * @param {AbortSignal} [signal]
+ * @param {import("../ai-apis/types.js").StreamOptions} [options]
  * @returns {Promise<import("../ai-apis/event-stream.js").AssistantMessageEventStream>}
  */
-async function streamForSummary(agent, ctx, signal) {
+async function streamForSummary(agent, ctx, options = {}) {
 	const model = agent.state.model
-	const options = {
-		signal,
+	const requestOptions = {
+		...options,
+		reasoning: options.reasoning ?? agent.state.thinkingLevel,
+		sessionId: options.sessionId ?? agent.sessionId,
 		serviceTier: isFastModeEligibleModel(model) ? agent.state.serviceTier : undefined,
 	}
-	if (agent.streamFn?.serviceMediated) return agent.streamFn(model, ctx, options)
-	const streamOptions = await resolveModelStreamOptions(model, options)
+	if (agent.streamFn?.serviceMediated) return agent.streamFn(model, ctx, requestOptions)
+	const streamOptions = await resolveModelStreamOptions(model, requestOptions)
 	if (typeof agent.streamFn === "function") return agent.streamFn(model, ctx, streamOptions)
 	return openaiStream(model, ctx, streamOptions)
 }
@@ -337,10 +341,50 @@ function compactionSource(messages) {
 	}
 }
 
+/** @param {Agent} agent @param {any[]} messages */
+function buildSummaryMessages(agent, messages) {
+	const modelMessages = agent.streamFn?.serviceMediated
+		? messages.map(modelCompactionHandoffMessage)
+		: buildModelMessagesForAgent(agent, messages)
+	return agent.streamFn?.serviceMediated
+		? modelMessages
+		: prependEnvironmentContext(agent.pinanoEnvironmentContext?.(), modelMessages)
+}
+
+/** @param {any[]} messages @param {string} prompt */
+function appendSummaryPrompt(messages, prompt) {
+	return [
+		...messages,
+		{
+			role: "user",
+			content: prompt,
+			pinanoMaintenance: true,
+		},
+	]
+}
+
+/** @param {any} final */
+function textFromSummaryFinalMessage(final) {
+	return (final.content ?? [])
+		.filter((/** @type {any} */ c) => c.type === "text")
+		.map((/** @type {any} */ c) => c.text)
+		.join("\n")
+}
+
+/** @param {any} final */
+function assertSummaryWasText(final) {
+	const toolCalls = (final.content ?? []).filter((/** @type {any} */ c) => c.type === "toolCall")
+	if (toolCalls.length > 0) {
+		const names = toolCalls.map((/** @type {any} */ c) => c.name || "unknown").join(", ")
+		throw new Error(`Compaction summary produced tool call${toolCalls.length === 1 ? "" : "s"} instead of text: ${names}`)
+	}
+}
+
 /**
- * Run a non-streaming summarization using the same model with a custom system
- * prompt. Lightweight wrapper around the OpenAI Chat Completions stream — we
- * just collect the deltas.
+ * Run a non-streaming summarization using the same model. Default compaction
+ * preserves the normal model-facing prompt prefix and appends the compact
+ * instruction as the final user message. Custom summary prompts keep the
+ * older serialized-transcript shape used by branch summaries.
  *
  * Returns the summary text together with the usage object from the underlying
  * call so callers can bill the cost back to the agent's running total.
@@ -351,31 +395,32 @@ function compactionSource(messages) {
  * @returns {Promise<{ summary: string, usage: any }>}
  */
 export async function summarizeMessages(agent, messages, options = {}) {
+	const customPrompt = options.systemPrompt !== undefined || options.userPreamble !== undefined
 	const ctx = {
-		systemPrompt: options.systemPrompt ?? SUMMARY_PROMPT,
-		messages: [
-			{
-				role: "user",
-				content: [
-					{ type: "text", text: options.userPreamble ?? SUMMARY_USER_PREAMBLE },
-					{ type: "text", text: serializeMessages(messages) },
-				],
-			},
-		],
-		tools: [],
+		systemPrompt: customPrompt ? options.systemPrompt ?? SUMMARY_PROMPT : agent.state.systemPrompt,
+		messages: customPrompt
+			? [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: options.userPreamble ?? SUMMARY_USER_PREAMBLE },
+						{ type: "text", text: serializeMessages(messages) },
+					],
+				},
+			]
+			: appendSummaryPrompt(buildSummaryMessages(agent, messages), SUMMARY_PROMPT),
+		tools: customPrompt ? [] : agent.state.tools,
 	}
-	const s = await streamForSummary(agent, ctx, options.signal)
+	const s = await streamForSummary(agent, ctx, { signal: options.signal })
 	let buf = ""
 	for await (const event of s) {
 		if (event.type === "text_delta") buf += event.delta
 	}
 	const final = await s.result()
 	if (final.errorMessage) throw new Error(final.errorMessage)
+	assertSummaryWasText(final)
 	if (!buf.trim()) {
-		buf = (final.content ?? [])
-			.filter((/** @type {any} */ c) => c.type === "text")
-			.map((/** @type {any} */ c) => c.text)
-			.join("\n")
+		buf = textFromSummaryFinalMessage(final)
 	}
 	return { summary: buf.trim(), usage: final.usage }
 }

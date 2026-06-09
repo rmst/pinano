@@ -56,7 +56,7 @@ export function codexUsageBaseUrlForModel(model, settings) {
 }
 
 /**
- * @param {{ baseUrl?: string, access?: string, accountId?: string, fetchFn?: typeof fetch }} [options]
+ * @param {{ baseUrl?: string, access?: string, accountId?: string, fetchFn?: typeof fetch, signal?: AbortSignal }} [options]
  * @returns {Promise<CodexUsagePayload>}
  */
 export async function fetchCodexUsage(options = {}) {
@@ -69,7 +69,7 @@ export async function fetchCodexUsage(options = {}) {
 	}
 	if (accountId) headers["ChatGPT-Account-Id"] = accountId
 	const fetchFn = options.fetchFn ?? fetch
-	const response = await fetchFn(usageUrl, { method: "GET", headers })
+	const response = await fetchFn(usageUrl, { method: "GET", headers, signal: options.signal })
 	const text = await response.text().catch(() => "")
 	if (!response.ok) throw new Error(`usage request failed: HTTP ${response.status}${text ? ` ${text}` : ""}`)
 	try {

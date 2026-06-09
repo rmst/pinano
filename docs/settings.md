@@ -18,13 +18,14 @@ Pinano reads settings from three layers, in order:
 			"baseUrl": "http://127.0.0.1:8080/v1",
 			"apiKey": "local",
 			"models": [
-				{ "id": "local", "contextWindow": 131072 }
+				{ "id": "local" }
 			]
 		}
 	},
 	"service": {
 		"modelIoLog": false
 	},
+	"updateCheck": true,
 	"thinkingLevel": "high"
 }
 ```
@@ -57,6 +58,10 @@ The `service` object configures the local background service:
 - `diagnostics`: service trace/probe options.
 - `token`: fixed local service capability token.
 
+## Update Check
+
+`updateCheck` controls the notice-only GitHub release check shown in the session overview. It defaults to `true` for ordinary installs. When enabled, Pinano checks the public package metadata at most once per local Pinano day, where the day starts at 04:00, and briefly shows a yellow overview notice if a newer version is available. Set it to `false` in `default-settings.json` for managed deployments or in `settings.json` for a user preference.
+
 ## Credentials
 
 Pinano resolves provider credentials from `$PINANO_HOME/auth/<provider>.json` first, then from `providers.<provider>.apiKey`. API keys in settings are useful for declarative deployments and local launcher defaults.
@@ -73,11 +78,11 @@ Start a llama.cpp OpenAI-compatible server, then declare it:
 			"baseUrl": "http://127.0.0.1:8080/v1",
 			"apiKey": "local",
 			"models": [
-				{ "id": "local", "contextWindow": 131072 }
+				{ "id": "local" }
 			]
 		}
 	}
 }
 ```
 
-Use the actual model id exposed by the server if it requires one. For a remote OpenAI-compatible endpoint, change `baseUrl` and `apiKey`.
+Pinano detects llama.cpp's served context window when the server exposes it. Set `contextWindow` on the model entry only when you need to override the detected value. Use the actual model id exposed by the server if it requires one. For a remote OpenAI-compatible endpoint, change `baseUrl` and `apiKey`.

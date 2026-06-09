@@ -9,7 +9,14 @@ import { validateMessageHistory } from "./message-history.js"
 import { parseStreamingJson } from "./json-parse.js"
 import { beginModelRequest, finishHttpAttempt, finishModelRequest, recordStreamEvent } from "./model-io-log.js"
 import { retryableModelErrorDetails, retryableModelErrorFrom } from "./model-errors.js"
-import { fetchStreamingResponseWithRetries, streamInactivityTimeoutMs } from "./responses-transport.js"
+import {
+	cancelResponseBody,
+	fetchStreamingResponseWithRetries,
+	firstStreamEventTimeoutMs,
+	streamEventInactivityTimeoutMs,
+	streamFailurePhase,
+	streamInactivityTimeoutMs,
+} from "./responses-transport.js"
 import { sanitizeSurrogates } from "./sanitize-unicode.js"
 import { parseSSE } from "./sse.js"
 import { transformMessages } from "./transform-messages.js"
@@ -83,6 +90,15 @@ function imageUrlPart(block) {
 	}
 }
 
+function systemLikeMessageContent(content) {
+	if (typeof content === "string") return content
+	if (!Array.isArray(content)) return ""
+	return content
+		.filter((block) => block?.type === "text")
+		.map((block) => block.text ?? "")
+		.join("")
+}
+
 function convertMessages(model, context, compat) {
 	const params = []
 	const transformed = transformMessages(context.messages, model)
@@ -101,6 +117,16 @@ function convertMessages(model, context, compat) {
 
 		if (compat.requiresAssistantAfterToolResult && lastRole === "toolResult" && msg.role === "user") {
 			params.push({ role: "assistant", content: "I have processed the tool results." })
+		}
+
+		if (msg.role === "developer" || msg.role === "system") {
+			const content = systemLikeMessageContent(msg.content)
+			if (content) {
+				const role = msg.role === "developer" && model.reasoning && compat.supportsDeveloperRole ? "developer" : "system"
+				params.push({ role, content: sanitizeSurrogates(content) })
+			}
+			lastRole = msg.role
+			continue
 		}
 
 		if (msg.role === "user") {
@@ -282,6 +308,9 @@ export function streamOpenAI(model, context, options) {
 		let modelLog = null
 		let attemptLog = null
 		let attemptFinished = false
+		let cleanupResponseSignal = () => {}
+		let abortResponseSignal = () => {}
+		let response
 		try {
 			validateMessageHistory(context.messages)
 			const apiKey = options?.apiKey ?? providerConfiguredApiKey(model) ?? ""
@@ -299,7 +328,12 @@ export function streamOpenAI(model, context, options) {
 			modelLog = beginModelRequest({ model, transport: "chat", requestJson: bodyJson, options })
 			if (modelLog?.id) output.modelRequestId = modelLog.id
 
-			const { response, attemptLog: successAttemptLog } = await fetchStreamingResponseWithRetries({
+			const {
+				response: fetchedResponse,
+				attemptLog: successAttemptLog,
+				cleanupResponseSignal: cleanupFetchedResponseSignal,
+				abortResponseSignal: abortFetchedResponseSignal,
+			} = await fetchStreamingResponseWithRetries({
 				url,
 				headers,
 				bodyJson,
@@ -317,7 +351,10 @@ export function streamOpenAI(model, context, options) {
 				},
 				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,
 			})
+			response = fetchedResponse
 			attemptLog = successAttemptLog
+			cleanupResponseSignal = cleanupFetchedResponseSignal
+			abortResponseSignal = abortFetchedResponseSignal
 
 			stream.push({ type: "start", partial: output })
 
@@ -342,6 +379,8 @@ export function streamOpenAI(model, context, options) {
 
 			for await (const chunk of parseSSE(response.body, {
 				inactivityTimeoutMs: streamInactivityTimeoutMs(model, options?.streamInactivityTimeoutMs),
+				firstEventTimeoutMs: firstStreamEventTimeoutMs(model, options?.firstStreamEventTimeoutMs),
+				eventInactivityTimeoutMs: streamEventInactivityTimeoutMs(model, options?.streamEventInactivityTimeoutMs, options?.streamInactivityTimeoutMs),
 				onEvent: (event) => recordStreamEvent(modelLog, attemptLog, event),
 			})) {
 				if (!chunk || typeof chunk !== "object") continue
@@ -455,6 +494,7 @@ export function streamOpenAI(model, context, options) {
 			finishCurrentBlock(currentBlock)
 			finishHttpAttempt(attemptLog, { status: "completed" })
 			attemptFinished = true
+			cleanupResponseSignal()
 
 			if (options?.signal?.aborted) throw new Error("Request was aborted")
 			if (output.stopReason === "error") {
@@ -465,9 +505,14 @@ export function streamOpenAI(model, context, options) {
 			stream.push({ type: "done", reason: output.stopReason, message: output })
 			stream.end()
 		} catch (error) {
+			if (error?.name === "StreamInactivityTimeoutError" || error?.name === "StreamEventTimeoutError") {
+				abortResponseSignal(error)
+			}
+			await cancelResponseBody(response, error)
+			cleanupResponseSignal()
 			const retryableError = options?.signal?.aborted
 				? undefined
-				: retryableModelErrorFrom(error, { phase: attemptLog && !attemptFinished ? "stream" : undefined })
+				: retryableModelErrorFrom(error, { phase: attemptLog && !attemptFinished ? streamFailurePhase(error) : undefined })
 			const finalError = retryableError ?? error
 			if (attemptLog && !attemptFinished) {
 				finishHttpAttempt(attemptLog, {

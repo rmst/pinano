@@ -13,6 +13,24 @@ const MAX_RETRIES = 3
 const BASE_DELAY_MS = 1000
 const DEFAULT_RESPONSE_HEADER_TIMEOUT_MS = 120_000
 const DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS = 15 * 60_000
+const DEFAULT_FIRST_STREAM_EVENT_TIMEOUT_MS = 60_000
+
+function configuredTimeoutMs(value, defaultMs) {
+	if (value === false || value === null) return 0
+	const n = Number(value ?? defaultMs)
+	return Number.isFinite(n) && n > 0 ? n : 0
+}
+
+function timeoutOverrideMs(override, modelValue, defaultMs) {
+	return override !== undefined ? configuredTimeoutMs(override, defaultMs) : configuredTimeoutMs(modelValue, defaultMs)
+}
+
+function firstConfiguredTimeoutMs(values, defaultMs) {
+	for (const value of values) {
+		if (value !== undefined) return configuredTimeoutMs(value, defaultMs)
+	}
+	return configuredTimeoutMs(undefined, defaultMs)
+}
 
 export function isRetryableHttpError(status, errorText = "") {
 	if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504 || status === 529) return true
@@ -26,17 +44,38 @@ function headersToRecord(headers) {
 }
 
 export function responseHeaderTimeoutMs(model, override) {
-	const value = override ?? model?.responseHeaderTimeoutMs
-	if (value === false || value === null) return 0
-	const n = Number(value ?? DEFAULT_RESPONSE_HEADER_TIMEOUT_MS)
-	return Number.isFinite(n) && n > 0 ? n : 0
+	return timeoutOverrideMs(override, model?.responseHeaderTimeoutMs, DEFAULT_RESPONSE_HEADER_TIMEOUT_MS)
 }
 
 export function streamInactivityTimeoutMs(model, override) {
-	const value = override ?? model?.streamInactivityTimeoutMs
-	if (value === false || value === null) return 0
-	const n = Number(value ?? DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS)
-	return Number.isFinite(n) && n > 0 ? n : 0
+	return timeoutOverrideMs(override, model?.streamInactivityTimeoutMs, DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS)
+}
+
+export function firstStreamEventTimeoutMs(model, override) {
+	return timeoutOverrideMs(override, model?.firstStreamEventTimeoutMs, DEFAULT_FIRST_STREAM_EVENT_TIMEOUT_MS)
+}
+
+export function streamEventInactivityTimeoutMs(model, override, streamInactivityOverride) {
+	return firstConfiguredTimeoutMs([
+		override,
+		model?.streamEventInactivityTimeoutMs,
+		streamInactivityOverride,
+		model?.streamInactivityTimeoutMs,
+	], DEFAULT_STREAM_INACTIVITY_TIMEOUT_MS)
+}
+
+export function streamFailurePhase(error) {
+	if (error?.name === "StreamEventTimeoutError") {
+		return error.phase === "stream_start" ? "before_first_event" : "stream_event_inactivity"
+	}
+	if (error?.name === "StreamInactivityTimeoutError") return "stream_inactivity"
+	return "stream"
+}
+
+export async function cancelResponseBody(response, reason) {
+	try {
+		await response?.body?.cancel?.(reason)
+	} catch {}
 }
 
 export async function sleep(ms, signal) {
@@ -61,15 +100,28 @@ export async function sleep(ms, signal) {
 
 export async function fetchWithResponseHeaderTimeout(url, init, timeoutMs) {
 	const parentSignal = init?.signal
-	if (!timeoutMs) return fetch(url, init)
-
 	const controller = new AbortController()
 	let timedOut = false
 	let parentAbortCleanup = null
-	const timer = setTimeout(() => {
-		timedOut = true
-		controller.abort()
-	}, timeoutMs)
+	let timer = undefined
+	const cleanup = () => {
+		if (timer) clearTimeout(timer)
+		timer = undefined
+		parentAbortCleanup?.()
+		parentAbortCleanup = null
+	}
+	const abort = (reason) => {
+		try {
+			controller.abort(reason)
+		} catch {}
+	}
+
+	if (timeoutMs) {
+		timer = setTimeout(() => {
+			timedOut = true
+			controller.abort()
+		}, timeoutMs)
+	}
 
 	if (parentSignal) {
 		const onAbort = () => controller.abort(parentSignal.reason)
@@ -81,17 +133,18 @@ export async function fetchWithResponseHeaderTimeout(url, init, timeoutMs) {
 	}
 
 	try {
-		return await fetch(url, { ...init, signal: controller.signal })
+		const response = await fetch(url, { ...init, signal: controller.signal })
+		if (timer) clearTimeout(timer)
+		timer = undefined
+		return { response, cleanup, abort }
 	} catch (error) {
+		cleanup()
 		if (timedOut && !parentSignal?.aborted) {
 			const timeoutError = new Error(`No response headers received within ${timeoutMs}ms`)
 			timeoutError.name = "ResponseHeaderTimeoutError"
 			throw timeoutError
 		}
 		throw error
-	} finally {
-		clearTimeout(timer)
-		parentAbortCleanup?.()
 	}
 }
 
@@ -110,6 +163,8 @@ export async function fetchStreamingResponseWithRetries({
 	let response
 	let lastError
 	let successAttemptLog = null
+	let cleanupResponseSignal = () => {}
+	let abortResponseSignal = () => {}
 	const headerTimeoutMs = responseHeaderTimeoutMs(model, responseHeaderTimeoutOverride)
 	for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
 		if (signal?.aborted) throw new Error("Request was aborted")
@@ -117,7 +172,10 @@ export async function fetchStreamingResponseWithRetries({
 		let attemptFinished = false
 		const attemptLog = startHttpAttempt(modelLog, { attemptIndex: attempt, method, url, headers, body: bodyJson })
 		try {
-			response = await fetchWithResponseHeaderTimeout(url, { method, headers, body: bodyJson, signal }, headerTimeoutMs)
+			const fetched = await fetchWithResponseHeaderTimeout(url, { method, headers, body: bodyJson, signal }, headerTimeoutMs)
+			response = fetched.response
+			cleanupResponseSignal = fetched.cleanup
+			abortResponseSignal = fetched.abort
 			fetchSucceeded = true
 			recordHttpResponse(attemptLog, response)
 			if (onResponse) await onResponse({ status: response.status, headers: headersToRecord(response.headers) }, model)
@@ -127,6 +185,7 @@ export async function fetchStreamingResponseWithRetries({
 			}
 
 			const errorText = await response.text().catch(() => "")
+			cleanupResponseSignal()
 			finishHttpAttempt(attemptLog, { status: "http_error", responseBody: errorText })
 			attemptFinished = true
 			if (attempt < MAX_RETRIES && isRetryableHttpError(response.status, errorText)) {
@@ -138,6 +197,7 @@ export async function fetchStreamingResponseWithRetries({
 				: { message: errorText || `HTTP ${response.status}` }
 			throw new Error(parsed.friendly || parsed.message || `HTTP ${response.status}`)
 		} catch (error) {
+			cleanupResponseSignal()
 			if (!attemptFinished) {
 				finishHttpAttempt(attemptLog, {
 					status: error?.name === "AbortError" || error?.message === "Request was aborted" ? "aborted" : "network_error",
@@ -159,9 +219,10 @@ export async function fetchStreamingResponseWithRetries({
 	if (!response?.ok) throw lastError ?? new Error("Failed after retries")
 	if (!response.body) {
 		finishHttpAttempt(successAttemptLog, { status: "network_error", error: "Response has no body" })
+		cleanupResponseSignal()
 		throw new Error("Response has no body")
 	}
-	return { response, attemptLog: successAttemptLog }
+	return { response, attemptLog: successAttemptLog, cleanupResponseSignal, abortResponseSignal }
 }
 
 /**
@@ -190,6 +251,8 @@ export async function fetchStreamingResponseWithRetries({
  * @param {string} [params.method]
  * @param {number|false|null} [params.responseHeaderTimeoutMs]
  * @param {number|false|null} [params.streamInactivityTimeoutMs]
+ * @param {number|false|null} [params.firstStreamEventTimeoutMs]
+ * @param {number|false|null} [params.streamEventInactivityTimeoutMs]
  */
 export async function executeResponsesRequest({
 	url,
@@ -206,8 +269,10 @@ export async function executeResponsesRequest({
 	method = "POST",
 	responseHeaderTimeoutMs: responseHeaderTimeoutOverride,
 	streamInactivityTimeoutMs: streamInactivityTimeoutOverride,
+	firstStreamEventTimeoutMs: firstStreamEventTimeoutOverride,
+	streamEventInactivityTimeoutMs: streamEventInactivityTimeoutOverride,
 }) {
-	const { response, attemptLog: successAttemptLog } = await fetchStreamingResponseWithRetries({
+	const { response, attemptLog: successAttemptLog, cleanupResponseSignal, abortResponseSignal } = await fetchStreamingResponseWithRetries({
 		url,
 		method,
 		headers,
@@ -220,21 +285,31 @@ export async function executeResponsesRequest({
 		responseHeaderTimeoutMs: responseHeaderTimeoutOverride,
 	})
 	const inactivityTimeoutMs = streamInactivityTimeoutMs(model, streamInactivityTimeoutOverride)
+	const firstEventTimeoutMs = firstStreamEventTimeoutMs(model, firstStreamEventTimeoutOverride)
+	const eventInactivityTimeoutMs = streamEventInactivityTimeoutMs(model, streamEventInactivityTimeoutOverride, streamInactivityTimeoutOverride)
 
 	try {
 		stream.push({ type: "start", partial: output })
 		const events = parseSSE(response.body, {
 			inactivityTimeoutMs,
+			firstEventTimeoutMs,
+			eventInactivityTimeoutMs,
 			onEvent: (event) => recordStreamEvent(modelLog, successAttemptLog, event),
 		})
 		await processResponsesStream(mapEvents ? mapEvents(events) : events, output, stream, model)
 		finishHttpAttempt(successAttemptLog, { status: "completed" })
 	} catch (error) {
+		if (error?.name === "StreamInactivityTimeoutError" || error?.name === "StreamEventTimeoutError") {
+			abortResponseSignal(error)
+		}
+		await cancelResponseBody(response, error)
 		finishHttpAttempt(successAttemptLog, {
 			status: signal?.aborted ? "aborted" : "stream_error",
 			error: error instanceof Error ? error.message : String(error),
 		})
 		if (signal?.aborted) throw error
-		throw retryableModelErrorFrom(error, { phase: error?.name === "StreamInactivityTimeoutError" ? "stream_inactivity" : "stream" }) ?? error
+		throw retryableModelErrorFrom(error, { phase: streamFailurePhase(error) }) ?? error
+	} finally {
+		cleanupResponseSignal()
 	}
 }

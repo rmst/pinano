@@ -10,11 +10,13 @@
 import { existsSync, readFileSync } from "node:fs"
 import { join, resolve } from "node:path"
 
+import { contextFileIdentity, contextFileIdentityPath } from "../session-manager/context-identity.js"
 import { expandImports } from "./context-imports.js"
 
 /**
  * @typedef {object} ContextFile
  * @property {string} path
+ * @property {string} identityPath
  * @property {string} content
  */
 
@@ -37,7 +39,7 @@ export function loadContextFileFromDir(dir) {
 		if (existsSync(filePath)) {
 			try {
 				const raw = readFileSync(filePath, "utf-8")
-				return { path: filePath, content: expandImports(raw, filePath) }
+				return { path: filePath, identityPath: contextFileIdentityPath(filePath), content: expandImports(raw, filePath) }
 			} catch {
 				// Unreadable file — skip silently; pi warns to stderr but pinano's
 				// TUI swallows stderr, so a warning would be invisible anyway.
@@ -59,9 +61,10 @@ export function loadProjectContextFiles(options) {
 
 	for (const agentDir of options.agentDirs) {
 		const global = loadContextFileFromDir(agentDir)
-		if (global && !seen.has(global.path)) {
+		const key = global ? contextFileIdentity(global) : ""
+		if (global && !seen.has(key)) {
 			out.push(global)
-			seen.add(global.path)
+			seen.add(key)
 		}
 	}
 
@@ -73,9 +76,10 @@ export function loadProjectContextFiles(options) {
 	const root = resolve("/")
 	while (true) {
 		const file = loadContextFileFromDir(dir)
-		if (file && !seen.has(file.path)) {
+		const key = file ? contextFileIdentity(file) : ""
+		if (file && !seen.has(key)) {
 			ancestors.unshift(file)
-			seen.add(file.path)
+			seen.add(key)
 		}
 		if (dir === root) break
 		const parent = resolve(dir, "..")

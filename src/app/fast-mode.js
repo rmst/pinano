@@ -38,7 +38,6 @@ export async function setSessionFastMode(agent, session, enabled) {
 	}
 	agent.state.serviceTier = enabled ? FAST_SERVICE_TIER : undefined
 	await session?.appendConfigPatch?.({
-		version: 1,
 		serviceTier: enabled ? FAST_SERVICE_TIER : null,
 	})
 }

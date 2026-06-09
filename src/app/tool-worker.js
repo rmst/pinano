@@ -4,12 +4,15 @@ import { mkdirSync, unlinkSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 
 import { createDefaultTools } from "../tools/index.js"
+import { processSessionManager } from "../tools/process-sessions.js"
 import { JsonLineRpc } from "./json-rpc-lines.js"
+import { startWorkerInternalHttpBridge } from "./worker-internal-http.js"
 import { WORKER_PROTOCOL_VERSION, assertWorkerProtocolVersion } from "./worker-protocol.js"
 
 let cwd = process.cwd()
-/** @type {Map<string, AbortController>} */
+/** @type {Map<string, { controller: AbortController, name: string, cwd: string, startedAt: number }>} */
 const activeTools = new Map()
+let internalApiBridge
 let shuttingDown = false
 
 function registerPidFile() {
@@ -32,7 +35,8 @@ function registerPidFile() {
 function shutdown() {
 	if (shuttingDown) return
 	shuttingDown = true
-	for (const controller of activeTools.values()) controller.abort()
+	internalApiBridge?.close?.()
+	for (const tool of activeTools.values()) tool.controller.abort()
 	setTimeout(() => process.exit(0), 50)
 }
 
@@ -52,9 +56,23 @@ function toolsForScope(_scope, toolCwd = cwd, options = {}) {
 	})
 }
 
+async function ensureInternalApiBridge() {
+	if (internalApiBridge) return internalApiBridge
+	internalApiBridge = await startWorkerInternalHttpBridge({
+		request: (request) => rpc.request("internalHttp", request),
+	})
+	Object.assign(process.env, internalApiBridge.env)
+	return internalApiBridge
+}
+
 async function executeTool(params) {
 	const controller = new AbortController()
-	activeTools.set(params.id, controller)
+	activeTools.set(params.id, {
+		controller,
+		name: params.name,
+		cwd: params.cwd ?? cwd,
+		startedAt: Date.now(),
+	})
 	try {
 		const tool = toolsForScope(params.scope, params.cwd ?? cwd, { toolProfile: params.toolProfile })
 			.find((item) => item.name === params.name)
@@ -67,6 +85,35 @@ async function executeTool(params) {
 	}
 }
 
+function memoryUsage() {
+	const memory = typeof process.memoryUsage === "function" ? process.memoryUsage() : {}
+	return {
+		rss: memory.rss ?? 0,
+		heapTotal: memory.heapTotal ?? 0,
+		heapUsed: memory.heapUsed ?? 0,
+		external: memory.external ?? 0,
+		arrayBuffers: memory.arrayBuffers ?? 0,
+	}
+}
+
+function inspectWorker() {
+	const now = Date.now()
+	return {
+		pid: process.pid,
+		cwd,
+		shuttingDown,
+		internalApi: internalApiBridge?.inspect(),
+		memory: memoryUsage(),
+		activeTools: [...activeTools.entries()].map(([id, tool]) => ({
+			id,
+			name: tool.name,
+			cwd: tool.cwd,
+			ageMs: now - tool.startedAt,
+		})),
+		processSessions: processSessionManager.inspect(now),
+	}
+}
+
 const rpc = new JsonLineRpc({
 	input: process.stdin,
 	output: process.stdout,
@@ -74,18 +121,21 @@ const rpc = new JsonLineRpc({
 	onRequest: async (method, params = {}) => {
 		if (method === "init") {
 			assertWorkerProtocolVersion(params.protocolVersion)
-			cwd = params.cwd ?? process.env.HOME ?? cwd
+			await ensureInternalApiBridge()
+			cwd = params.cwd ?? cwd
 			return {
 				protocolVersion: WORKER_PROTOCOL_VERSION,
 				cwd,
+				internalApi: internalApiBridge.inspect(),
 				tools: toolsForScope(undefined).map(serializableTool),
 			}
 		}
 		if (method === "executeTool") return executeTool(params)
 		if (method === "cancelTool") {
-			activeTools.get(params.id)?.abort()
+			activeTools.get(params.id)?.controller.abort()
 			return { ok: true }
 		}
+		if (method === "inspect") return inspectWorker()
 		throw new Error(`Unknown tool worker method: ${method}`)
 	},
 	onProtocolError: (err) => {

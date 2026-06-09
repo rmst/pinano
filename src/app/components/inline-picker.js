@@ -35,6 +35,8 @@ class DynamicBorder {
 export class InlinePickerComponent extends Container {
 	/** @type {SelectList} */
 	list
+	/** @type {Text | undefined} */
+	selectedDescription
 	focused = false
 
 	/** @type {((item: SelectItem) => void) | undefined} */
@@ -44,7 +46,7 @@ export class InlinePickerComponent extends Container {
 
 	/**
 	 * @param {SelectItem[]} items
-	 * @param {{ title?: string, subtitle?: string, maxVisible?: number }} [opts]
+	 * @param {{ title?: string, subtitle?: string, maxVisible?: number, descriptionMode?: "inline" | "selected" }} [opts]
 	 */
 	constructor(items, opts = {}) {
 		super()
@@ -59,10 +61,26 @@ export class InlinePickerComponent extends Container {
 			this.addChild(new Spacer(1))
 		}
 
-		this.list = new SelectList(items, opts.maxVisible ?? Math.max(items.length, 5), /** @type {any} */ (selectListTheme))
-		this.list.onSelect = (item) => this.onSelect?.(item)
+		const itemsByValue = new Map(items.map((item) => [item.value, item]))
+		const descriptionsByValue = new Map(items.map((item) => [item.value, item.description ?? ""]))
+		const listItems = opts.descriptionMode === "selected"
+			? items.map((item) => ({ ...item, description: undefined }))
+			: items
+		this.list = new SelectList(listItems, opts.maxVisible ?? Math.max(items.length, 5), /** @type {any} */ (selectListTheme))
+		this.list.onSelect = (item) => this.onSelect?.(itemsByValue.get(item.value) ?? item)
 		this.list.onCancel = () => this.onCancel?.()
 		this.addChild(this.list)
+
+		if (opts.descriptionMode === "selected") {
+			const selectedDescriptionText = () => {
+				const description = descriptionsByValue.get(this.list.getSelectedItem()?.value ?? "") ?? ""
+				return description ? theme.fg("muted", description) : ""
+			}
+			this.selectedDescription = new Text(selectedDescriptionText(), 1, 0)
+			this.list.onSelectionChange = () => this.selectedDescription?.setText(selectedDescriptionText())
+			this.addChild(new Spacer(1))
+			this.addChild(this.selectedDescription)
+		}
 
 		if (opts.title) {
 			this.addChild(new Spacer(1))
@@ -92,7 +110,7 @@ export class InlinePickerComponent extends Container {
  *
  * @param {ShowSelectorCtx} ctx
  * @param {SelectItem[]} items
- * @param {{ title?: string, subtitle?: string, maxVisible?: number }} [opts]
+ * @param {{ title?: string, subtitle?: string, maxVisible?: number, descriptionMode?: "inline" | "selected" }} [opts]
  * @returns {Promise<string | null>}
  */
 export async function pickInline(ctx, items, opts = {}) {

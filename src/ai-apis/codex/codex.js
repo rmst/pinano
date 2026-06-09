@@ -78,7 +78,7 @@ function buildBody(model, context, options) {
 		input: messages,
 		include: ["reasoning.encrypted_content"],
 		prompt_cache_key: options?.sessionId,
-		tool_choice: "auto",
+		tool_choice: options?.toolChoice ?? "auto",
 	}
 	if (model.supportsParallelToolCalls ?? true) body.parallel_tool_calls = true
 	const textVerbosity = model.supportsTextVerbosity === false ? undefined : options?.textVerbosity ?? model.defaultTextVerbosity
@@ -230,6 +230,8 @@ export function streamCodex(model, context, options) {
 				modelLog,
 				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,
 				streamInactivityTimeoutMs: options?.streamInactivityTimeoutMs,
+				firstStreamEventTimeoutMs: options?.firstStreamEventTimeoutMs,
+				streamEventInactivityTimeoutMs: options?.streamEventInactivityTimeoutMs,
 			})
 			await execute(bodyJson)
 

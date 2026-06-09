@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto"
 import { dirname } from "node:path"
 
+import { contextFileIdentityPath } from "../session-manager/context-identity.js"
+
 export { hasProjectContextMessage, isProjectContextMessage } from "./project-context-message.js"
 
 /** Heading used in the synthetic project-context user message. */
@@ -14,17 +16,18 @@ export function hashContextContent(content) {
 	return createHash("sha256").update(content).digest("hex")
 }
 
-/** @param {{ path: string, content: string, scopeDir?: string, hash?: string }} file */
+/** @param {{ path: string, content: string, scopeDir?: string, identityPath?: string, hash?: string }} file */
 export function normalizeContextFile(file) {
 	return {
 		path: file.path,
 		scopeDir: file.scopeDir ?? dirname(file.path),
+		identityPath: file.identityPath ?? contextFileIdentityPath(file.path),
 		content: file.content ?? "",
 		hash: file.hash ?? hashContextContent(file.content ?? ""),
 	}
 }
 
-/** @param {Array<{ path: string, content: string, scopeDir?: string, hash?: string }>} files */
+/** @param {Array<{ path: string, content: string, scopeDir?: string, identityPath?: string, hash?: string }>} files */
 export function normalizeContextFiles(files) {
 	return files.map(normalizeContextFile)
 }

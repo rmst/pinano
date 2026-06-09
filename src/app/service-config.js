@@ -89,3 +89,23 @@ export function configuredServiceDiagnostics() {
 		recordAllSpans: value.recordAllSpans,
 	}
 }
+
+export function configuredServiceDebug() {
+	const config = serviceSettings()
+	const value = config.debug
+	if (value === undefined || value === null) return { inspect: false, heapSnapshot: false, allowNonLoopback: false }
+	if (typeof value === "boolean") return { inspect: value, heapSnapshot: false, allowNonLoopback: false }
+	if (typeof value === "string") return { inspect: TRUE_VALUES.has(value.toLowerCase()), heapSnapshot: false, allowNonLoopback: false }
+	if (typeof value !== "object") return { inspect: false, heapSnapshot: false, allowNonLoopback: false }
+	const enabled = value.enabled === undefined ? undefined : (typeof value.enabled === "boolean" ? value.enabled : TRUE_VALUES.has(String(value.enabled).toLowerCase()))
+	const inspect = value.inspect === undefined
+		? enabled === true
+		: typeof value.inspect === "boolean"
+			? value.inspect
+			: TRUE_VALUES.has(String(value.inspect).toLowerCase())
+	return {
+		inspect,
+		heapSnapshot: value.heapSnapshot === true || (typeof value.heapSnapshot === "string" && TRUE_VALUES.has(value.heapSnapshot.toLowerCase())),
+		allowNonLoopback: value.allowNonLoopback === true || (typeof value.allowNonLoopback === "string" && TRUE_VALUES.has(value.allowNonLoopback.toLowerCase())),
+	}
+}

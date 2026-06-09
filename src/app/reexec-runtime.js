@@ -4,9 +4,25 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 export const REEXEC_REQUEST_EXIT_CODE = 113
+export const STALE_RUNTIME_REEXEC_DEPTH_ENV = "PINANO_STALE_RUNTIME_REEXEC_DEPTH"
 
 const REQUEST_FILE_ENV = "PINANO_REEXEC_REQUEST_FILE"
 const SUPERVISOR_PID_ENV = "PINANO_REEXEC_SUPERVISOR_PID"
+const STALE_RUNTIME_REEXEC_MAX_DEPTH = 3
+
+export function nextStaleRuntimeReexecDepth(env = process.env) {
+	const depth = Number(env[STALE_RUNTIME_REEXEC_DEPTH_ENV] ?? 0)
+	if (Number.isFinite(depth) && depth >= STALE_RUNTIME_REEXEC_MAX_DEPTH) throw new Error("stale runtime reexec depth exceeded")
+	return String((Number.isFinite(depth) ? depth : 0) + 1)
+}
+
+export function staleRuntimeReexecEnvPatch(env = process.env) {
+	return { [STALE_RUNTIME_REEXEC_DEPTH_ENV]: nextStaleRuntimeReexecDepth(env) }
+}
+
+export function clearStaleRuntimeReexecDepth(env = process.env) {
+	delete env[STALE_RUNTIME_REEXEC_DEPTH_ENV]
+}
 
 function processExists(pid) {
 	if (!Number.isInteger(pid) || pid <= 0) return false

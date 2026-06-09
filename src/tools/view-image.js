@@ -28,7 +28,7 @@ export function createViewImageTool(cwd) {
 		name: "view_image",
 		label: "view_image",
 		description:
-			"View a local image from the filesystem. Only use if given a full filepath by the user, and the image is not already attached to the thread context.",
+			"View a local image from the filesystem. Only use if the image is not already attached to the thread context.",
 		parameters: viewImageSchema,
 		async execute(_id, { path, detail }, signal) {
 			const abs = resolveToCwd(path, cwd)

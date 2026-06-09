@@ -1,20 +1,17 @@
-import { existsSync } from "node:fs"
+import { statSync } from "node:fs"
 import { basename, isAbsolute, resolve } from "node:path"
 
 const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"])
 const SHELL_SEPARATORS = new Set(["|", "||", "&&", ";"])
 const FULL_OUTPUT_COMMANDS = new Set(["cat", "bat", "batcat", "less", "more", "nl"])
-const PATH_COMMANDS = new Set([
+const FILE_READ_COMMANDS = new Set([
 	...FULL_OUTPUT_COMMANDS,
 	"awk",
-	"find",
 	"grep",
 	"head",
-	"ls",
 	"rg",
 	"sed",
 	"tail",
-	"wc",
 ])
 const OPTIONS_WITH_VALUES = new Set([
 	"-A",
@@ -59,7 +56,7 @@ function isRedirectionToken(token) {
 }
 
 function hasOutputRedirection(tokens) {
-	return tokens.some((token) => /^(?:\d*)?>/.test(token) || token === "&>" || token === "&>>")
+	return tokens.some((token) => /^(?:1)?>/.test(token) || token === "&>" || token === "&>>")
 }
 
 function shellWords(command) {
@@ -91,6 +88,11 @@ function shellWords(command) {
 		}
 		if (ch === "\\" && i + 1 < command.length) {
 			word += command[++i]
+			continue
+		}
+		if (ch === "\n") {
+			push()
+			words.push(";")
 			continue
 		}
 		if (/\s/.test(ch)) {
@@ -199,33 +201,28 @@ function pathTokensForSegment(tokens) {
 	const start = commandStart(tokens)
 	if (start >= tokens.length) return { command: "", tokens: [] }
 	const command = commandName(tokens[start])
-	if (command === "git") {
-		const marker = tokens.indexOf("--", start + 1)
-		return { command, tokens: marker === -1 ? [] : tokens.slice(marker + 1).filter(isLiteralPathToken) }
-	}
-	if (!PATH_COMMANDS.has(command)) return { command, tokens: [] }
-	if (command === "find") {
-		const pathTokens = []
-		for (const token of tokens.slice(start + 1)) {
-			if (token === "--") continue
-			if (token.startsWith("-") || token === "!" || token === "(" || token === ")") break
-			if (isLiteralPathToken(token)) pathTokens.push(token)
-		}
-		return { command, tokens: pathTokens }
-	}
+	if (!FILE_READ_COMMANDS.has(command)) return { command, tokens: [] }
 	if (command === "grep" || command === "rg") {
 		const { out, options } = collectPositionals(tokens, start + 1, command)
-		if (command === "rg" && options.has("--files")) return { command, tokens: out }
+		if (command === "rg" && options.has("--files")) return { command, tokens: [] }
 		const patternPassedByOption = [...options].some((option) => PATTERN_ARGUMENT_OPTIONS.has(option))
 		return { command, tokens: patternPassedByOption ? out : out.slice(1) }
+	}
+	if (command === "sed" || command === "awk") {
+		const { out, options } = collectPositionals(tokens, start + 1, command)
+		const scriptPassedByOption = [...options].some((option) => option === "-e" || option === "-f" || option === "--file")
+		return { command, tokens: scriptPassedByOption ? out : out.slice(1) }
 	}
 	return { command, tokens: collectPositionals(tokens, start + 1, command).out }
 }
 
-function existingShellPath(token, cwd) {
+function existingShellFilePath(token, cwd) {
 	const abs = isAbsolute(token) ? token : resolve(cwd, token)
-	if (!existsSync(abs)) return null
-	return abs
+	try {
+		return statSync(abs).isFile() ? abs : null
+	} catch {
+		return null
+	}
 }
 
 function isContextFilePath(path) {
@@ -233,7 +230,7 @@ function isContextFilePath(path) {
 }
 
 /**
- * Best-effort extraction of literal filesystem paths from common shell file inspection commands. This deliberately ignores variables, globs, command substitution, and non-existing paths to avoid surprising context injections.
+ * Best-effort extraction of literal filesystem paths from common shell file read commands. This deliberately ignores variables, globs, command substitution, directories, and non-existing paths to avoid surprising context injections from broad discovery commands.
  *
  * @param {string} command
  * @param {string} cwd
@@ -246,9 +243,11 @@ export function extractShellCommandPathInfo(command, cwd) {
 	const manuallyLoadedContextPaths = []
 	for (const segment of commandSegments(command)) {
 		const extracted = pathTokensForSegment(segment.tokens)
-		const segmentPaths = extracted.tokens
-			.map((token) => existingShellPath(token, cwd))
-			.filter((path) => typeof path === "string")
+		const segmentPaths = hasOutputRedirection(segment.tokens)
+			? []
+			: extracted.tokens
+				.map((token) => existingShellFilePath(token, cwd))
+				.filter((path) => typeof path === "string")
 		paths.push(...segmentPaths)
 		if (FULL_OUTPUT_COMMANDS.has(extracted.command) && !segment.pipedToNext && !hasOutputRedirection(segment.tokens)) {
 			manuallyLoadedContextPaths.push(...segmentPaths.filter(isContextFilePath))

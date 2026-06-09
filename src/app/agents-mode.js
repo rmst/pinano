@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto"
 import { spawn } from "node:child_process"
 import { homedir } from "node:os"
-import { resolve } from "node:path"
+import { isAbsolute, resolve } from "node:path"
 
 import {
 	CombinedAutocompleteProvider,
@@ -51,7 +51,7 @@ import { availableModelEntries, canonicalModelRef, findModelEntry, modelRef, mod
 import { defaultModelRef, loadSettings, messageRenderOptionsFromSettings, updateSetting, updateSettings } from "./settings.js"
 import { authFilePath } from "./paths.js"
 import { parseBashShortcut } from "./bash-shortcut.js"
-import { readClipboardImage } from "./clipboard-image.js"
+import { clipboardImagePasteNotice, readClipboardImage } from "./clipboard-image.js"
 import { promptImageLabel, promptImagePlaceholders } from "../prompt-images.js"
 import {
 	codexUsageBaseUrlForModel,
@@ -70,12 +70,20 @@ import { editorTheme, theme } from "./theme.js"
 import { isProjectContextMessage } from "./project-context.js"
 import { applySessionEvent, cloneSessionSnapshot, eventInvalidatesSessionList, eventInvalidatesSessionSnapshot, messageKey } from "./session-state.js"
 import { overviewRoute, routeToArg, routeToCliArgs, sessionRoute, settingsCredentialsRoute } from "./routes.js"
-import { reexecRuntime } from "./reexec-runtime.js"
+import { nextStaleRuntimeReexecDepth, reexecRuntime, staleRuntimeReexecEnvPatch } from "./reexec-runtime.js"
 import { NativeSandboxStartupPage, nativeSandboxStartupIssue } from "./native-sandbox-onboarding.js"
+import { UPDATE_CHECK_NOTICE_MS, checkForUpdateNotice } from "./update-check.js"
+import { pathIsWithin } from "./sandbox-paths.js"
+import { overviewDirectoryFilterEnabled, setOverviewDirectoryFilterEnabled } from "./ui-state.js"
+import { OVERVIEW_AGENT_PRIORITY, overviewLifecycleStateFor, overviewRunProblemIsUnresolved, overviewSortTimestampFor, overviewStateFor } from "./overview-state.js"
 
 
 /** @typedef {import("./stderr-capture.js").StderrCapture} StderrCapture */
 /** @typedef {import("./routes.js").PinanoRoute} PinanoRoute */
+
+const OVERVIEW_AGE_WIDTH = 3
+const TRANSIENT_RUNNING_ACTIVITY_RE = /^(Thinking|Generating|Running)/
+const CLIPBOARD_IMAGE_NOTICE_MS = 4000
 
 /** @param {string} text */
 function stripAnsi(text) {
@@ -88,6 +96,11 @@ function stripAnsi(text) {
  */
 function padToWidth(text, width) {
 	return text + " ".repeat(Math.max(0, width - visibleWidth(text)))
+}
+
+/** @param {string} text */
+function modelLineDivider(text) {
+	return theme.dim(text)
 }
 
 /**
@@ -110,6 +123,12 @@ function singleLine(value) {
 	return String(value ?? "")
 		.replace(/\s+/g, " ")
 		.trim()
+}
+
+/** @param {unknown} value */
+function shortSessionId(value) {
+	const text = singleLine(value)
+	return text ? text.slice(0, 8) : ""
 }
 
 /** @param {string} p */
@@ -137,6 +156,20 @@ function clearPromptImageAttachmentsForText(promptImages, text) {
 	return promptImages.filter((attachment) => !text.includes(attachment.placeholder))
 }
 
+/** @param {any} session */
+function sessionRowIsRunning(session) {
+	return session.lifecycleState === "running" || session.runStatus === "running" || session.runtimeState === "running"
+}
+
+/** @param {any} session */
+function sessionRowCanStillBeQueued(session) {
+	if (sessionRowIsRunning(session)) return false
+	if (session.lifecycleState && session.lifecycleState !== "not_started") return false
+	if (session.runStatus && session.runStatus !== "idle") return false
+	if (session.runtimeState && session.runtimeState !== "idle") return false
+	return !session.agentView && !session.preview?.first && !session.preview?.lastUser
+}
+
 function insertPromptImageAttachment(editor, promptImages, promptImageCounter, image) {
 	const placeholder = promptImageLabel(promptImageCounter + 1)
 	promptImages.push({ placeholder, image })
@@ -161,14 +194,14 @@ function truncateLeftToWidth(text, width) {
 	return `${ellipsis}${suffix}`
 }
 
-/** @param {string} left @param {string} right @param {number} width */
-function leftRightLine(left, right, width) {
+/** @param {string} left @param {string} right @param {number} width @param {(text: string) => string} [renderRight] */
+function leftRightLine(left, right, width, renderRight = theme.dim) {
 	if (!right) return fit(left, width)
 	const minGap = 2
 	const rightWidth = width - visibleWidth(left) - minGap
 	if (rightWidth <= 0) return fit(left, width)
 	const clippedRight = truncateLeftToWidth(right, rightWidth)
-	const coloredRight = theme.dim(clippedRight)
+	const coloredRight = renderRight(clippedRight)
 	const gap = " ".repeat(Math.max(minGap, width - visibleWidth(left) - visibleWidth(coloredRight)))
 	return `${left}${gap}${coloredRight}`
 }
@@ -176,7 +209,7 @@ function leftRightLine(left, right, width) {
 /** @param {Array<[string, string]>} hints @param {number} width */
 function renderKeyHints(hints, width) {
 	const line = hints
-		.map(([key, label]) => `${theme.cyan(key)} ${theme.dim(label)}`)
+		.map(([key, label]) => label ? `${theme.cyan(key)} ${theme.dim(label)}` : theme.cyan(key))
 		.join(theme.dim(" · "))
 	return [fit(line, width)]
 }
@@ -216,9 +249,9 @@ export function overviewModelStatusText(settings) {
 function overviewModelStatusLine(settings, usageStatus) {
 	const label = overviewModelLabel(settings)
 	if (!label) return ""
-	const base = [theme.cyan(label), theme.dim(`reasoning=${reasoningLevelLabel(settings?.thinkingLevel)}`)].join(theme.dim(" │ "))
+	const base = [theme.cyan(label), theme.dim(`reasoning=${reasoningLevelLabel(settings?.thinkingLevel)}`)].join(modelLineDivider(" │ "))
 	return usageStatus?.text
-		? `${base}${theme.dim(" | ")}${colorUsageStatus(usageStatus.text, usageStatus.tone)}`
+		? `${base}${modelLineDivider(" | ")}${colorUsageStatus(usageStatus.text, usageStatus.tone)}`
 		: base
 }
 
@@ -244,7 +277,11 @@ function isStaleRuntimeError(err) {
 	return false
 }
 
+export { nextStaleRuntimeReexecDepth }
+
 const DOUBLE_ESCAPE_MS = 500
+const STALE_RUNTIME_RETRY_INITIAL_MS = 1000
+const STALE_RUNTIME_RETRY_MAX_MS = 15000
 const NO_MODEL_PROVIDER_OVERVIEW_ERROR = "No model provider configured"
 const NO_MODEL_PROVIDER_EMPTY_GUIDANCE = "Configure a model provider with /credentials before dispatching an agent."
 const NO_MODEL_PROVIDER_CHAT_NOTICE = "No model provider configured. Open /settings and choose credentials before sending."
@@ -295,7 +332,20 @@ function relativeAge(iso) {
 	if (minutes < 60) return `${minutes}m`
 	const hours = Math.floor(minutes / 60)
 	if (hours < 48) return `${hours}h`
-	return `${Math.floor(hours / 24)}d`
+	const days = Math.floor(hours / 24)
+	if (days < 100) return `${days}d`
+	if (days >= 365) {
+		const years = Math.floor(days / 365)
+		return `${Math.min(99, Math.max(1, years))}y`
+	}
+	const weeks = Math.floor(days / 7)
+	return `${weeks}w`
+}
+
+/** @param {string} iso */
+function overviewAgeText(iso) {
+	const age = relativeAge(iso)
+	return age ? theme.dim(age.padStart(OVERVIEW_AGE_WIDTH, " ")) : ""
 }
 
 /** @param {string | undefined} iso */
@@ -360,9 +410,16 @@ export function streamingStatusBase(message) {
 }
 
 const DEFERRED_FOLDED_GROUP_LIMIT = 6
+const OVERVIEW_WORKTREE_STATUS_CONCURRENCY = 2
+const OVERVIEW_WORKTREE_STATUS_REFRESH_INTERVAL_MS = 10 * 1000
+const OVERVIEW_WORKTREE_STATUS_RUNNING_MAX_AGE_MS = 10 * 1000
+const OVERVIEW_WORKTREE_STATUS_ACTIVE_MAX_AGE_MS = 30 * 1000
+const OVERVIEW_WORKTREE_STATUS_DEFERRED_MAX_AGE_MS = 10 * 60 * 1000
+const OVERVIEW_WORKTREE_STATUS_COMPLETED_MAX_AGE_MS = 60 * 60 * 1000
+const SESSION_WORKTREE_STATUS_REFRESH_INTERVAL_MS = 10 * 1000
 
 export class AgentTable {
-	/** @param {{ cwd?: string, getMaxLines?: (width: number) => number, getEmptyText?: () => string, getEmptyLines?: () => Array<string | { text: string, highlight?: boolean }>, spinnerFrame?: () => string }} [options] */
+	/** @param {{ cwd?: string, directoryFilterEnabled?: boolean, getMaxLines?: (width: number) => number, getEmptyText?: () => string, getEmptyLines?: () => Array<string | { text: string, highlight?: boolean }>, spinnerFrame?: () => string }} [options] */
 	constructor(options = {}) {
 		/** @type {any[]} */
 		this.sessions = []
@@ -374,12 +431,17 @@ export class AgentTable {
 		this.filter = ""
 		this.notice = ""
 		this.expandedGroups = new Set()
+		this.worktrees = new Map()
+		this.worktreeSessionVersions = new Map()
+		this.worktreeLoadedVersions = new Map()
+		this.worktreeLoadedAt = new Map()
 		this.scrollOffset = 0
 		this.getMaxLines = options.getMaxLines
 		this.getEmptyText = options.getEmptyText
 		this.getEmptyLines = options.getEmptyLines
 		this.spinnerFrame = options.spinnerFrame ?? (() => "✽")
 		this.cwd = resolve(options.cwd ?? process.cwd())
+		this.directoryFilterEnabled = options.directoryFilterEnabled === true
 	}
 
 	clampedIndex(index, rows = this.rows()) {
@@ -472,7 +534,24 @@ export class AgentTable {
 		const hadRows = this.rows().length > 0
 		const previousSelected = previousSelectedId ? this.sessions.find((s) => s.id === previousSelectedId) : undefined
 		const wasTerminal = previousSelected ? this.isSelectionTerminal(previousSelected) : false
+		const nextWorktreeVersions = new Map()
+		const nextSessionIds = new Set()
+		for (const session of sessions) {
+			if (!session?.id) continue
+			nextSessionIds.add(session.id)
+			const version = `${session.updatedAt ?? ""}:${session.agentView?.updatedAt ?? ""}:${session.latestRunStartedAt ?? ""}:${session.latestRunEndedAt ?? ""}:${session.runStatus ?? ""}:${session.runtimeState ?? ""}`
+			nextWorktreeVersions.set(session.id, version)
+		}
+		for (const sessionId of this.worktrees.keys()) {
+			if (!nextSessionIds.has(sessionId)) {
+				this.worktrees.delete(sessionId)
+				this.worktreeLoadedVersions.delete(sessionId)
+				this.worktreeLoadedAt.delete(sessionId)
+			}
+		}
+		this.worktreeSessionVersions = nextWorktreeVersions
 		this.sessions = sessions
+		this.reconcileActivityWithSessions(sessions)
 
 		if (previousSelectedId) {
 			const nextSelected = this.sessions.find((s) => s.id === previousSelectedId)
@@ -497,9 +576,33 @@ export class AgentTable {
 		this.selectFallback(previousSelectedIndex)
 	}
 
+	/** @param {any[]} sessions */
+	reconcileActivityWithSessions(sessions) {
+		const sessionById = new Map(sessions.map((session) => [session.id, session]))
+		for (const [sessionId, activity] of this.activity) {
+			const session = sessionById.get(sessionId)
+			if (!session) {
+				this.activity.delete(sessionId)
+				continue
+			}
+			if (activity === "queued" && !sessionRowCanStillBeQueued(session)) this.activity.delete(sessionId)
+			else if (TRANSIENT_RUNNING_ACTIVITY_RE.test(activity) && !sessionRowIsRunning(session)) this.activity.delete(sessionId)
+		}
+	}
+
 	/** @param {string} filter */
 	setFilter(filter) {
 		this.filter = filter.trim().toLowerCase()
+		if (this.selectedSessionId && this.visibleSessionIndex(this.selectedSessionId) !== -1) {
+			this.selectedIndex = this.visibleSessionIndex(this.selectedSessionId)
+			return
+		}
+		this.selectFallback(0)
+	}
+
+	/** @param {boolean} enabled */
+	setDirectoryFilterEnabled(enabled) {
+		this.directoryFilterEnabled = enabled
 		if (this.selectedSessionId && this.visibleSessionIndex(this.selectedSessionId) !== -1) {
 			this.selectedIndex = this.visibleSessionIndex(this.selectedSessionId)
 			return
@@ -526,6 +629,12 @@ export class AgentTable {
 
 	rows() {
 		let sessions = this.sessions
+		if (this.directoryFilterEnabled) {
+			sessions = sessions.filter((s) => {
+				const initialWd = typeof s.initialWd === "string" && isAbsolute(s.initialWd) ? resolve(s.initialWd) : undefined
+				return initialWd ? pathIsWithin(this.cwd, initialWd) : false
+			})
+		}
 		if (this.filter) {
 			sessions = sessions.filter((s) => {
 				const haystack = [s.id, s.cwd, s.agentView?.projectTag, s.agentView?.descriptionInUi, s.agentView?.description, s.preview?.first?.text, s.preview?.lastUser?.text]
@@ -535,17 +644,16 @@ export class AgentTable {
 				return haystack.includes(this.filter)
 			})
 		}
-		const priority = { needs_input: 0, experiencing_problems: 1, queued: 2, ready_for_review: 3, working: 4, not_started: 5, deferred: 6, completed: 7 }
 		const sorted = sessions
 			.slice()
 			.sort((a, b) => {
 				const stateA = this.stateFor(a)
 				const stateB = this.stateFor(b)
-				const pa = priority[stateA] ?? 7
-				const pb = priority[stateB] ?? 7
+				const pa = OVERVIEW_AGENT_PRIORITY[stateA] ?? 7
+				const pb = OVERVIEW_AGENT_PRIORITY[stateB] ?? 7
 				if (pa !== pb) return pa - pb
-				const timestampA = stateA === "working" ? a.latestRunStartedAt ?? a.createdAt ?? a.updatedAt : a.updatedAt
-				const timestampB = stateB === "working" ? b.latestRunStartedAt ?? b.createdAt ?? b.updatedAt : b.updatedAt
+				const timestampA = overviewSortTimestampFor(a, stateA)
+				const timestampB = overviewSortTimestampFor(b, stateB)
 				return String(timestampB ?? "").localeCompare(String(timestampA ?? ""))
 			})
 		const out = []
@@ -609,6 +717,42 @@ export class AgentTable {
 		this.peekSessionId = this.peekSessionId === selected.id ? undefined : selected.id
 	}
 
+	/**
+	 * @param {string} sessionId
+	 * @param {any[]} worktrees
+	 * @param {{ loadedAt?: number }} [options]
+	 */
+	setWorktrees(sessionId, worktrees, options = {}) {
+		if (!sessionId) return
+		this.worktrees.set(sessionId, Array.isArray(worktrees) ? worktrees : [])
+		this.worktreeLoadedVersions.set(sessionId, this.worktreeSessionVersions.get(sessionId) ?? "")
+		this.worktreeLoadedAt.set(sessionId, options.loadedAt ?? Date.now())
+	}
+
+	/** @param {string} sessionId */
+	hasWorktreeInfo(sessionId) {
+		return this.worktrees.has(sessionId)
+	}
+
+	/** @param {string} sessionId */
+	worktreeStatusMaxAgeMs(sessionId) {
+		const session = this.sessions.find((s) => s.id === sessionId)
+		const state = session ? this.stateFor(session) : undefined
+		if (state === "working") return OVERVIEW_WORKTREE_STATUS_RUNNING_MAX_AGE_MS
+		if (state === "completed") return OVERVIEW_WORKTREE_STATUS_COMPLETED_MAX_AGE_MS
+		if (state === "deferred") return OVERVIEW_WORKTREE_STATUS_DEFERRED_MAX_AGE_MS
+		return OVERVIEW_WORKTREE_STATUS_ACTIVE_MAX_AGE_MS
+	}
+
+	/** @param {string} sessionId @param {number} [now] */
+	hasFreshWorktreeInfo(sessionId, now = Date.now()) {
+		if (!this.worktrees.has(sessionId)) return false
+		if ((this.worktreeLoadedVersions.get(sessionId) ?? "") !== (this.worktreeSessionVersions.get(sessionId) ?? "")) return false
+		const loadedAt = this.worktreeLoadedAt.get(sessionId)
+		if (!Number.isFinite(loadedAt)) return false
+		return now - loadedAt <= this.worktreeStatusMaxAgeMs(sessionId)
+	}
+
 	invalidate() {}
 
 	/** @param {number} width */
@@ -637,7 +781,7 @@ export class AgentTable {
 	renderHeader(width) {
 		/** @type {string[]} */
 		const lines = []
-		lines.push(leftRightLine(theme.bold("pinano"), compactHomePath(this.cwd), width))
+		lines.push(leftRightLine(theme.bold("pinano"), compactHomePath(this.cwd), width, this.directoryFilterEnabled ? theme.bold : theme.dim))
 		if (this.notice) lines.push(theme.dim(fit(this.notice, width)))
 		if (this.filter) lines.push(theme.dim(fit(`filter: ${this.filter}`, width)))
 		lines.push("")
@@ -689,30 +833,15 @@ export class AgentTable {
 	/** @param {any} session */
 	stateFor(session) {
 		if (/^error:/.test(this.activity.get(session.id) || "")) return "needs_input"
-		const lifecycleState = this.lifecycleStateFor(session)
-		if (lifecycleState === "queued") return "queued"
-		if (lifecycleState === "running") return "working"
-		if (session.runStatus === "failed" || session.runStatus === "aborted" || session.runStatus === "interrupted") return "needs_input"
-		if (lifecycleState === "not_started" && !session.agentView) return "not_started"
-		const state = session.agentView?.state
-		if (state === "legacy") return "completed"
-		if (state === "needs_input" || state === "deferred" || state === "completed" || state === "experiencing_problems") return state
-		if (state === "ready_for_review" || state === null || state === undefined) return "ready_for_review"
-		if (session.agentViewFallbackState === "legacy") return "completed"
-		if (session.agentViewFallbackState === "needs_input" || session.agentViewFallbackState === "ready_for_review" || session.agentViewFallbackState === "deferred" || session.agentViewFallbackState === "completed" || session.agentViewFallbackState === "experiencing_problems") return session.agentViewFallbackState
-		return "not_started"
+		return overviewStateFor(session, { lifecycleState: this.lifecycleStateFor(session) })
 	}
 
 	/** @param {any} session */
 	lifecycleStateFor(session) {
 		const activity = this.activity.get(session.id) || ""
 		if (activity === "queued") return "queued"
-		if (/^(Thinking|Generating|Running)/.test(activity)) return "running"
-		if (session.lifecycleState) return session.lifecycleState
-		if (session.runStatus === "running" || session.runtimeState === "running") return "running"
-		const hasVisibleConversation = Boolean(session.preview?.first || session.preview?.lastUser)
-		if ((session.runStatus === undefined || session.runStatus === "idle") && !hasVisibleConversation && !session.agentView) return "not_started"
-		return "stopped"
+		if (TRANSIENT_RUNNING_ACTIVITY_RE.test(activity)) return "running"
+		return overviewLifecycleStateFor(session)
 	}
 
 	/** @param {any} session */
@@ -749,8 +878,8 @@ export class AgentTable {
 		const runtimeState = session.runtimeState || session.runStatus || "idle"
 		if (lifecycleState === "queued") return theme.cyan("◌")
 		if (this.isRunningSession(session)) return theme.cyan(this.spinnerFrame() || "✽")
-		if (runtimeState === "failed") return theme.red("✖")
-		if (runtimeState === "aborted" || runtimeState === "interrupted" || runtimeState === "paused") return theme.yellow("■")
+		if (overviewRunProblemIsUnresolved(session)) return runtimeState === "failed" ? theme.red("✖") : theme.yellow("■")
+		if (runtimeState === "paused") return theme.yellow("■")
 		return theme.gray("∙")
 	}
 
@@ -776,9 +905,11 @@ export class AgentTable {
 	 */
 	renderRow(session, selected, width) {
 		const description = session.agentView?.description || session.preview?.first?.text || session.preview?.lastUser?.text || this.activity.get(session.id) || session.id.slice(0, 8)
-		const age = relativeAge(session.updatedAt)
+		const age = overviewAgeText(session.updatedAt)
+		const worktreeSignal = worktreeRowSignalText(this.worktrees.get(session.id))
 		const prefix = `${selected ? "›" : " "} ${this.iconFor(session)} `
-		const suffix = age ? ` ${theme.dim(age)}` : ""
+		const renderedSuffix = [worktreeSignal, age].filter(Boolean).join(" ")
+		const suffix = renderedSuffix ? ` ${renderedSuffix}` : ""
 		const available = Math.max(10, width - visibleWidth(stripAnsi(prefix)) - visibleWidth(stripAnsi(suffix)))
 		const projectLabel = this.projectLabelFor(session)
 		const labelWidth = projectLabel ? Math.max(1, Math.min(24, Math.floor(available * 0.3))) : 0
@@ -815,17 +946,33 @@ export class AgentTable {
 			if (!text) return
 			lines.push(theme.dim(fit(`${indent}${label}: ${text}`, width)))
 		}
-		add("id", session.id)
-		add("project", session.agentView?.projectTag)
+		add("id", shortSessionId(session.id))
 		add("cwd", session.cwd)
-		add("status", this.groupFor(session))
-		add("description", session.agentView?.descriptionInUi ?? session.agentView?.description)
-		add("activity", this.activity.get(session.id))
-		add("first", session.preview?.first?.text)
-		add("last user", session.preview?.lastUser?.text)
-		lines.push(theme.dim(fit(`${indent}Type below to reply to this session; Enter sends, → opens.`, width)))
+		for (const worktree of this.worktrees.get(session.id) ?? []) add("worktree", formatOverviewWorktreeInfo(worktree))
 		return lines
 	}
+}
+
+/**
+ * @param {AgentTable} table
+ * @param {{ markReadyForReview(id: string): Promise<any>, markCompleted(id: string): Promise<any>, markDeferred(id: string): Promise<any> }} client
+ * @param {any} selected
+ * @param {"completed" | "deferred"} targetState
+ */
+export function selectedAgentStateActionTask(table, client, selected, targetState) {
+	if (!selected || table.isRunningSession(selected)) return undefined
+	return table.stateFor(selected) === targetState
+		? client.markReadyForReview(selected.id)
+		: targetState === "completed"
+			? client.markCompleted(selected.id)
+			: client.markDeferred(selected.id)
+}
+
+/** @param {unknown} err */
+export function isRunningAgentStateActionRejection(err) {
+	const status = /** @type {any} */ (err)?.status
+	const message = String(/** @type {any} */ (err)?.message ?? err)
+	return status === 409 && /^Cannot (?:mark a running session completed|defer a running session|reopen a running session)\.$/.test(message)
 }
 
 class PromptLabel {
@@ -860,6 +1007,66 @@ class OverviewModelLine {
 	}
 }
 
+export class OverviewNoticeLine {
+	/** @param {() => ({ text: string, tone?: "normal" | "warn" | "error" } | undefined)} notice */
+	constructor(notice) {
+		this.notice = notice
+	}
+	invalidate() {}
+	lineCount() {
+		return this.notice()?.text ? 1 : 0
+	}
+	/** @param {number} width */
+	render(width) {
+		const notice = this.notice()
+		if (!notice?.text) return []
+		const render = notice.tone === "warn"
+			? theme.yellow
+			: notice.tone === "error"
+				? theme.red
+				: theme.dim
+		return [render(fit(notice.text, width))]
+	}
+}
+
+export class StaleRuntimeOverlay {
+	/** @param {() => { route?: string, reopening?: boolean, retryScheduled?: boolean, error?: string, retryable?: boolean, height?: number }} state */
+	constructor(state) {
+		this.state = state
+	}
+	invalidate() {}
+	/** @param {number} width */
+	render(width) {
+		const state = this.state()
+		const height = Math.max(1, state.height ?? 1)
+		const center = (line) => {
+			const clipped = truncateToWidth(line, Math.max(1, width))
+			const padding = Math.max(0, Math.floor((width - visibleWidth(stripAnsi(clipped))) / 2))
+			return `${" ".repeat(padding)}${clipped}`
+		}
+		const action = state.reopening
+			? theme.cyan("Reopening...")
+			: state.retryScheduled
+				? theme.cyan("Retrying...")
+				: state.retryable === false
+					? theme.red("Reopen failed")
+					: `${theme.cyan("Enter")} retry`
+		const content = [
+			theme.bold("Pinano was updated"),
+			"",
+			action,
+			...(state.error ? [theme.yellow(`Last error: ${state.error}`)] : []),
+			...(state.route ? [theme.dim(`Returning to ${state.route}`)] : []),
+			`${theme.cyan("Ctrl+C")} exit`,
+		]
+		const padTop = Math.max(0, Math.floor((height - content.length) / 2))
+		const lines = Array.from({ length: padTop }, () => "")
+		for (const line of content) lines.push(center(line))
+		while (lines.length < height) lines.push("")
+		return lines.slice(0, height)
+	}
+}
+
 export class OverviewKeyHints {
 	/** @param {() => { filterMode?: boolean, peeking?: boolean, hasText?: boolean }} state */
 	constructor(state) {
@@ -877,32 +1084,30 @@ export class OverviewKeyHints {
 		if (state.peeking && state.hasText) return renderKeyHints([
 			["Enter", "reply"],
 			["Ctrl+J", "newline"],
-			["Ctrl+V", "image"],
 			["Esc", "clear"],
-			["/help", "more"],
+			["/help", ""],
 		], width)
 		if (state.hasText) return renderKeyHints([
 			["Enter", "dispatch"],
 			["Ctrl+J", "newline"],
-			["Ctrl+V", "image"],
 			["Esc", "clear"],
-			["/help", "more"],
+			["/help", ""],
 		], width)
 		if (state.peeking) return renderKeyHints([
 			["Enter/→", "open"],
 			["↑/↓", "move"],
 			["Ctrl+F", "filter"],
-			["Ctrl+V", "image"],
 			["Ctrl+D", "done"],
-			["/help", "more"],
+			["Ctrl+E", "defer"],
+			["/help", ""],
 		], width)
 		return renderKeyHints([
 			["Enter/→", "open"],
 			["↑/↓", "move"],
 			["Ctrl+F", "filter"],
-			["Ctrl+V", "image"],
 			["Ctrl+D", "done"],
-			["/help", "more"],
+			["Ctrl+E", "defer"],
+			["/help", ""],
 		], width)
 	}
 }
@@ -919,7 +1124,6 @@ export class SessionKeyHints {
 		if (state.hasText) return renderKeyHints([
 			["Enter", "send"],
 			["Ctrl+J", "newline"],
-			["Ctrl+V", "image"],
 			["Esc Esc", "clear"],
 			["Ctrl+C", "detach"],
 			["/help", "more"],
@@ -928,7 +1132,7 @@ export class SessionKeyHints {
 			["←", "back"],
 		])
 		if (state.interruptible) hints.push(["Esc", "interrupt"])
-		hints.push(["Ctrl+V", "image"], ["Ctrl+C", "detach"], ["/help", "more"])
+		hints.push(["Ctrl+C", "detach"], ["/help", "more"])
 		return renderKeyHints(hints, width)
 	}
 }
@@ -1035,6 +1239,21 @@ const SERVICE_CHAT_COMMANDS = [
 	{ name: "continue", description: "resume an interrupted turn, or ask the model to continue" },
 	{ name: "abort", description: "abort the current turn" },
 ]
+
+export function rewindPromptActionItems(target = {}) {
+	const items = [
+		{ value: "conversation", label: "Restore conversation", description: "Drops everything after this point in the current session. No model call." },
+		{ value: "conversation-summary", label: "Restore with summary", description: "Summarizes the discarded branch first, then restores the conversation here." },
+	]
+	if (target.hasFileCheckpoints) {
+		items.push(
+			{ value: "files-conversation", label: "Restore files and conversation", description: "Restores edited files to their checkpoint preimages, then restores the conversation here." },
+			{ value: "files", label: "Restore files", description: "Restores edited files to their checkpoint preimages and leaves the conversation where it is." },
+		)
+	}
+	items.push({ value: "branch", label: "Branch new session from here", description: "Leaves this session unchanged and starts a new session from this point." })
+	return items
+}
 
 function serviceChatCommandMap(settings) {
 	return commandMap(commandsWithWebSetting(SERVICE_CHAT_COMMANDS, settings))
@@ -1702,18 +1921,6 @@ async function showCredentialsSettings(tui, options = {}) {
 	})
 }
 
-async function updateScopedModelsSetting(ctx, settings, notify) {
-	const models = await availableModelEntries(settings)
-	const rows = rowsForModels(models, { scopedModelIds: settings.scopedModelIds })
-	const id = await pickModel(ctx, rows, { mode: "toggle", title: "Scoped models", subtitle: "Pick a model to add/remove from the scoped shortlist." }) ?? ""
-	if (!id) return
-	const next = settings.scopedModelIds.includes(id)
-		? settings.scopedModelIds.filter((existing) => existing !== id)
-		: [...settings.scopedModelIds, id]
-	await updateSetting("scopedModelIds", next)
-	notify(`scoped models: ${next.join(", ") || "(empty)"}`)
-}
-
 async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultModel, setDefaultReasoning, refreshAuthCache } = {}) {
 	const write = notify ?? (() => {})
 	while (true) {
@@ -1722,12 +1929,8 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 			{ value: "credentials", label: "credentials", description: "manage ChatGPT subscription OAuth and API keys" },
 			{ value: "model", label: `model: ${currentDefaultModelRef(settings)}`, description: "default model for new sessions" },
 			{ value: "thinkingLevel", label: `reasoning: ${reasoningLevelLabel(settings.thinkingLevel)}`, description: "default reasoning effort for new sessions" },
-			{ value: "autocompactThreshold", label: `autocompactThreshold: ${settings.autocompactThreshold}`, description: "fraction of context window before auto-compaction" },
-			{ value: "scopedModelIds", label: `scopedModelIds: ${settings.scopedModelIds.length} model(s)`, description: "model shortlist shown by the model selector" },
-			{ value: "doubleEscapeAction", label: `doubleEscapeAction: ${settings.doubleEscapeAction}`, description: "Esc Esc behavior" },
 			{ value: "web", label: `web: ${settings.web ? "on" : "off"}`, description: "enable Pinano Web CLI and /web commands" },
-			{ value: "showThinkingOutput", label: `showThinkingOutput: ${settings.showThinkingOutput ? "on" : "off"}`, description: "show model reasoning text in the transcript" },
-			{ value: "showToolOutput", label: `showToolOutput: ${settings.showToolOutput ? "on" : "off"}`, description: "show successful tool result bodies in the transcript" },
+			{ value: "updateCheck", label: `updateCheck: ${settings.updateCheck ? "on" : "off"}`, description: "check GitHub once per day for new Pinano releases" },
 		])
 		if (!choice) return
 		if (choice === "credentials") {
@@ -1741,7 +1944,7 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 				continue
 			}
 			const current = currentDefaultModelRef(settings)
-			const rows = rowsForModels(models, { currentId: current, scopedModelIds: settings.scopedModelIds })
+			const rows = rowsForModels(models, { currentId: current })
 			const chosen = await pickModel(ctx, rows, { initialSelectedValue: current, title: "Default model", subtitle: "Pick the default model for new sessions." }) ?? ""
 			if (!chosen) continue
 			const updated = await setDefaultModel?.(chosen) ?? await updateDefaultModel(chosen, settings)
@@ -1757,19 +1960,6 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 			write(`default reasoning → ${level}`)
 			continue
 		}
-		if (choice === "scopedModelIds") {
-			await updateScopedModelsSetting(ctx, settings, write)
-			await onSettingsChanged?.(await loadSettings())
-			continue
-		}
-		if (choice === "doubleEscapeAction") {
-			const order = ["rewind", "none"]
-			const next = order[(order.indexOf(settings.doubleEscapeAction) + 1) % order.length]
-			const updated = await updateSetting("doubleEscapeAction", /** @type {any} */ (next))
-			await onSettingsChanged?.(updated)
-			write(`doubleEscapeAction → ${next}`)
-			continue
-		}
 		if (choice === "web") {
 			const next = !settings.web
 			const updated = await updateSetting("web", next)
@@ -1777,31 +1967,12 @@ async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDefaultMo
 			write(`web → ${next ? "on" : "off"}`)
 			continue
 		}
-		if (choice === "showThinkingOutput") {
-			const next = !settings.showThinkingOutput
-			const updated = await updateSetting("showThinkingOutput", next)
+		if (choice === "updateCheck") {
+			const next = !settings.updateCheck
+			const updated = await updateSetting("updateCheck", next)
 			await onSettingsChanged?.(updated)
-			write(`showThinkingOutput → ${next ? "on" : "off"}`)
+			write(`updateCheck → ${next ? "on" : "off"}`)
 			continue
-		}
-		if (choice === "showToolOutput") {
-			const next = !settings.showToolOutput
-			const updated = await updateSetting("showToolOutput", next)
-			await onSettingsChanged?.(updated)
-			write(`showToolOutput → ${next ? "on" : "off"}`)
-			continue
-		}
-		if (choice === "autocompactThreshold") {
-			const raw = await promptForInput(ctx.tui, `autocompactThreshold (${settings.autocompactThreshold})`)
-			if (raw == null) continue
-			const parsed = Number(raw.trim())
-			if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
-				write(`invalid value: ${raw}`)
-				continue
-			}
-			const updated = await updateSetting("autocompactThreshold", parsed)
-			await onSettingsChanged?.(updated)
-			write(`autocompactThreshold → ${parsed}`)
 		}
 	}
 }
@@ -1884,16 +2055,211 @@ class SessionInfoLine {
 		this.getSnapshot = getSnapshot
 	}
 
+	/** @param {any} snapshot */
+	descriptionFor(snapshot) {
+		const explicit = singleLine(snapshot?.agentView?.descriptionInUi ?? snapshot?.agentView?.description)
+		if (explicit) return explicit
+		const messages = Array.isArray(snapshot?.messages) ? snapshot.messages : []
+		const firstUser = messages.find((message) => message?.role === "user")
+		return singleLine(flattenContent(firstUser?.content)) || "ready"
+	}
+
 	/** @param {number} width */
 	render(width) {
 		const snapshot = this.getSnapshot()
-		const cwd = singleLine(snapshot?.cwd) || "?"
-		const description = singleLine(snapshot?.agentView?.descriptionInUi ?? snapshot?.agentView?.description)
-		const text = description
-			? `${theme.cyan(cwd)}${theme.dim(" │ ")}${theme.dim(description)}`
-			: theme.cyan(cwd)
-		return [truncateToWidth(text, Math.max(1, width), "", true)]
+		const project = singleLine(snapshot?.agentView?.projectTag)
+		const description = this.descriptionFor(snapshot)
+		const parts = []
+		if (project) parts.push(theme.cyan(project))
+		if (description) parts.push(theme.dim(description))
+		return [fit(parts.join(modelLineDivider(" │ ")), Math.max(1, width))]
 	}
+}
+
+class SessionCwdLine {
+	/** @param {() => { snapshot?: any, worktrees?: any[] }} state */
+	constructor(state) {
+		this.state = state
+	}
+	invalidate() {}
+	/** @param {number} width */
+	render(width) {
+		const state = this.state()
+		const status = sessionCwdStatus(state.snapshot, state.worktrees)
+		if (!status) return []
+		const detailText = status.detail ? ` ${status.detail} ` : ""
+		const detail = status.detail ? theme.dim(detailText) : ""
+		const rightRule = theme.cyan("─")
+		const fixedWidth = visibleWidth("─  ") + visibleWidth(detailText) + visibleWidth("─")
+		const pathWidth = Math.max(1, width - fixedWidth - 1)
+		const path = theme.gray(truncateLeftToWidth(status.cwd, pathWidth))
+		const left = `${theme.cyan("─ ")}${path}${theme.cyan(" ")}`
+		const right = `${detail}${rightRule}`
+		const ruleWidth = Math.max(0, width - visibleWidth(left) - visibleWidth(right))
+		const line = fit(`${left}${theme.cyan("─".repeat(ruleWidth))}${right}`, Math.max(1, width))
+		return [line, ""]
+	}
+}
+
+function worktreePathText(worktree) {
+	const path = singleLine(worktree?.path)
+	return path ? compactHomePath(path) : ""
+}
+
+function worktreeLifecycleSignal(worktrees) {
+	if (!Array.isArray(worktrees) || worktrees.length === 0) return ""
+	let hasApplied = false
+	for (const worktree of worktrees) {
+		const status = singleLine(worktree?.status)
+		if (!worktree?.removed && (status === "dirty" || status === "conflicts")) return "dirty"
+		const unapplied = Number(worktree?.comparison?.unapplied)
+		if (!worktree?.removed && Number.isSafeInteger(unapplied) && unapplied > 0) return "unapplied"
+		if (worktree?.removed && worktree?.terminalState === "applied") hasApplied = true
+	}
+	return hasApplied ? "applied" : ""
+}
+
+function worktreeRowSignalText(worktrees) {
+	const signal = worktreeLifecycleSignal(worktrees)
+	if (signal === "dirty") return theme.yellow("·")
+	if (signal === "unapplied") return theme.yellow("↑")
+	if (signal === "applied") return theme.green("✓")
+	return ""
+}
+
+function commitCountText(count) {
+	return `${count} ${count === 1 ? "commit" : "commits"}`
+}
+
+function worktreeStatusDisplayText(status) {
+	return status === "dirty" ? "uncommitted changes" : status
+}
+
+function worktreeComparisonText(worktree) {
+	if (worktree?.removed && worktree?.terminalState === "applied") return ""
+	const comparison = worktree?.comparison
+	const ref = singleLine(comparison?.ref)
+	const ahead = Number(comparison?.ahead)
+	const behind = Number(comparison?.behind)
+	const unapplied = Number(comparison?.unapplied)
+	if (Number.isSafeInteger(unapplied) && unapplied === 0 && worktreeHasWork(comparison)) return ""
+	if (!ref || !Number.isSafeInteger(ahead) || ahead < 0 || !Number.isSafeInteger(behind) || behind < 0) return ""
+	if (ahead === 0 && behind === 0) return ""
+	if (ahead > 0 && behind > 0) return `${ahead} ahead, ${commitCountText(behind)} behind ${ref}`
+	if (ahead > 0) return `${commitCountText(ahead)} ahead of ${ref}`
+	return `${commitCountText(behind)} behind ${ref}`
+}
+
+function worktreeStatusText(worktree) {
+	const status = singleLine(worktree?.status)
+	if (!status || status === "clean") return ""
+	return worktreeStatusDisplayText(status)
+}
+
+function worktreeHasWork(comparison) {
+	if (comparison?.hasWork === true) return true
+	if (comparison?.hasWork === false) return false
+	const ahead = Number(comparison?.ahead)
+	return Number.isSafeInteger(ahead) && ahead > 0
+}
+
+function worktreeIntegrationText(worktree) {
+	const comparison = worktree?.comparison
+	const ref = singleLine(comparison?.ref) || singleLine(worktree?.integrationTarget)
+	const unapplied = Number(comparison?.unapplied)
+	if (worktree?.removed) {
+		if (worktree?.terminalState !== "applied") return ""
+		return ref ? `applied in ${ref}` : "applied"
+	}
+	if (!ref || !Number.isSafeInteger(unapplied) || unapplied < 0) return ""
+	if (unapplied === 0) {
+		if (worktreeStatusText(worktree)) return ""
+		if (worktree?.terminalState === "applied" || worktreeHasWork(comparison)) return `applied in ${ref}`
+		const ahead = Number(comparison?.ahead)
+		const behind = Number(comparison?.behind)
+		return ahead === 0 && behind === 0 ? `same as ${ref}` : ""
+	}
+	return `${unapplied} ${unapplied === 1 ? "change" : "changes"} not applied in ${ref}`
+}
+
+function formatWorktreeInfoLine(worktree) {
+	const status = worktreeStatusText(worktree)
+	const path = worktreePathText(worktree)
+	const integration = worktreeIntegrationText(worktree)
+	const comparison = worktreeComparisonText(worktree)
+	return `  ${[status, path, integration, comparison].filter(Boolean).join("  ") || "unknown"}`
+}
+
+function formatOverviewWorktreeInfo(worktree) {
+	const path = worktreePathText(worktree) || "unknown"
+	const status = worktreeStatusText(worktree)
+	const integration = worktreeIntegrationText(worktree)
+	const comparison = worktreeComparisonText(worktree)
+	const detail = [status, integration, comparison].filter(Boolean).join(", ")
+	return detail ? `${path} (${detail})` : path
+}
+
+function worktreeDetailText(worktree) {
+	const status = worktreeStatusText(worktree)
+	if (status) return status
+	return worktreeCompactIntegrationText(worktree) || worktreeComparisonText(worktree)
+}
+
+function worktreeCompactIntegrationText(worktree) {
+	const comparison = worktree?.comparison
+	const ref = singleLine(comparison?.ref)
+	const unapplied = Number(comparison?.unapplied)
+	if (!ref || !Number.isSafeInteger(unapplied) || unapplied < 0) return ""
+	if (unapplied > 0) return `${unapplied} ${unapplied === 1 ? "change" : "changes"} not in ${ref}`
+	return worktreeIntegrationText(worktree)
+}
+
+function currentWorktreeForCwd(cwd, worktrees) {
+	const cwdPath = singleLine(cwd)
+	if (!cwdPath || !isAbsolute(cwdPath) || !Array.isArray(worktrees)) return undefined
+	const resolvedCwd = resolve(cwdPath)
+	return worktrees
+		.map((worktree) => {
+			const path = singleLine(worktree?.path)
+			return { worktree, path }
+		})
+		.filter(({ worktree, path }) => !worktree?.removed && path && isAbsolute(path))
+		.map(({ worktree, path }) => ({ worktree, path: resolve(path) }))
+		.filter(({ path }) => pathIsWithin(path, resolvedCwd))
+		.sort((a, b) => b.path.length - a.path.length || a.path.localeCompare(b.path))[0]?.worktree
+}
+
+export function sessionCwdStatus(snapshot, worktrees = []) {
+	const cwd = singleLine(snapshot?.cwd)
+	if (!cwd) return undefined
+	const worktree = currentWorktreeForCwd(snapshot?.cwd, worktrees)
+	return { cwd: compactHomePath(cwd), detail: worktree ? worktreeDetailText(worktree) : "" }
+}
+
+export function sessionCwdStatusText(snapshot, worktrees = []) {
+	const status = sessionCwdStatus(snapshot, worktrees)
+	if (!status) return ""
+	return `${status.cwd}${status.detail ? ` (${status.detail})` : ""}`
+}
+
+export function sessionInfoBody(snapshot, sessionId, worktrees = []) {
+	const lines = [
+		`id:        ${sessionId}`,
+		`cwd:       ${snapshot?.cwd ?? "?"}`,
+		`model:     ${snapshot?.model?.id ?? "?"}`,
+		`provider:  ${snapshot?.model?.provider ?? "?"}`,
+		`reasoning: ${reasoningLevelLabel(snapshot?.thinkingLevel)}`,
+		`fast:      ${snapshot?.serviceTier === "priority" && isFastModeEligibleModel(snapshot?.model) ? "on" : "off"}`,
+		`streaming: ${snapshot?.isStreaming ? "yes" : "no"}`,
+		`messages:  ${snapshot?.messages?.length ?? 0}`,
+	]
+	if (!Array.isArray(worktrees) || worktrees.length === 0) {
+		lines.push("worktrees: none")
+	} else {
+		lines.push("worktrees:")
+		lines.push(...worktrees.map(formatWorktreeInfoLine))
+	}
+	return lines.join("\n")
 }
 
 export class Chat {
@@ -1948,10 +2314,20 @@ export class Chat {
 		this.statusContainer = new Container()
 		this.pendingContainer = new Container()
 		this.usageStatusLine = new Text("", 0, 0)
+		this.statusChromeVisible = false
+		this.pendingChromeVisible = false
+		this.usageChromeVisible = false
+		this.composerGapSpacer = new Spacer(2)
+		this.sessionWorktrees = []
+		this.sessionWorktreesSessionId = undefined
+		this.sessionWorktreesLoadedAt = 0
+		this.sessionWorktreeStatusRefresh = undefined
+		this.sessionWorktreeStatusTimer = undefined
 		this.editorContainer = new Container()
 		this.toolComponents = new Map()
 		this.toolCallDetails = new Map()
 		this.statusLoader = undefined
+		this.transientStatusNoticeTimer = undefined
 		this.statusAgeTimer = undefined
 		this.statusProgress = undefined
 		this.statusRunStartedAt = undefined
@@ -1969,6 +2345,14 @@ export class Chat {
 			() => this.stderrCapture?.size() ?? 0,
 		)
 		this.sessionInfoLine = new SessionInfoLine(() => this.snapshot)
+		this.sessionCwdLine = new SessionCwdLine(() => ({
+			snapshot: this.snapshot,
+			worktrees: this.sessionWorktreesSessionId === this.snapshot?.sessionId ? this.sessionWorktrees : [],
+		}))
+		this.sessionKeyHints = new SessionKeyHints(() => ({
+			hasText: this.editor.getText().trim() !== "",
+			interruptible: this.hasInterruptibleTurn(),
+		}))
 		this.stderrUnsubscribe = this.stderrCapture?.subscribe(() => {
 			this.footer.update()
 			this.tui.requestRender()
@@ -2010,24 +2394,75 @@ export class Chat {
 		this.root.addChild(this.statusContainer)
 		this.root.addChild(this.pendingContainer)
 		this.root.addChild(this.usageStatusLine)
-		this.root.addChild(new Spacer(1))
-		this.root.addChild(new SessionKeyHints(() => ({
-			hasText: this.editor.getText().trim() !== "",
-			interruptible: this.hasInterruptibleTurn(),
-		})))
+		this.root.addChild(this.composerGapSpacer)
+		this.root.addChild(this.sessionCwdLine)
+		this.root.addChild(this.sessionKeyHints)
 		this.editorContainer.addChild(this.editor)
 		this.root.addChild(this.editorContainer)
 		this.root.addChild(this.footer.component)
 		this.root.addChild(this.sessionInfoLine)
+		this.startSessionWorktreeStatusTimer()
 		void this.refreshAuthCache()
 	}
 
 	dispose() {
 		this.disposed = true
 		this.stopStatusAgeTimer()
+		this.stopSessionWorktreeStatusTimer()
+		this.clearTransientStatusNoticeTimer()
 		this.hideStatusLoader()
 		if (this.draftSyncTimer) clearTimeout(this.draftSyncTimer)
 		this.stderrUnsubscribe?.()
+	}
+
+	startSessionWorktreeStatusTimer() {
+		if (this.sessionWorktreeStatusTimer || typeof this.client.worktrees !== "function") return
+		this.sessionWorktreeStatusTimer = setInterval(() => {
+			void this.refreshSessionWorktrees()
+		}, SESSION_WORKTREE_STATUS_REFRESH_INTERVAL_MS)
+		this.sessionWorktreeStatusTimer.unref?.()
+	}
+
+	stopSessionWorktreeStatusTimer() {
+		if (!this.sessionWorktreeStatusTimer) return
+		clearInterval(this.sessionWorktreeStatusTimer)
+		this.sessionWorktreeStatusTimer = undefined
+	}
+
+	clearSessionWorktrees() {
+		this.sessionWorktrees = []
+		this.sessionWorktreesSessionId = undefined
+		this.sessionWorktreesLoadedAt = 0
+	}
+
+	async refreshSessionWorktrees(options = {}) {
+		const sessionId = this.snapshot?.sessionId ?? this.sessionId
+		if (this.disposed || !sessionId || typeof this.client.worktrees !== "function") return undefined
+		if (this.sessionWorktreeStatusRefresh?.sessionId === sessionId) return this.sessionWorktreeStatusRefresh.promise
+		if (options.force !== true && this.sessionWorktreesSessionId === sessionId && Date.now() - this.sessionWorktreesLoadedAt < SESSION_WORKTREE_STATUS_REFRESH_INTERVAL_MS) return undefined
+		const promise = this.client.worktrees(sessionId)
+			.then((worktrees) => {
+				if (this.disposed || (this.snapshot?.sessionId ?? this.sessionId) !== sessionId) return worktrees
+				this.sessionWorktrees = Array.isArray(worktrees) ? worktrees : []
+				this.sessionWorktreesSessionId = sessionId
+				this.sessionWorktreesLoadedAt = Date.now()
+				this.tui.requestRender()
+				return worktrees
+			})
+			.catch((err) => {
+				if (this.disposed || (this.snapshot?.sessionId ?? this.sessionId) !== sessionId) return undefined
+				this.clearSessionWorktrees()
+				this.sessionWorktreesSessionId = sessionId
+				this.sessionWorktreesLoadedAt = Date.now()
+				if (options.showError === true) this.reportClientError(err, "worktree status error")
+				this.tui.requestRender()
+				return undefined
+			})
+			.finally(() => {
+				if (this.sessionWorktreeStatusRefresh?.promise === promise) this.sessionWorktreeStatusRefresh = undefined
+			})
+		this.sessionWorktreeStatusRefresh = { sessionId, promise }
+		return promise
 	}
 
 	async refreshAuthCache() {
@@ -2190,8 +2625,7 @@ export class Chat {
 			const image = await readClipboardImage()
 			this.insertPromptImage(image)
 		} catch (err) {
-			this.appendLine(theme.red(`[image paste error] ${err?.message ?? err}`))
-			this.tui.requestRender()
+			this.showClipboardImagePasteNotice(err)
 		}
 	}
 
@@ -2276,7 +2710,14 @@ export class Chat {
 	/** @param {{ text: string, tone: "normal" | "warn" | "error" } | undefined} status */
 	setCodexUsageStatus(status) {
 		this.usageStatusLine.setText(status?.text ? colorUsageStatus(status.text, status.tone) : "")
+		this.usageChromeVisible = !!status?.text
+		this.updateComposerGapSpacer()
 		this.tui.requestRender()
+	}
+
+	updateComposerGapSpacer() {
+		const lines = this.statusChromeVisible || this.pendingChromeVisible || this.usageChromeVisible ? 1 : 2
+		if (this.composerGapSpacer.lines !== lines) this.composerGapSpacer.setLines(lines)
 	}
 
 	appendSpacer() {
@@ -2410,16 +2851,8 @@ export class Chat {
 			return
 		}
 		if (name === "session") {
-			await this.showModal("Session", [
-				`id:        ${this.sessionId}`,
-				`cwd:       ${this.snapshot?.cwd ?? "?"}`,
-				`model:     ${this.snapshot?.model?.id ?? "?"}`,
-				`provider:  ${this.snapshot?.model?.provider ?? "?"}`,
-				`reasoning: ${reasoningLevelLabel(this.snapshot?.thinkingLevel)}`,
-				`fast:      ${this.snapshot?.serviceTier === "priority" && isFastModeEligibleModel(this.snapshot?.model) ? "on" : "off"}`,
-				`streaming: ${this.snapshot?.isStreaming ? "yes" : "no"}`,
-				`messages:  ${this.snapshot?.messages?.length ?? 0}`,
-			].join("\n"))
+			const worktrees = this.client.worktrees ? await this.client.worktrees(this.sessionId) : []
+			await this.showModal("Session", sessionInfoBody(this.snapshot, this.sessionId, worktrees))
 			return
 		}
 		if (name === "branch") {
@@ -2461,18 +2894,19 @@ export class Chat {
 				this.appendLine(theme.dim(match.active ? "already on that branch tip" : "switched to branch tip"))
 				return
 			}
-			const actionItems = [
-				{ value: "conversation", label: "Restore conversation", description: "drop everything after this point — no model call" },
-				{ value: "conversation-summary", label: "Restore conversation with branch summary", description: "summarize the discarded branch first" },
-			]
-			if (match.hasFileCheckpoints) {
-				actionItems.push(
-					{ value: "files-conversation", label: "Restore files and conversation", description: "also hard-reset edited files to their checkpoint preimages" },
-					{ value: "files", label: "Restore files", description: "hard-reset edited files, keep the conversation where it is" },
-				)
-			}
-			const mode = await pickInline(this, actionItems, { title: "What should rewind restore?" }) ?? ""
+			const actionItems = rewindPromptActionItems(match)
+			const mode = await pickInline(this, actionItems, { title: "What should happen from here?", descriptionMode: "selected" }) ?? ""
 			if (!mode) return
+			if (mode === "branch") {
+				const sourceSessionId = this.sessionId
+				const branched = await this.client.branchSession(sourceSessionId, { entryId: match.id, restoreDraft: true })
+				this.sessionId = branched.sessionId
+				await this.refreshAfterMutation(branched, { sessionId: branched.sessionId, replace: true })
+				this.appendSpacer()
+				this.appendLine(theme.dim(`branched into ${branched.sessionId.slice(0, 8)}; prompt restored in editor`))
+				this.appendLine(theme.dim(`open previous branch: ${sessionOpenCommand(sourceSessionId)}`))
+				return
+			}
 			const restoreConversation = mode !== "files"
 			const restoreFiles = mode === "files" || mode === "files-conversation"
 			const rewind = async () => {
@@ -2702,6 +3136,8 @@ export class Chat {
 
 	/** @param {string} message */
 	showStatusLoader(message) {
+		this.statusChromeVisible = true
+		this.updateComposerGapSpacer()
 		if (this.statusLoader) {
 			this.statusLoader.setMessage(message)
 			return
@@ -2717,6 +3153,38 @@ export class Chat {
 			this.statusLoader = undefined
 		}
 		this.statusContainer.clear()
+		this.statusChromeVisible = false
+		this.updateComposerGapSpacer()
+	}
+
+	clearTransientStatusNoticeTimer() {
+		if (this.transientStatusNoticeTimer) clearTimeout(this.transientStatusNoticeTimer)
+		this.transientStatusNoticeTimer = undefined
+	}
+
+	clearTransientStatusNotice() {
+		this.clearTransientStatusNoticeTimer()
+		if (this.snapshot) this.renderStatus(this.snapshot)
+		else {
+			this.statusContainer.clear()
+			this.statusChromeVisible = false
+			this.updateComposerGapSpacer()
+		}
+		this.tui.requestRender()
+	}
+
+	/** @param {unknown} err */
+	showClipboardImagePasteNotice(err) {
+		const notice = clipboardImagePasteNotice(err)
+		if (!notice) return
+		this.clearTransientStatusNoticeTimer()
+		this.hideStatusLoader()
+		this.statusContainer.addChild(new TextLine(theme.yellow(notice)))
+		this.statusChromeVisible = true
+		this.updateComposerGapSpacer()
+		this.transientStatusNoticeTimer = setTimeout(() => this.clearTransientStatusNotice(), CLIPBOARD_IMAGE_NOTICE_MS)
+		this.transientStatusNoticeTimer.unref?.()
+		this.tui.requestRender()
 	}
 
 	stopStatusAgeTimer() {
@@ -2809,7 +3277,11 @@ export class Chat {
 			.map((item) => ({ behavior: item?.behavior ?? "steer", message: item?.message ?? item }))
 			.filter((item) => item.message?.role === "user")
 		this.pendingContainer.clear()
-		if (pending.length === 0) return
+		if (pending.length === 0) {
+			this.pendingChromeVisible = false
+			this.updateComposerGapSpacer()
+			return
+		}
 		const label = pending.length === 1 ? "Pending message" : `${pending.length} pending messages`
 		const behaviorLabels = new Set(pending.map((item) => item.behavior))
 		const detail = behaviorLabels.size === 1 && behaviorLabels.has("followUp")
@@ -2821,6 +3293,8 @@ export class Chat {
 			this.pendingContainer.addChild(new Spacer(1))
 			this.pendingContainer.addChild(new UserMessageComponent(item.message))
 		}
+		this.pendingChromeVisible = true
+		this.updateComposerGapSpacer()
 	}
 
 	renderStatus(snapshot) {
@@ -2852,6 +3326,8 @@ export class Chat {
 					? theme.yellow("Last run failed. Use /continue to retry/resume, or type a new message.")
 					: theme.dim("Run stopped. Use /continue to resume, or type a new message.")
 				this.statusContainer.addChild(new TextLine(message))
+				this.statusChromeVisible = true
+				this.updateComposerGapSpacer()
 			}
 		}
 	}
@@ -2878,6 +3354,7 @@ export class Chat {
 			this.promptImages = []
 			this.promptImageCounter = 0
 			this.clearSubmittedPrompt()
+			this.clearSessionWorktrees()
 		}
 		const rebuildTranscript = options.rebuildTranscript ?? (sessionChanged || !this.snapshotMatchesRenderedTranscript(next))
 		this.snapshot = next
@@ -2899,6 +3376,7 @@ export class Chat {
 		this.renderStatus(next)
 		this.renderPendingUserMessages(next)
 		this.refreshFooter()
+		void this.refreshSessionWorktrees({ force: firstSnapshot || sessionChanged })
 		this.tui.requestRender()
 	}
 
@@ -3069,6 +3547,7 @@ export async function runServiceTuiMode(options) {
 	const root = new Container()
 	const editor = new Editor(tui, /** @type {any} */ (editorTheme), { paddingX: 1 })
 	let settings = await loadSettings()
+	const initialDirectoryFilterEnabled = await overviewDirectoryFilterEnabled(options.client, options.cwd).catch(() => false)
 	let webEnabled = settings.web === true
 	let hasModelProvider = await hasAvailableModelProvider()
 	let highlightEmptyCredentialsGuidance = false
@@ -3078,17 +3557,21 @@ export async function runServiceTuiMode(options) {
 	let promptLabel = /** @type {PromptLabel | undefined} */ (undefined)
 	let overviewModelLine = /** @type {OverviewModelLine | undefined} */ (undefined)
 	let overviewUsageStatus = /** @type {{ text: string, tone: "normal" | "warn" | "error" } | undefined} */ (undefined)
+	let overviewBottomNotice = /** @type {{ text: string, tone?: "normal" | "warn" | "error" } | undefined} */ (undefined)
 	let overviewSpinnerFrameIndex = 0
 	const overviewSpinnerFrame = () => LOADER_SPINNER_FRAMES[overviewSpinnerFrameIndex] ?? "✽"
+	const overviewNoticeLine = new OverviewNoticeLine(() => overviewBottomNotice)
 	const table = new AgentTable({
 		cwd: options.cwd,
+		directoryFilterEnabled: initialDirectoryFilterEnabled,
 		spinnerFrame: overviewSpinnerFrame,
 		getMaxLines: (width) => tui.terminal.rows
 			- overviewSpacerLines
 			- overviewKeyHintLines
 			- (promptLabel?.lineCount() ?? 0)
 			- editor.getRenderedLineCount(width)
-			- (overviewModelLine?.lineCount() ?? 0),
+			- (overviewModelLine?.lineCount() ?? 0)
+			- overviewNoticeLine.lineCount(),
 		getEmptyLines: () => hasModelProvider ? [
 			"No sessions yet.",
 		] : [
@@ -3129,10 +3612,25 @@ export async function runServiceTuiMode(options) {
 	let overviewMounted = false
 	/** @type {ReturnType<typeof setInterval> | undefined} */
 	let overviewSpinnerTimer = undefined
+	/** @type {ReturnType<typeof setInterval> | undefined} */
+	let overviewWorktreeStatusTimer = undefined
 	const stopOverviewSpinner = () => {
 		if (!overviewSpinnerTimer) return
 		clearInterval(overviewSpinnerTimer)
 		overviewSpinnerTimer = undefined
+	}
+	const stopOverviewWorktreeStatusTimer = () => {
+		if (!overviewWorktreeStatusTimer) return
+		clearInterval(overviewWorktreeStatusTimer)
+		overviewWorktreeStatusTimer = undefined
+	}
+	const startOverviewWorktreeStatusTimer = () => {
+		if (overviewWorktreeStatusTimer || typeof options.client.worktrees !== "function") return
+		overviewWorktreeStatusTimer = setInterval(() => {
+			if (!overviewMounted || staleRuntimeActive) return
+			scheduleOverviewWorktreeLoads()
+		}, OVERVIEW_WORKTREE_STATUS_REFRESH_INTERVAL_MS)
+		overviewWorktreeStatusTimer.unref?.()
 	}
 	const canAnimateOverviewSpinner = () => overviewMounted && !staleRuntimeActive && LOADER_SPINNER_FRAMES.length > 1
 	const shouldAnimateOverviewSpinner = () => canAnimateOverviewSpinner() && table.hasVisibleRunningSession()
@@ -3152,10 +3650,29 @@ export async function runServiceTuiMode(options) {
 		if (shouldAnimateOverviewSpinner()) startOverviewSpinner()
 		else stopOverviewSpinner()
 	}
+	/** @type {ReturnType<typeof setTimeout> | undefined} */
+	let overviewBottomNoticeTimer = undefined
+	const clearOverviewBottomNoticeTimer = () => {
+		if (overviewBottomNoticeTimer) clearTimeout(overviewBottomNoticeTimer)
+		overviewBottomNoticeTimer = undefined
+	}
 	const requestShellRender = (force = false) => {
 		editor.invalidate()
 		syncOverviewSpinner()
 		tui.requestRender(force)
+	}
+	const setOverviewBottomNotice = (notice, { timeoutMs } = {}) => {
+		clearOverviewBottomNoticeTimer()
+		overviewBottomNotice = notice
+		if (notice?.text && timeoutMs) {
+			overviewBottomNoticeTimer = setTimeout(() => {
+				overviewBottomNotice = undefined
+				overviewBottomNoticeTimer = undefined
+				requestShellRender()
+			}, timeoutMs)
+			overviewBottomNoticeTimer.unref?.()
+		}
+		requestShellRender()
 	}
 	const overviewPromptAttachmentsForText = (text) => promptAttachmentsForText(overviewPromptImages, text)
 	const clearOverviewPromptImagesForText = (text) => {
@@ -3170,7 +3687,8 @@ export async function runServiceTuiMode(options) {
 			overviewPromptImageCounter = insertPromptImageAttachment(editor, overviewPromptImages, overviewPromptImageCounter, image)
 			requestShellRender()
 		} catch (err) {
-			table.setNotice(`[image paste error] ${err?.message ?? err}`)
+			const notice = clipboardImagePasteNotice(err)
+			if (notice) setOverviewBottomNotice({ text: notice, tone: "warn" }, { timeoutMs: CLIPBOARD_IMAGE_NOTICE_MS })
 			requestShellRender()
 		}
 	}
@@ -3185,77 +3703,104 @@ export async function runServiceTuiMode(options) {
 	const textDoubleEscape = new DoubleEscapeTracker()
 	let staleRuntimeDesired = /** @type {any} */ (null)
 	let staleRuntimeRouteArgs = /** @type {string[]} */ ([])
+	let staleRuntimeRoute = ""
 	let reexecInProgress = false
-	const staleRuntimeBanner = {
-		invalidate() {},
-		render(width) {
-			const center = (line) => `${" ".repeat(Math.max(0, Math.floor((width - visibleWidth(stripAnsi(line))) / 2)))}${line}`
-			const innerWidth = Math.max(32, Math.min(68, width - 8))
-			const border = "━".repeat(innerWidth + 4)
-			const row = (text = "") => {
-				const clipped = truncateToWidth(text, innerWidth)
-				const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(stripAnsi(clipped))))
-				return center(`${theme.red("┃")}  ${clipped}${padding}  ${theme.red("┃")}`)
-			}
-			return [
-				"",
-				"",
-				center(theme.red(`┏${border}┓`)),
-				row(),
-				row(theme.red("Pinano was updated.")),
-				row(),
-				row(reexecInProgress ? theme.cyan("Reopening…") : `${theme.cyan("Enter")} reopen this page`),
-				row(`${theme.cyan("Ctrl+C")} exit`),
-				row(),
-				center(theme.red(`┗${border}┛`)),
-				"",
-			]
-		},
-	}
+	let staleRuntimeRetryTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
+	let staleRuntimeRetryScheduled = false
+	let staleRuntimeRetryDelayMs = STALE_RUNTIME_RETRY_INITIAL_MS
+	let staleRuntimeReexecError = ""
+	let staleRuntimeRetryable = true
+	const staleRuntimeOverlay = new StaleRuntimeOverlay(() => ({
+		route: staleRuntimeRoute,
+		reopening: reexecInProgress,
+		retryScheduled: staleRuntimeRetryScheduled,
+		error: staleRuntimeReexecError,
+		retryable: staleRuntimeRetryable,
+		height: tui.terminal.rows,
+	}))
 	const currentRouteArgs = () => {
 		const args = []
 		if (options.noContextFiles) args.push("--no-context-files")
 		args.push(...routeToCliArgs(currentRoute))
 		return args
 	}
+	const clearStaleRuntimeRetryTimer = () => {
+		if (!staleRuntimeRetryTimer) return
+		clearTimeout(staleRuntimeRetryTimer)
+		staleRuntimeRetryTimer = undefined
+		staleRuntimeRetryScheduled = false
+	}
+	const staleRuntimeReexecErrorMessage = (err) => {
+		const text = `${err?.message ?? err}`.replace(/\s+/g, " ").trim()
+		return text || "unknown error"
+	}
+	const staleRuntimeReexecErrorIsRetryable = (err) => !/\bstale runtime reexec depth exceeded\b/i.test(staleRuntimeReexecErrorMessage(err))
+	const scheduleStaleRuntimeReexec = (delayMs = 0) => {
+		if (!staleRuntimeActive || reexecInProgress || staleRuntimeRetryTimer || !staleRuntimeRetryable) return
+		staleRuntimeRetryScheduled = delayMs > 0
+		requestShellRender()
+		staleRuntimeRetryTimer = setTimeout(() => {
+			staleRuntimeRetryTimer = undefined
+			staleRuntimeRetryScheduled = false
+			void reexecStaleRuntime()
+		}, delayMs)
+		staleRuntimeRetryTimer.unref?.()
+	}
 
 	const reexecStaleRuntime = async () => {
 		if (reexecInProgress) return
+		clearStaleRuntimeRetryTimer()
 		reexecInProgress = true
+		staleRuntimeRetryable = true
+		staleRuntimeReexecError = ""
 		requestShellRender(true)
 		await new Promise((resolve) => setTimeout(resolve, 50))
 		let tuiStopped = false
 		try {
-			staleRuntimeDesired = staleRuntimeDesired || await options.client.desiredRuntime?.()
+			staleRuntimeDesired = await options.client.desiredRuntime?.() || staleRuntimeDesired
 			const runtime = staleRuntimeDesired?.execPath ?? process.execPath
 			const target = staleRuntimeDesired?.mainPath
 			if (!target) throw new Error("desired runtime path unavailable")
+			const envPatch = staleRuntimeReexecEnvPatch()
 			tui.stop()
 			tuiStopped = true
 			await reexecRuntime({
 				command: runtime,
 				args: [target, ...staleRuntimeRouteArgs],
 				cwd: options.cwd,
+				envPatch,
 			})
 		} catch (err) {
 			if (tuiStopped) {
 				console.error(`pinano update failed: ${err?.message ?? err}`)
 				process.exit(1)
 			}
+			staleRuntimeRetryable = staleRuntimeReexecErrorIsRetryable(err)
+			staleRuntimeReexecError = staleRuntimeReexecErrorMessage(err)
 			reexecInProgress = false
+			if (staleRuntimeRetryable) {
+				const delayMs = staleRuntimeRetryDelayMs
+				staleRuntimeRetryDelayMs = Math.min(staleRuntimeRetryDelayMs * 2, STALE_RUNTIME_RETRY_MAX_MS)
+				scheduleStaleRuntimeReexec(delayMs)
+			}
 			requestShellRender()
 		}
 	}
 
+	let scheduleOverviewWorktreeLoads = () => {}
 	const refreshRows = async () => {
 		table.setSessions(await options.client.sessions())
+		scheduleOverviewWorktreeLoads()
 		requestShellRender()
 	}
 	const refreshRowsAndSelect = async (sessionId) => {
 		table.setSessions(await options.client.sessions())
 		table.selectSession(sessionId)
+		scheduleOverviewWorktreeLoads()
 		requestShellRender()
 	}
+	const peekWorktreeLoads = new Set()
+	const overviewWorktreeLoads = new Set()
 	const handleRefreshError = (err) => {
 		if (showStaleRuntime(err)) return
 		if (isConnectionReset(err)) return
@@ -3267,22 +3812,77 @@ export async function runServiceTuiMode(options) {
 		if (!isStaleRuntimeError(err)) return false
 		if (!staleRuntimeActive) {
 			staleRuntimeRouteArgs = currentRouteArgs()
+			staleRuntimeRoute = routeToArg(currentRoute)
+			staleRuntimeDesired = null
+			staleRuntimeRetryDelayMs = STALE_RUNTIME_RETRY_INITIAL_MS
+			staleRuntimeReexecError = ""
+			staleRuntimeRetryable = true
 			staleRuntimeActive = true
 			scheduleRowsRefresh.cancel()
 			unsubscribe?.()
 			unsubscribe = undefined
-			root.addChild(staleRuntimeBanner)
-			tui.setFocus(staleRuntimeBanner)
-		}
-		const desiredRuntimePromise = options.client.desiredRuntime?.()
-		if (desiredRuntimePromise) void desiredRuntimePromise
-			.then((desired) => {
-				if (desired) staleRuntimeDesired = desired
-				requestShellRender(true)
+			tui.showOverlay(staleRuntimeOverlay, {
+				width: "100%",
+				maxHeight: "100%",
+				anchor: "top-left",
+				row: 0,
+				col: 0,
+				margin: 0,
+				backdrop: true,
 			})
-			.catch(() => {})
+		}
+		scheduleStaleRuntimeReexec(0)
 		requestShellRender(true)
 		return true
+	}
+	const loadPeekWorktrees = async (sessionId, loadOptions = {}) => {
+		if (!sessionId || typeof options.client.worktrees !== "function") return
+		if (peekWorktreeLoads.has(sessionId)) return
+		if (loadOptions.refresh !== true && table.hasFreshWorktreeInfo(sessionId)) return
+		const sessionVersion = table.worktreeSessionVersions.get(sessionId)
+		peekWorktreeLoads.add(sessionId)
+		try {
+			const worktrees = await options.client.worktrees(sessionId)
+			if (table.worktreeSessionVersions.get(sessionId) === sessionVersion) table.setWorktrees(sessionId, worktrees)
+		} catch (err) {
+			if (showStaleRuntime(err)) return
+			if (!isConnectionReset(err)) table.setNotice(`worktree status error: ${err?.message ?? err}`)
+		} finally {
+			peekWorktreeLoads.delete(sessionId)
+			requestShellRender()
+		}
+	}
+	const overviewWorktreeLoadCandidates = () => {
+		const rows = table.rows().filter((row) => row?.type !== "more")
+		if (rows.length === 0) return []
+		const selectedId = table.selected()?.id
+		const ids = [table.peekSessionId, selectedId, ...rows.map((row) => row.id)].filter(Boolean)
+		return [...new Set(ids)]
+	}
+	scheduleOverviewWorktreeLoads = () => {
+		if (!overviewMounted || staleRuntimeActive || typeof options.client.worktrees !== "function") return
+		const available = OVERVIEW_WORKTREE_STATUS_CONCURRENCY - overviewWorktreeLoads.size
+		if (available <= 0) return
+		const sessionIds = overviewWorktreeLoadCandidates()
+			.filter((sessionId) => !table.hasFreshWorktreeInfo(sessionId) && !overviewWorktreeLoads.has(sessionId))
+			.slice(0, available)
+		for (const sessionId of sessionIds) {
+			const sessionVersion = table.worktreeSessionVersions.get(sessionId)
+			overviewWorktreeLoads.add(sessionId)
+			options.client.worktrees(sessionId)
+				.then((worktrees) => {
+					if (table.worktreeSessionVersions.get(sessionId) === sessionVersion) table.setWorktrees(sessionId, worktrees)
+				})
+				.catch((err) => {
+					if (showStaleRuntime(err)) return
+					if (!isConnectionReset(err) && table.worktreeSessionVersions.get(sessionId) === sessionVersion) table.setWorktrees(sessionId, [])
+				})
+				.finally(() => {
+					overviewWorktreeLoads.delete(sessionId)
+					requestShellRender()
+					scheduleOverviewWorktreeLoads()
+				})
+		}
 	}
 
 	const clearCodexUsageStatus = () => {
@@ -3320,9 +3920,12 @@ export async function runServiceTuiMode(options) {
 	const exit = async () => {
 		if (exiting) return
 		exiting = true
+		clearStaleRuntimeRetryTimer()
 		scheduleRowsRefresh.cancel()
 		scheduleCodexUsageRefresh.cancel()
+		clearOverviewBottomNoticeTimer()
 		stopOverviewSpinner()
+		stopOverviewWorktreeStatusTimer()
 		currentChat?.dispose()
 		if (unsubscribe) {
 			let detachTimer
@@ -3350,12 +3953,15 @@ export async function runServiceTuiMode(options) {
 		root.addChild(promptLabel)
 		root.addChild(editor)
 		root.addChild(overviewModelLine)
+		root.addChild(overviewNoticeLine)
 		syncOverviewSpinner()
+		startOverviewWorktreeStatusTimer()
 	}
 
 	const unmountOverview = () => {
 		overviewMounted = false
 		stopOverviewSpinner()
+		stopOverviewWorktreeStatusTimer()
 	}
 
 	const showAgents = (showOptions = {}) => {
@@ -3369,22 +3975,27 @@ export async function runServiceTuiMode(options) {
 		if (selectSessionId) table.selectSession(selectSessionId)
 		tui.setFocus(editor)
 		requestShellRender(true)
-		void (selectSessionId ? refreshRowsAndSelect(selectSessionId) : refreshRows()).catch(handleRefreshError)
+		void refreshRows().catch(handleRefreshError)
 	}
 
 	const openSession = async (id) => {
 		currentRoute = sessionRoute(id)
 		currentChat?.dispose()
-		settings = await loadSettings()
+		const nextSettings = await loadSettings()
+		if (currentRoute.type !== "session" || currentRoute.id !== id) return
+		settings = nextSettings
 		webEnabled = settings.web === true
 		messageRenderOptions = messageRenderOptionsFromSettings(settings)
-		currentChat = new Chat({ tui, client: options.client, sessionId: id, detach: () => showAgents({ selectSessionId: id }), exit, stderrCapture: options.stderrCapture, onClientError: showStaleRuntime, messageRenderOptions, webEnabled, onSettingsChanged: applyOverviewSettings, onCodexUsage: (payload) => applyCodexUsage(payload), getCodexUsageBaseUrl: (model) => codexUsageBaseUrlForModel(model, settings), refreshGlobalAuth: refreshOverviewAuth })
+		const chat = new Chat({ tui, client: options.client, sessionId: id, detach: () => showAgents({ selectSessionId: id }), exit, stderrCapture: options.stderrCapture, onClientError: showStaleRuntime, messageRenderOptions, webEnabled, onSettingsChanged: applyOverviewSettings, onCodexUsage: (payload) => applyCodexUsage(payload), getCodexUsageBaseUrl: (model) => codexUsageBaseUrlForModel(model, settings), refreshGlobalAuth: refreshOverviewAuth })
+		currentChat = chat
 		unmountOverview()
 		root.clear()
-		root.addChild(currentChat.root)
-		tui.setFocus(currentChat.editor)
-		currentChat.update(await options.client.snapshot(id))
-		if (latestCodexUsage) currentChat.setCodexUsageStatus(formatCodexUsageLowStatus(latestCodexUsage))
+		root.addChild(chat.root)
+		tui.setFocus(chat.editor)
+		const snapshot = await options.client.snapshot(id)
+		if (chat.disposed || currentChat !== chat || currentRoute.type !== "session" || currentRoute.id !== id) return
+		chat.update(snapshot)
+		if (latestCodexUsage) chat.setCodexUsageStatus(formatCodexUsageLowStatus(latestCodexUsage))
 		requestShellRender(true)
 	}
 
@@ -3404,15 +4015,17 @@ export async function runServiceTuiMode(options) {
 	}
 
 	const applySelectedStateAction = (selected, targetState) => {
-		const task = table.stateFor(selected) === targetState
-			? options.client.markReadyForReview(selected.id)
-			: targetState === "completed"
-				? options.client.markCompleted(selected.id)
-				: options.client.markDeferred(selected.id)
+		const task = selectedAgentStateActionTask(table, options.client, selected, targetState)
+		if (!task) return
 		task.then(async () => {
+			table.clearActivity(selected.id)
 			await refreshRows()
 		})
 			.catch((err) => {
+				if (isRunningAgentStateActionRejection(err)) {
+					void refreshRows().catch(handleRefreshError)
+					return
+				}
 				if (showStaleRuntime(err)) return
 				table.setActivity(selected.id, `error: ${err?.message ?? err}`)
 				requestShellRender()
@@ -3429,6 +4042,15 @@ export async function runServiceTuiMode(options) {
 	const setOverviewNotice = (message) => {
 		table.setNotice(message)
 		requestShellRender()
+	}
+	const toggleOverviewDirectoryFilter = () => {
+		const enabled = !table.directoryFilterEnabled
+		table.setDirectoryFilterEnabled(enabled)
+		requestShellRender()
+		void setOverviewDirectoryFilterEnabled(options.client, table.cwd, enabled).catch((err) => {
+			table.setNotice(`directory filter state error: ${err?.message ?? err}`)
+			requestShellRender()
+		})
 	}
 	const overviewCommandCtx = {
 		tui,
@@ -3479,6 +4101,7 @@ export async function runServiceTuiMode(options) {
 		settings = nextSettings
 		webEnabled = nextSettings.web === true
 		messageRenderOptions = messageRenderOptionsFromSettings(nextSettings)
+		if (nextSettings.updateCheck !== true) setOverviewBottomNotice(undefined)
 		if (currentChat) currentChat.webEnabled = webEnabled
 		requestShellRender()
 	}
@@ -3506,10 +4129,7 @@ export async function runServiceTuiMode(options) {
 				setOverviewNotice("no authenticated models available; open /credentials first")
 				return
 			}
-			const rows = rowsForModels(models, {
-				currentId: currentDefaultModelRef(settings),
-				scopedModelIds: settings.scopedModelIds,
-			})
+			const rows = rowsForModels(models, { currentId: currentDefaultModelRef(settings) })
 			chosen = await pickModel(overviewCommandCtx, rows, { initialSelectedValue: currentDefaultModelRef(settings), title: "Default model", subtitle: "Pick the default model for new sessions." }) ?? ""
 			if (!chosen) return
 		}
@@ -3531,6 +4151,7 @@ export async function runServiceTuiMode(options) {
 				"Up/Down       move selection",
 				"PgUp/PgDn     move by page",
 				"Ctrl+F        filter sessions",
+				"Ctrl+S        toggle directory filter",
 				"Ctrl+V        paste image",
 				"Ctrl+D        mark selected session completed",
 				"Ctrl+E        mark selected session deferred",
@@ -3611,6 +4232,7 @@ export async function runServiceTuiMode(options) {
 		filterMode = false
 		table.setFilter(filterBeforeEdit)
 		editor.setText("")
+		scheduleOverviewWorktreeLoads()
 		requestShellRender()
 	}
 
@@ -3618,6 +4240,7 @@ export async function runServiceTuiMode(options) {
 		const trimmed = text.trim()
 		if (filterMode) {
 			table.setFilter(text)
+			scheduleOverviewWorktreeLoads()
 			acceptFilterMode()
 			return
 		}
@@ -3671,7 +4294,10 @@ export async function runServiceTuiMode(options) {
 		}
 	}
 	editor.onChange = (text) => {
-		if (filterMode) table.setFilter(text)
+		if (filterMode) {
+			table.setFilter(text)
+			scheduleOverviewWorktreeLoads()
+		}
 		requestShellRender()
 	}
 
@@ -3703,7 +4329,10 @@ export async function runServiceTuiMode(options) {
 		requestShellRender()
 	}
 	const handleServiceEvent = (event) => {
-		if (event.type === "sessions") table.setSessions(event.sessions)
+		if (event.type === "sessions") {
+			table.setSessions(event.sessions)
+			scheduleOverviewWorktreeLoads()
+		}
 		else if (event.sessionId) {
 			if (event.type === "agent_start") table.setActivity(event.sessionId, "Thinking…")
 			else if (event.type === "message_start" && event.message?.role === "assistant") table.setActivity(event.sessionId, "Generating…")
@@ -3750,7 +4379,7 @@ export async function runServiceTuiMode(options) {
 	tui.addInputListener((data) => {
 		if (staleRuntimeActive) {
 			if (matchesKey(data, "ctrl+c")) void exit()
-			else if (!isKeyRelease(data) && matchesKey(data, "enter")) void reexecStaleRuntime()
+			else if (staleRuntimeRetryable && !isKeyRelease(data) && matchesKey(data, "enter")) void reexecStaleRuntime()
 			return { consume: true }
 		}
 		if (matchesKey(data, "ctrl+c")) {
@@ -3790,11 +4419,7 @@ export async function runServiceTuiMode(options) {
 					return { consume: true }
 				}
 				if (doubleEscape.press()) {
-					loadSettings()
-						.then((settings) => settings.doubleEscapeAction)
-						.then((action) => {
-							if (action !== "none") return currentChat?.handleSlash("rewind")
-						})
+					currentChat?.handleSlash("rewind")
 						.catch((err) => {
 							if (showStaleRuntime(err)) return
 							currentChat?.appendLine(theme.red(`[escape error] ${err?.message ?? err}`))
@@ -3808,6 +4433,10 @@ export async function runServiceTuiMode(options) {
 		if (isKeyRelease(data)) return undefined
 		if (!filterMode && (matchesKey(data, "ctrl+v") || matchesKey(data, "ctrl+alt+v"))) {
 			void pasteOverviewClipboardImage()
+			return { consume: true }
+		}
+		if (!filterMode && matchesKey(data, "ctrl+s")) {
+			toggleOverviewDirectoryFilter()
 			return { consume: true }
 		}
 		if (matchesKey(data, "ctrl+f")) {
@@ -3832,26 +4461,31 @@ export async function runServiceTuiMode(options) {
 		const empty = editor.getText().trim() === ""
 		if (matchesKey(data, "up") && empty) {
 			table.move(-1)
+			scheduleOverviewWorktreeLoads()
 			requestShellRender()
 			return { consume: true }
 		}
 		if (matchesKey(data, "down") && empty) {
 			table.move(1)
+			scheduleOverviewWorktreeLoads()
 			requestShellRender()
 			return { consume: true }
 		}
 		if (matchesKey(data, "pageup") && empty) {
 			table.page(-1)
+			scheduleOverviewWorktreeLoads()
 			requestShellRender()
 			return { consume: true }
 		}
 		if (matchesKey(data, "pagedown") && empty) {
 			table.page(1)
+			scheduleOverviewWorktreeLoads()
 			requestShellRender()
 			return { consume: true }
 		}
 		if (!filterMode && (matchesKey(data, "right") || matchesKey(data, "enter")) && empty) {
 			if (table.activateMore()) {
+				scheduleOverviewWorktreeLoads()
 				requestShellRender()
 				return { consume: true }
 			}
@@ -3864,10 +4498,17 @@ export async function runServiceTuiMode(options) {
 		}
 		if (!filterMode && matchesKey(data, "space") && empty) {
 			if (table.activateMore()) {
+				scheduleOverviewWorktreeLoads()
 				requestShellRender()
 				return { consume: true }
 			}
+			const previousPeekSessionId = table.peekSessionId
 			table.togglePeek()
+			scheduleOverviewWorktreeLoads()
+			const selected = table.selected()
+			if (selected && table.peekSessionId === selected.id && table.peekSessionId !== previousPeekSessionId) {
+				void loadPeekWorktrees(selected.id, { refresh: true })
+			}
 			requestShellRender()
 			return { consume: true }
 		}
@@ -3950,6 +4591,14 @@ export async function runServiceTuiMode(options) {
 		await openCredentialsSettingsPage()
 	} else if (!staleRuntimeActive && !(await hasConfiguredProviderCredentials())) {
 		await openCredentialsSettingsPage({ onboarding: true })
+	}
+	if (!staleRuntimeActive && currentRoute.type === "overview") {
+		void checkForUpdateNotice(settings)
+			.then((notice) => {
+				if (!notice || staleRuntimeActive || currentRoute.type !== "overview") return
+				setOverviewBottomNotice({ text: notice.message, tone: "warn" }, { timeoutMs: UPDATE_CHECK_NOTICE_MS })
+			})
+			.catch(() => {})
 	}
 
 	await new Promise(() => {})

@@ -1,5 +1,7 @@
 import { isAbsolute } from "node:path"
 
+import { sessionInitialWd } from "./session-config.js"
+
 export const SESSION_CUSTOM_TYPE_PROPERTIES = "session_properties"
 // Provider function-tool names cannot contain dots. `sessionWrite` is the
 // model-facing tool for Pinano's session property write operation.
@@ -103,7 +105,8 @@ export function getEffectiveSessionProperties(session, fromId = undefined) {
 	for (const entry of session?.getBranch?.(fromId) ?? []) {
 		if (entry.type === "custom" && entry.customType === "config") {
 			const configPatch = {}
-			if (typeof entry.data?.cwd === "string") configPatch.cwd = entry.data.cwd
+			const initialWd = sessionInitialWd(entry.data)
+			if (initialWd) configPatch.cwd = initialWd
 			if (typeof entry.data?.environmentId === "string") configPatch.environmentId = entry.data.environmentId
 			props = applySessionPropertyPatch(props, configPatch)
 		}
@@ -153,7 +156,7 @@ export function isHumanUserEntry(entry) {
 	return entry?.type === "message" && entry.message?.role === "user" && !isAutomatedMaintenanceMessage(entry.message)
 }
 
-const sessionPropertyPromptKeys = ["state", "descriptionInUi", "projectTag", "cwd", "environmentId"]
+const sessionPropertyPromptKeys = ["state", "descriptionInUi", "projectTag"]
 
 /** @param {any} props */
 function formatCurrentSessionProperties(props) {
@@ -162,16 +165,23 @@ function formatCurrentSessionProperties(props) {
 	return JSON.stringify(current)
 }
 
+/** @param {any} props */
+function metadataMaintenanceInstruction(props) {
+	if (props && (!props.descriptionInUi || !props.projectTag)) return "projectTag and descriptionInUi must be updated using sessionWrite."
+	return "Update projectTag or descriptionInUi only if they are stale or misleading."
+}
+
 /** @param {any} [props] */
 export function createMaintenancePromptMessage(props = undefined) {
 	const current = props ? formatCurrentSessionProperties(props) : "unavailable"
+	const instruction = metadataMaintenanceInstruction(props)
 	return {
 		role: "user",
 		pinanoAutomated: true,
 		pinanoMaintenance: "session_properties",
 		content: [{
 			type: "text",
-			text: `[Hidden session metadata check]\nPrevious session metadata was: ${current}. Update session metadata that is no longer correct. Update projectTag or descriptionInUi if they are missing, stale or misleading. With sessionWrite never include fields whose values should remain unchanged!`,
+			text: `[Hidden session metadata check]\nPrevious session metadata was: ${current}. ${instruction} With sessionWrite never include fields whose values should remain unchanged!`,
 		}],
 		timestamp: Date.now(),
 	}

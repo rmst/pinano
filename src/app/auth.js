@@ -13,7 +13,7 @@ import { chmod, mkdir, open, readFile, rm, stat, writeFile, readdir } from "node
 import { dirname, resolve } from "node:path"
 
 import { configuredProviderApiKey } from "./service-config.js"
-import { authDir, authFilePath, legacyAuthDir, legacyAuthFilePath } from "./paths.js"
+import { authDir, authFilePath } from "./paths.js"
 
 const LOCK_TTL_MS = 30_000
 
@@ -145,12 +145,6 @@ export async function getCredential(provider) {
 		const text = await readFile(authFilePath(provider), "utf-8")
 		return /** @type {T} */ (JSON.parse(text))
 	} catch (/** @type {any} */ err) {
-		if (err.code !== "ENOENT") throw err
-	}
-	try {
-		const text = await readFile(legacyAuthFilePath(provider), "utf-8")
-		return /** @type {T} */ (JSON.parse(text))
-	} catch (/** @type {any} */ err) {
 		if (err.code === "ENOENT") return undefined
 		throw err
 	}
@@ -191,11 +185,6 @@ export async function updateCredential(provider, fn) {
 			current = /** @type {T} */ (JSON.parse(await readFile(path, "utf-8")))
 		} catch (/** @type {any} */ err) {
 			if (err.code !== "ENOENT") throw err
-			try {
-				current = /** @type {T} */ (JSON.parse(await readFile(legacyAuthFilePath(provider), "utf-8")))
-			} catch (/** @type {any} */ legacyErr) {
-				if (legacyErr.code !== "ENOENT") throw legacyErr
-			}
 		}
 		const next = await fn(current)
 		await writeCredentialFile(path, next)
@@ -211,24 +200,20 @@ export async function updateCredential(provider, fn) {
  */
 export async function deleteCredential(provider) {
 	await rm(authFilePath(provider), { force: true })
-	await rm(legacyAuthFilePath(provider), { force: true })
 }
 
 /** @returns {Promise<string[]>} */
 export async function listProviders() {
-	const providers = new Set()
-	for (const dir of [legacyAuthDir(), authDir()]) {
-		try {
-			const entries = await readdir(dir)
-			for (const entry of entries) {
-				if (entry.endsWith(".json") && !entry.endsWith(".lock")) providers.add(entry.replace(/\.json$/, ""))
-			}
-		} catch (/** @type {any} */ err) {
-			if (err.code === "ENOENT") continue
-			throw err
-		}
+	try {
+		const entries = await readdir(authDir())
+		return entries
+			.filter((n) => n.endsWith(".json") && !n.endsWith(".lock"))
+			.map((n) => n.replace(/\.json$/, ""))
+			.sort()
+	} catch (/** @type {any} */ err) {
+		if (err.code === "ENOENT") return []
+		throw err
 	}
-	return [...providers].sort()
 }
 
 /**

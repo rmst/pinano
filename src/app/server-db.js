@@ -17,7 +17,7 @@ import {
 	SESSION_CUSTOM_TYPE_REWIND,
 } from "./session-custom-types.js"
 
-const SCHEMA_VERSION = 22
+const SCHEMA_VERSION = 27
 const SESSION_PREVIEW_BATCH_SIZE = 200
 
 const HIDDEN_MESSAGE_EXTRA_SQL = `
@@ -800,6 +800,43 @@ const migrations = [
 		if (!columns.has("mutation_version")) db.exec("ALTER TABLE sessions ADD COLUMN mutation_version INTEGER NOT NULL DEFAULT 0")
 		if (!columns.has("mutation_run_id")) db.exec("ALTER TABLE sessions ADD COLUMN mutation_run_id TEXT")
 	},
+	// v22 → v23: persist context-file identity captured at load time. Older
+	// rows fall back to realpath(path) while they still exist.
+	(db) => {
+		if (tableExists(db, "entry_context_files") && !tableColumns(db, "entry_context_files").has("identity_path")) {
+			db.exec("ALTER TABLE entry_context_files ADD COLUMN identity_path TEXT")
+		}
+		if (tableExists(db, "context_files") && !tableColumns(db, "context_files").has("identity_path")) {
+			db.exec("ALTER TABLE context_files ADD COLUMN identity_path TEXT")
+		}
+	},
+	// v23 → v24: retired before release; kept as an empty migration slot so existing v24 databases remain compatible.
+	() => {},
+	// v24 → v25: rename durable session config cwd/worktree fields to the
+	// canonical initialWd/sandboxMounts shape. Runtime code reads only the new
+	// names; this migration is the compatibility boundary for old databases.
+	(db) => {
+		migrateSessionConfigEntries(db)
+	},
+	// v25 → v26: durable UI state shared by TUI and web clients. This stays
+	// outside settings and session rows because it is mutable presentation state,
+	// not configuration or conversation/session data.
+	(db) => {
+		db.exec(`
+			CREATE TABLE IF NOT EXISTS ui_state (
+				state_key TEXT PRIMARY KEY,
+				value_json TEXT NOT NULL CHECK (json_valid(value_json)),
+				updated_at TEXT NOT NULL
+			)
+		`)
+	},
+	// v26 → v27: materialize the fixed session starting working directory on
+	// the session row. Config entries remain part of durable history/runtime
+	// replay, but session lists must not replay conversation branches for this.
+	(db) => {
+		if (!tableColumns(db, "sessions").has("initial_wd")) db.exec("ALTER TABLE sessions ADD COLUMN initial_wd TEXT")
+		backfillSessionInitialWds(db)
+	},
 ]
 
 function tableExists(db, name) {
@@ -808,6 +845,100 @@ function tableExists(db, name) {
 
 function tableColumns(db, table) {
 	return new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name))
+}
+
+function canonicalSessionConfig(data) {
+	const config = { ...data }
+	const initialWd = typeof data.initialWd === "string" && data.initialWd
+		? data.initialWd
+		: typeof data.cwd === "string" && data.cwd
+			? data.cwd
+			: undefined
+	if (initialWd) config.initialWd = initialWd
+	else if ("initialWd" in config) delete config.initialWd
+
+	if (!Array.isArray(data.sandboxMounts)) {
+		const mount = typeof data.worktree === "string" && data.worktree
+			? data.worktree
+			: typeof data.cwd === "string" && data.cwd
+				? data.cwd
+				: undefined
+		if (mount) config.sandboxMounts = [mount]
+		else if ("sandboxMounts" in config) delete config.sandboxMounts
+	}
+
+	delete config.cwd
+	delete config.worktree
+	delete config.version
+	return config
+}
+
+function migrateSessionConfigEntries(db) {
+	if (!tableExists(db, "entry_custom_entries")) return
+	const rows = db.prepare(`
+		SELECT global_id AS globalId, data_json AS dataJson
+		FROM entry_custom_entries
+		WHERE custom_type = 'config'
+	`).all()
+	const update = db.prepare("UPDATE entry_custom_entries SET data_json = ? WHERE global_id = ?")
+	for (const row of rows) {
+		const data = parseJson(row.dataJson)
+		if (!data || typeof data !== "object" || Array.isArray(data)) continue
+		const json = JSON.stringify(canonicalSessionConfig(data))
+		if (json !== row.dataJson) update.run(json, row.globalId)
+	}
+}
+
+function backfillSessionInitialWds(db) {
+	if (!tableExists(db, "sessions") || !tableColumns(db, "sessions").has("initial_wd")) return
+	if (tableExists(db, "entry_custom_entries") && tableExists(db, "session_entry_refs") && tableExists(db, "conversation_entries")) {
+		db.exec(`
+			WITH
+				candidate(session_id, initial_wd, source_rank, seq) AS (
+					SELECT
+						ser.session_id,
+						json_extract(ece.data_json, '$.initialWd'),
+						CASE WHEN ce.created_by_session_id = ser.session_id THEN 0 ELSE 1 END,
+						ser.seq
+					FROM entry_custom_entries ece
+					JOIN session_entry_refs ser ON ser.global_id = ece.global_id
+					JOIN conversation_entries ce ON ce.global_id = ece.global_id
+					WHERE ece.custom_type = 'config'
+						AND json_valid(ece.data_json)
+						AND json_type(ece.data_json, '$.initialWd') = 'text'
+						AND json_extract(ece.data_json, '$.initialWd') != ''
+				),
+				picked AS (
+					SELECT candidate.session_id, candidate.initial_wd
+					FROM candidate
+					WHERE NOT EXISTS (
+						SELECT 1
+						FROM candidate better
+						WHERE better.session_id = candidate.session_id
+							AND (
+								better.source_rank < candidate.source_rank
+								OR (
+									better.source_rank = candidate.source_rank
+									AND better.seq < candidate.seq
+								)
+							)
+					)
+				)
+			UPDATE sessions
+			SET initial_wd = (
+				SELECT picked.initial_wd
+				FROM picked
+				WHERE picked.session_id = sessions.id
+			)
+			WHERE initial_wd IS NULL
+				AND EXISTS (
+					SELECT 1
+					FROM picked
+					WHERE picked.session_id = sessions.id
+				)
+		`)
+	}
+	db.exec("UPDATE sessions SET initial_wd = cwd WHERE initial_wd IS NULL AND cwd != ''")
 }
 
 function ensureServiceRunsTable(db) {
@@ -950,32 +1081,38 @@ function migrateDb(db) {
  * @property {string} createdAt
  * @property {string} updatedAt
  * @property {string | undefined} [latestRunStartedAt]
+ * @property {string | undefined} [latestRunEndedAt]
  * @property {string | undefined} [latestRunError]
  * @property {string | undefined} [latestRunStopReason]
  * @property {"running" | "idle" | "failed" | "aborted" | "interrupted" | undefined} [runStatus]
  * @property {"running" | "idle" | "failed" | "aborted" | "interrupted" | "paused" | undefined} [runtimeState]
  * @property {"not_started" | "running" | "stopped" | string | undefined} [lifecycleState]
  * @property {{ state?: "working" | "needs_input" | "ready_for_review" | "deferred" | "completed" | "experiencing_problems" | string, descriptionInUi?: string, description?: string, projectTag?: string, needsInput?: string, result?: string, updatedAt?: string } | undefined} [agentView]
+ * @property {string | undefined} [initialWd]
  */
 
 /**
  * @typedef {object} ServerDb
  * @property {import("node:sqlite").DatabaseSync} raw
- * @property {(session: { id: string, cwd: string, createdAt?: string, updatedAt?: string }) => void} upsertSession
+ * @property {(session: { id: string, cwd: string, initialWd?: string, createdAt?: string, updatedAt?: string }) => void} upsertSession
  * @property {(id: string, cwd?: string, updatedAt?: string) => void} touchSession
  * @property {(id: string) => void} markSessionDeleted
  * @property {(id: string, state: string) => void} setSessionRuntimeState
  * @property {(id: string, metadata: { state?: string, descriptionInUi?: string, description?: string, projectTag?: string, needsInput?: string, result?: string, updatedAt?: string }) => void} setAgentViewMetadata
  * @property {(id: string) => { state?: string, descriptionInUi?: string, description?: string, projectTag?: string, needsInput?: string, result?: string, updatedAt?: string } | undefined} getAgentViewMetadata
+ * @property {(id: string) => { mutationVersion: number, mutationRunId?: string, runtimeState?: string, agentViewState?: string } | undefined} getSessionMutation
  * @property {(id: string) => PromptDraft} getPromptDraft
  * @property {(id: string, text: string, options?: { clientId?: string, clientSeq?: number }) => PromptDraft} setPromptDraft
+ * @property {(key: string) => any | undefined} getUiState
+ * @property {(key: string, value: any) => any} setUiState
+ * @property {(key: string) => boolean} deleteUiState
  * @property {(cwd?: string) => ServerDbSession[]} listSessions
  * @property {(id: string) => Array<{ previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string | any[] }>} loadSessionPreviewMessages
  * @property {(ids: string[]) => Array<{ sessionId: string, previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string | any[] }>} loadSessionPreviewMessagesForSessions
  * @property {(ids: string[]) => Array<{ sessionId: string, previewKind: "first" | "lastUser", entryId: string, timestamp: string, role: string, content: string }>} loadSessionOverviewPreviewMessagesForSessions
  * @property {(cwd: string) => string | undefined} latestSessionForCwd
  * @property {(prefix: string) => string[]} findSessionIdsByPrefix
- * @property {(sessions: Array<{ id: string, cwd: string, createdAt?: string, updatedAt?: string }>) => void} replaceSessions
+ * @property {(sessions: Array<{ id: string, cwd: string, initialWd?: string, createdAt?: string, updatedAt?: string }>) => void} replaceSessions
  * @property {() => number} sessionCount
  * @property {(run: { id: string, sessionId: string, startedAt?: string, expectedMutationVersion: number }) => void} startRun
  * @property {(id: string, update: { status: string, error?: string, stopReason?: string, endedAt?: string }) => void} finishRun
@@ -1019,6 +1156,15 @@ function promptDraftFromRow(row, overrides = {}) {
 		updatedByClientId: row?.updatedByClientId ?? undefined,
 		updatedByClientSeq: row?.updatedByClientSeq ?? undefined,
 		...overrides,
+	}
+}
+
+function parseJson(text, fallback = undefined) {
+	if (text === null || text === undefined) return fallback
+	try {
+		return JSON.parse(String(text))
+	} catch {
+		return fallback
 	}
 }
 
@@ -1082,6 +1228,117 @@ function cachedPreviewRowsFromOverview(row) {
 	return rows
 }
 
+// For active ancestors, session_entry_refs.seq is root-to-leaf order because parents are referenced before children. Use it to choose the two preview target entries before loading message blocks.
+function previewMessagesForSelectedSql(selectedValuesSql) {
+	return `
+		WITH RECURSIVE
+			selected(ord, session_id) AS (
+				VALUES ${selectedValuesSql}
+			),
+			leaf(ord, session_id, global_id) AS (
+				SELECT selected.ord, selected.session_id, COALESCE(
+					s.active_leaf_global_id,
+					(
+						SELECT ser.global_id
+						FROM session_entry_refs ser
+						JOIN conversation_entries ce ON ce.global_id = ser.global_id
+						WHERE ser.session_id = selected.session_id AND ce.id = s.active_leaf_entry_id
+						LIMIT 1
+					),
+					(
+						SELECT ser.global_id
+						FROM session_entry_refs ser
+						WHERE ser.session_id = selected.session_id
+						ORDER BY ser.seq DESC
+						LIMIT 1
+					)
+				)
+				FROM selected
+				JOIN sessions s ON s.id = selected.session_id AND s.deleted_at IS NULL
+			),
+			ancestors(ord, session_id, global_id, parent_global_id) AS (
+				SELECT leaf.ord, leaf.session_id, ce.global_id, ce.parent_global_id
+				FROM leaf
+				JOIN conversation_entries ce ON ce.global_id = leaf.global_id
+				UNION ALL
+				SELECT ancestors.ord, ancestors.session_id, parent.global_id, parent.parent_global_id
+				FROM ancestors
+				JOIN conversation_entries parent ON parent.global_id = ancestors.parent_global_id
+			),
+			visible_entries AS (
+				SELECT
+					ancestors.ord AS ord,
+					ancestors.session_id AS sessionId,
+					ancestors.global_id AS globalId,
+					ser.seq AS seq,
+					em.role AS role
+				FROM ancestors
+				JOIN session_entry_refs ser ON ser.session_id = ancestors.session_id AND ser.global_id = ancestors.global_id
+				JOIN entry_messages em ON em.global_id = ancestors.global_id
+				WHERE NOT (${HIDDEN_MESSAGE_EXTRA_SQL})
+					AND NOT (${PROJECT_CONTEXT_EXTRA_SQL})
+			),
+			preview_seqs AS (
+				SELECT
+					ord,
+					sessionId,
+					min(seq) AS firstSeq,
+					max(CASE WHEN role = 'user' THEN seq END) AS lastUserSeq
+				FROM visible_entries
+				GROUP BY ord, sessionId
+			),
+			preview_targets AS (
+				SELECT
+					0 AS previewOrder,
+					'first' AS previewKind,
+					visible_entries.ord AS ord,
+					visible_entries.sessionId AS sessionId,
+					visible_entries.globalId AS globalId
+				FROM preview_seqs
+				JOIN visible_entries ON visible_entries.ord = preview_seqs.ord
+					AND visible_entries.sessionId = preview_seqs.sessionId
+					AND visible_entries.seq = preview_seqs.firstSeq
+				WHERE preview_seqs.firstSeq IS NOT NULL
+				UNION ALL
+				SELECT
+					1 AS previewOrder,
+					'lastUser' AS previewKind,
+					visible_entries.ord AS ord,
+					visible_entries.sessionId AS sessionId,
+					visible_entries.globalId AS globalId
+				FROM preview_seqs
+				JOIN visible_entries ON visible_entries.ord = preview_seqs.ord
+					AND visible_entries.sessionId = preview_seqs.sessionId
+					AND visible_entries.seq = preview_seqs.lastUserSeq
+				WHERE preview_seqs.lastUserSeq IS NOT NULL
+			)
+		SELECT
+			preview_targets.previewKind,
+			preview_targets.sessionId,
+			ce.id AS entryId,
+			ce.timestamp AS timestamp,
+			em.role AS role,
+			em.content_format AS contentFormat,
+			(
+				SELECT json_group_array(json_object(
+					'type', mb.type,
+					'text', mb.text,
+					'payloadJson', mb.payload_json
+				))
+				FROM (
+					SELECT type, text, payload_json
+					FROM entry_message_blocks
+					WHERE global_id = preview_targets.globalId
+					ORDER BY ordinal ASC
+				) mb
+			) AS blocksJson
+		FROM preview_targets
+		JOIN conversation_entries ce ON ce.global_id = preview_targets.globalId
+		JOIN entry_messages em ON em.global_id = preview_targets.globalId
+		ORDER BY preview_targets.ord ASC, preview_targets.previewOrder ASC
+	`
+}
+
 /**
  * Open and migrate the Pinano server metadata db.
  * @param {{ path?: string, recoverRunningRuns?: boolean }} [options]
@@ -1098,10 +1355,11 @@ export function openServerDb(options = {}) {
 
 	// sessions.name is intentionally retained as an unused reserved column. Runtime code should not read or write it.
 	const upsertSessionStmt = db.prepare(`
-		INSERT INTO sessions (id, cwd, created_at, updated_at, deleted_at)
-		VALUES (?, ?, ?, ?, NULL)
+		INSERT INTO sessions (id, cwd, initial_wd, created_at, updated_at, deleted_at)
+		VALUES (?, ?, ?, ?, ?, NULL)
 		ON CONFLICT(id) DO UPDATE SET
 			cwd = excluded.cwd,
+			initial_wd = COALESCE(sessions.initial_wd, excluded.initial_wd),
 			updated_at = excluded.updated_at,
 			deleted_at = NULL
 	`)
@@ -1161,10 +1419,20 @@ export function openServerDb(options = {}) {
 			updated_by_client_id = excluded.updated_by_client_id,
 			updated_by_client_seq = excluded.updated_by_client_seq
 	`)
-	const listSessionsStmt = db.prepare(`
+	const getUiStateStmt = db.prepare("SELECT value_json AS valueJson FROM ui_state WHERE state_key = ?")
+	const setUiStateStmt = db.prepare(`
+		INSERT INTO ui_state (state_key, value_json, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(state_key) DO UPDATE SET
+			value_json = excluded.value_json,
+			updated_at = excluded.updated_at
+	`)
+	const deleteUiStateStmt = db.prepare("DELETE FROM ui_state WHERE state_key = ?")
+	const listSessionsSelectSql = `
 		SELECT
 			s.id,
 			s.cwd,
+			s.initial_wd AS initialWd,
 			s.created_at AS createdAt,
 			s.updated_at AS updatedAt,
 			s.runtime_state AS runtimeState,
@@ -1189,6 +1457,13 @@ export function openServerDb(options = {}) {
 				LIMIT 1
 			) AS latestRunStartedAt,
 			(
+				SELECT r.ended_at
+				FROM runs r
+				WHERE r.session_id = s.id
+				ORDER BY r.started_at DESC
+				LIMIT 1
+			) AS latestRunEndedAt,
+			(
 				SELECT r.error
 				FROM runs r
 				WHERE r.session_id = s.id
@@ -1203,226 +1478,22 @@ export function openServerDb(options = {}) {
 				LIMIT 1
 			) AS latestRunStopReason
 		FROM sessions s
+	`
+	const listSessionsStmt = db.prepare(`
+		${listSessionsSelectSql}
 		WHERE s.deleted_at IS NULL
-			AND (? IS NULL OR s.cwd = ?)
 		ORDER BY s.updated_at DESC
 	`)
-	const previewMessagesStmt = db.prepare(`
-		WITH RECURSIVE
-			selected(session_id) AS (
-				VALUES (?)
-			),
-			leaf(session_id, global_id) AS (
-				SELECT selected.session_id, COALESCE(
-					s.active_leaf_global_id,
-					(
-						SELECT ser.global_id
-						FROM session_entry_refs ser
-						JOIN conversation_entries ce ON ce.global_id = ser.global_id
-						WHERE ser.session_id = selected.session_id AND ce.id = s.active_leaf_entry_id
-						LIMIT 1
-					),
-					(
-						SELECT ser.global_id
-						FROM session_entry_refs ser
-						WHERE ser.session_id = selected.session_id
-						ORDER BY ser.seq DESC
-						LIMIT 1
-					)
-				)
-				FROM selected
-				JOIN sessions s ON s.id = selected.session_id AND s.deleted_at IS NULL
-			),
-			branch(session_id, global_id, id, parent_global_id, depth) AS (
-				SELECT leaf.session_id, ce.global_id, ce.id, ce.parent_global_id, 0
-				FROM leaf
-				JOIN conversation_entries ce ON ce.global_id = leaf.global_id
-				UNION ALL
-				SELECT branch.session_id, parent.global_id, parent.id, parent.parent_global_id, branch.depth + 1
-				FROM branch
-				JOIN conversation_entries parent ON parent.global_id = branch.parent_global_id
-			),
-			branch_messages AS (
-				SELECT
-					branch.session_id AS sessionId,
-					branch.id AS entryId,
-					branch.depth AS depth,
-					ce.timestamp AS timestamp,
-					em.role AS role,
-					em.content_format AS contentFormat,
-					CASE WHEN ${HIDDEN_MESSAGE_EXTRA_SQL} THEN 1 ELSE 0 END AS hasHiddenMessageMarker,
-					CASE WHEN ${PROJECT_CONTEXT_EXTRA_SQL} THEN 1 ELSE 0 END AS hasProjectContextMarker,
-					(
-						SELECT json_group_array(json_object(
-							'type', mb.type,
-							'text', mb.text,
-							'payloadJson', mb.payload_json
-						))
-						FROM (
-							SELECT type, text, payload_json
-							FROM entry_message_blocks
-							WHERE global_id = branch.global_id
-							ORDER BY ordinal ASC
-						) mb
-					) AS blocksJson
-				FROM branch
-				JOIN conversation_entries ce ON ce.global_id = branch.global_id
-				JOIN entry_messages em ON em.global_id = branch.global_id
-			),
-			visible_messages AS (
-				SELECT *
-				FROM branch_messages
-				WHERE hasHiddenMessageMarker = 0
-					AND hasProjectContextMarker = 0
-			)
-		SELECT * FROM (
-			SELECT
-				'first' AS previewKind,
-				entryId,
-				timestamp,
-				role,
-				contentFormat,
-				blocksJson
-			FROM visible_messages
-			ORDER BY depth DESC
-			LIMIT 1
-		)
-		UNION ALL
-		SELECT * FROM (
-			SELECT
-				'lastUser' AS previewKind,
-				entryId,
-				timestamp,
-				role,
-				contentFormat,
-				blocksJson
-			FROM visible_messages
-			WHERE role = 'user'
-			ORDER BY depth ASC
-			LIMIT 1
-		)
+	const listSessionsForCwdStmt = db.prepare(`
+		${listSessionsSelectSql}
+		WHERE s.deleted_at IS NULL AND s.cwd = ?
+		ORDER BY s.updated_at DESC
 	`)
+	const previewMessagesStmt = db.prepare(previewMessagesForSelectedSql("(0, ?)"))
 	const loadSessionPreviewMessagesForSessionBatch = (ids) => {
 		if (ids.length === 0) return []
-		const values = ids.map(() => "(?)").join(", ")
-		const stmt = db.prepare(`
-			WITH RECURSIVE
-				selected(session_id) AS (
-					VALUES ${values}
-				),
-				leaf(session_id, global_id) AS (
-					SELECT selected.session_id, COALESCE(
-						s.active_leaf_global_id,
-						(
-							SELECT ser.global_id
-							FROM session_entry_refs ser
-							JOIN conversation_entries ce ON ce.global_id = ser.global_id
-							WHERE ser.session_id = selected.session_id AND ce.id = s.active_leaf_entry_id
-							LIMIT 1
-						),
-						(
-							SELECT ser.global_id
-							FROM session_entry_refs ser
-							WHERE ser.session_id = selected.session_id
-							ORDER BY ser.seq DESC
-							LIMIT 1
-						)
-					)
-					FROM selected
-					JOIN sessions s ON s.id = selected.session_id AND s.deleted_at IS NULL
-				),
-				branch(session_id, global_id, id, parent_global_id, depth) AS (
-					SELECT leaf.session_id, ce.global_id, ce.id, ce.parent_global_id, 0
-					FROM leaf
-					JOIN conversation_entries ce ON ce.global_id = leaf.global_id
-					UNION ALL
-					SELECT branch.session_id, parent.global_id, parent.id, parent.parent_global_id, branch.depth + 1
-					FROM branch
-					JOIN conversation_entries parent ON parent.global_id = branch.parent_global_id
-				),
-				branch_messages AS (
-					SELECT
-						branch.session_id AS sessionId,
-						branch.global_id AS globalId,
-						branch.id AS entryId,
-						branch.depth AS depth,
-						ce.timestamp AS timestamp,
-						em.role AS role,
-						em.content_format AS contentFormat,
-						CASE WHEN ${HIDDEN_MESSAGE_EXTRA_SQL} THEN 1 ELSE 0 END AS hasHiddenMessageMarker,
-						CASE WHEN ${PROJECT_CONTEXT_EXTRA_SQL} THEN 1 ELSE 0 END AS hasProjectContextMarker
-					FROM branch
-					JOIN conversation_entries ce ON ce.global_id = branch.global_id
-					JOIN entry_messages em ON em.global_id = branch.global_id
-				),
-				visible_messages AS (
-					SELECT *
-					FROM branch_messages
-					WHERE hasHiddenMessageMarker = 0
-						AND (role != 'user' OR hasProjectContextMarker = 0)
-				),
-				first_messages AS (
-					SELECT
-						'first' AS previewKind,
-						visible_messages.sessionId,
-						visible_messages.globalId,
-						visible_messages.entryId,
-						visible_messages.timestamp,
-						visible_messages.role,
-						visible_messages.contentFormat
-					FROM visible_messages
-					JOIN (
-						SELECT sessionId, max(depth) AS depth
-						FROM visible_messages
-						GROUP BY sessionId
-					) picked ON picked.sessionId = visible_messages.sessionId AND picked.depth = visible_messages.depth
-				),
-				last_user_messages AS (
-					SELECT
-						'lastUser' AS previewKind,
-						visible_messages.sessionId,
-						visible_messages.globalId,
-						visible_messages.entryId,
-						visible_messages.timestamp,
-						visible_messages.role,
-						visible_messages.contentFormat
-					FROM visible_messages
-					JOIN (
-						SELECT sessionId, min(depth) AS depth
-						FROM visible_messages
-						WHERE role = 'user'
-						GROUP BY sessionId
-					) picked ON picked.sessionId = visible_messages.sessionId AND picked.depth = visible_messages.depth
-				),
-				preview_entries AS (
-					SELECT previewKind, sessionId, globalId, entryId, timestamp, role, contentFormat
-					FROM first_messages
-					UNION ALL
-					SELECT previewKind, sessionId, globalId, entryId, timestamp, role, contentFormat
-					FROM last_user_messages
-				)
-			SELECT
-				previewKind,
-				sessionId,
-				entryId,
-				timestamp,
-				role,
-				contentFormat,
-				(
-					SELECT json_group_array(json_object(
-						'type', mb.type,
-						'text', mb.text,
-						'payloadJson', mb.payload_json
-					))
-					FROM (
-						SELECT type, text, payload_json
-						FROM entry_message_blocks
-						WHERE global_id = preview_entries.globalId
-						ORDER BY ordinal ASC
-					) mb
-				) AS blocksJson
-			FROM preview_entries
-		`)
+		const values = ids.map((_, i) => `(${i}, ?)`).join(", ")
+		const stmt = db.prepare(previewMessagesForSelectedSql(values))
 		return stmt.all(...ids).map(previewMessageFromRow)
 	}
 	const loadSessionPreviewMessagesForSessions = (ids) => ids
@@ -1565,6 +1636,32 @@ export function openServerDb(options = {}) {
 			lastUserText: lastUser ? flattenPreviewContent(lastUser.content) : null,
 		}
 	}
+	const ensureSessionOverviewsForSessions = (ids) => {
+		if (ids.length === 0) return new Map()
+		const cachedBySessionId = new Map(cachedOverviewsForSessions(ids).map((row) => [row.sessionId, row]))
+		const leaves = overviewLeavesForSessions(ids)
+		const staleLeaves = leaves.filter((row) => !cachedBySessionId.has(row.sessionId))
+		if (staleLeaves.length > 0) {
+			const staleIds = staleLeaves.map((row) => row.sessionId)
+			const messagesBySessionId = new Map()
+			for (const row of loadSessionPreviewMessagesForSessions(staleIds)) {
+				const messages = messagesBySessionId.get(row.sessionId) ?? []
+				messages.push(row)
+				messagesBySessionId.set(row.sessionId, messages)
+			}
+			for (const leaf of staleLeaves) {
+				cachedBySessionId.set(
+					leaf.sessionId,
+					upsertSessionOverview(
+						leaf.sessionId,
+						leaf.activeLeafEntryId ?? null,
+						messagesBySessionId.get(leaf.sessionId) ?? [],
+					),
+				)
+			}
+		}
+		return cachedBySessionId
+	}
 	const latestForCwdStmt = db.prepare(`
 		SELECT id FROM sessions
 		WHERE deleted_at IS NULL AND cwd = ?
@@ -1578,7 +1675,11 @@ export function openServerDb(options = {}) {
 	`)
 	const sessionCountStmt = db.prepare("SELECT COUNT(*) AS n FROM sessions WHERE deleted_at IS NULL")
 	const getSessionMutationStmt = db.prepare(`
-		SELECT mutation_version AS mutationVersion, mutation_run_id AS mutationRunId
+		SELECT
+			mutation_version AS mutationVersion,
+			mutation_run_id AS mutationRunId,
+			runtime_state AS runtimeState,
+			agent_view_state AS agentViewState
 		FROM sessions
 		WHERE id = ? AND deleted_at IS NULL
 	`)
@@ -1705,9 +1806,11 @@ export function openServerDb(options = {}) {
 		raw: db,
 		upsertSession(session) {
 			const at = session.updatedAt ?? nowIso()
+			const initialWd = typeof session.initialWd === "string" && session.initialWd ? session.initialWd : session.cwd
 			upsertSessionStmt.run(
 				session.id,
 				session.cwd,
+				initialWd,
 				session.createdAt ?? at,
 				at,
 			)
@@ -1747,6 +1850,16 @@ export function openServerDb(options = {}) {
 				updatedAt: row.updatedAt ?? undefined,
 			}
 		},
+		getSessionMutation(id) {
+			const row = getSessionMutationStmt.get(id)
+			if (!row) return undefined
+			return {
+				mutationVersion: Number(row.mutationVersion ?? 0),
+				mutationRunId: row.mutationRunId ?? undefined,
+				runtimeState: row.runtimeState ?? undefined,
+				agentViewState: row.agentViewState ?? undefined,
+			}
+		},
 		getPromptDraft(id) {
 			return promptDraftFromRow(getPromptDraftStmt.get(id))
 		},
@@ -1773,13 +1886,29 @@ export function openServerDb(options = {}) {
 				throw err
 			}
 		},
+		getUiState(key) {
+			const row = getUiStateStmt.get(key)
+			return row ? parseJson(row.valueJson) : undefined
+		},
+		setUiState(key, value) {
+			const valueJson = JSON.stringify(value)
+			if (valueJson === undefined) throw new Error("ui state value must be JSON-serializable")
+			setUiStateStmt.run(key, valueJson, nowIso())
+			return parseJson(valueJson)
+		},
+		deleteUiState(key) {
+			return Number(deleteUiStateStmt.run(key).changes ?? 0) > 0
+		},
 		listSessions(cwd) {
-			return listSessionsStmt.all(cwd ?? null, cwd ?? null).map((row) => ({
+			const rows = cwd == null ? listSessionsStmt.all() : listSessionsForCwdStmt.all(cwd)
+			return rows.map((row) => ({
 				id: row.id,
 				cwd: row.cwd,
+				initialWd: row.initialWd ?? undefined,
 				createdAt: row.createdAt,
 				updatedAt: row.updatedAt,
 				latestRunStartedAt: row.latestRunStartedAt ?? undefined,
+				latestRunEndedAt: row.latestRunEndedAt ?? undefined,
 				latestRunError: row.latestRunError ?? undefined,
 				latestRunStopReason: row.latestRunStopReason ?? undefined,
 				runStatus: normalizeRunStatus(row.latestRunStatus),
@@ -1802,25 +1931,7 @@ export function openServerDb(options = {}) {
 			return loadSessionPreviewMessagesForSessions(ids)
 		},
 		loadSessionOverviewPreviewMessagesForSessions(ids) {
-			if (ids.length === 0) return []
-			const cachedBySessionId = new Map(cachedOverviewsForSessions(ids).map((row) => [row.sessionId, row]))
-			const leaves = overviewLeavesForSessions(ids)
-			const staleLeaves = leaves.filter((row) => !cachedBySessionId.has(row.sessionId))
-			if (staleLeaves.length > 0) {
-				const staleIds = staleLeaves.map((row) => row.sessionId)
-				const messagesBySessionId = new Map()
-				for (const row of loadSessionPreviewMessagesForSessions(staleIds)) {
-					const messages = messagesBySessionId.get(row.sessionId) ?? []
-					messages.push(row)
-					messagesBySessionId.set(row.sessionId, messages)
-				}
-				for (const leaf of staleLeaves) {
-					cachedBySessionId.set(
-						leaf.sessionId,
-						upsertSessionOverview(leaf.sessionId, leaf.activeLeafEntryId ?? null, messagesBySessionId.get(leaf.sessionId) ?? []),
-					)
-				}
-			}
+			const cachedBySessionId = ensureSessionOverviewsForSessions(ids)
 			return ids.flatMap((id) => {
 				const row = cachedBySessionId.get(id)
 				return row ? cachedPreviewRowsFromOverview(row) : []

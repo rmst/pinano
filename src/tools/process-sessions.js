@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
 import { resolve } from "node:path"
 
-import { envWithFallbackTools } from "./fallback-tools.js"
+import { envForToolSubprocess } from "./tool-env.js"
 import { DEFAULT_MAX_LINES, formatSize, truncateTail } from "./truncate.js"
 
 // /bin/bash if available, else sh. Keep this independent of $SHELL so user
@@ -109,7 +109,7 @@ export class ProcessSession {
 		const stdio = this.interactive === "pipe" ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"]
 		this.child = spawn(this.shell, ["-c", this.command], {
 			cwd: this.cwd,
-			env: envWithFallbackTools(process.env),
+			env: envForToolSubprocess(process.env, { toolCallId: options.toolCallId }),
 			detached: true,
 			stdio,
 		})
@@ -262,6 +262,28 @@ export class ProcessSession {
 		if (this.idleTimer) clearTimeout(this.idleTimer)
 		if (this.running) this.sendSignal(signal)
 	}
+
+	inspect(now = Date.now()) {
+		return {
+			id: this.id,
+			cwd: this.cwd,
+			shell: this.shell,
+			interactive: this.interactive,
+			running: this.running,
+			exitCode: this.exitCode,
+			exitSignal: this.exitSignal,
+			timedOut: this.timedOut,
+			stdinClosed: this.stdinClosed,
+			finalReported: this.finalReported,
+			createdAgeMs: now - this.createdAt,
+			idleMs: now - this.lastActivityAt,
+			commandBytes: Buffer.byteLength(this.command ?? "", "utf-8"),
+			outputBytes: Buffer.byteLength(this.output ?? "", "utf-8"),
+			unreadOutputBytes: Buffer.byteLength((this.output ?? "").slice(this.readOffset), "utf-8"),
+			outputDroppedSinceRead: this.outputDroppedSinceRead,
+			childPid: this.child?.pid,
+		}
+	}
 }
 
 export class ProcessSessionManager {
@@ -283,7 +305,7 @@ export class ProcessSessionManager {
 		return cwd
 	}
 
-	start(baseCwd, args) {
+	start(baseCwd, args, options = {}) {
 		this.cleanupExpired()
 		if (this.sessions.size >= MAX_SESSIONS) throw new Error(`Too many running command sessions (${MAX_SESSIONS} max). Finish or signal an existing session first.`)
 		const interactive = args.interactive ?? "none"
@@ -296,6 +318,7 @@ export class ProcessSessionManager {
 			shell: args.shell ?? DEFAULT_SHELL,
 			interactive,
 			timeoutMs,
+			toolCallId: options.toolCallId,
 		})
 		this.sessions.set(session.id, session)
 		this.scheduleIdleCleanup(session)
@@ -337,6 +360,17 @@ export class ProcessSessionManager {
 			} else if (!session.running && (session.finalReported || now - session.lastActivityAt >= SESSION_IDLE_TTL_MS)) {
 				this.delete(session)
 			}
+		}
+	}
+
+	inspect(now = Date.now()) {
+		this.cleanupExpired()
+		return {
+			sessionCount: this.sessions.size,
+			maxSessions: MAX_SESSIONS,
+			idleTtlMs: SESSION_IDLE_TTL_MS,
+			maxStoredOutputBytes: MAX_STORED_OUTPUT_BYTES,
+			sessions: [...this.sessions.values()].map((session) => session.inspect(now)),
 		}
 	}
 }

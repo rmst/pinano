@@ -1,27 +1,42 @@
+import { createHash } from "node:crypto"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { markUncertainToolExecution } from "../agent-core/tool-errors.js"
-import { resolveExecutionEnvironment, resolveSandboxRootCwd } from "./environments.js"
+import { resolveExecutionEnvironment, resolveSessionWd } from "./environments.js"
 import { recordFileCheckpoint } from "./file-checkpoints.js"
 import { JsonLineRpc } from "./json-rpc-lines.js"
+import { optionalSessionWorkspacePath } from "./paths.js"
+import { pinanoStateMountFromSettings } from "./settings.js"
+import { sandboxWithSessionMounts, sessionSandboxBaseWd, sessionSandboxMounts } from "./session-config.js"
 import { getEffectiveSessionProperties } from "./session-properties.js"
 import { createWorkerLauncher } from "./worker-launchers.js"
 import { WORKER_PROTOCOL_VERSION, assertWorkerProtocolVersion } from "./worker-protocol.js"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const defaultToolWorkerPath = join(here, "tool-worker.js")
+const DEFAULT_WORKER_INSPECT_TIMEOUT_MS = 500
 
-function sandboxFallbackCwd(session, fallbackCwd) {
+function sandboxBaseWdForSession(session, fallbackCwd) {
 	const config = session?.getSessionConfig?.() ?? {}
-	return config.worktree ?? config.cwd ?? session?.getMetadata?.()?.cwd ?? fallbackCwd
+	return sessionSandboxBaseWd(config, session?.getMetadata?.()?.cwd ?? fallbackCwd)
+}
+
+const delay = (ms, value) => new Promise((resolve) => setTimeout(() => resolve(value), ms))
+
+function shortHash(value) {
+	return createHash("sha256").update(value).digest("hex").slice(0, 12)
 }
 
 class ToolWorkerConnection {
 	/**
 	 * @param {object} options
 	 * @param {string} options.environmentId
+	 * @param {any} options.target
+	 * @param {any} options.sandbox
 	 * @param {string | undefined} options.startCwd
+	 * @param {string | undefined} options.sessionWd
+	 * @param {string | undefined} options.sessionDir
 	 * @param {any} options.launcher
 	 * @param {string} options.workerPath
 	 * @param {() => import("../session-manager/session.js").Session | null | undefined} options.getSession
@@ -29,7 +44,11 @@ class ToolWorkerConnection {
 	 */
 	constructor(options) {
 		this.environmentId = options.environmentId
+		this.target = options.target
+		this.sandbox = options.sandbox
 		this.startCwd = options.startCwd
+		this.sessionWd = options.sessionWd
+		this.sessionDir = options.sessionDir
 		this.launcher = options.launcher
 		this.workerPath = options.workerPath
 		this.getSession = options.getSession
@@ -60,7 +79,7 @@ class ToolWorkerConnection {
 	}
 
 	async startWorker() {
-		const handle = await this.launcher.start({ cwd: this.startCwd, environmentId: this.environmentId, workerPath: this.workerPath })
+		const handle = await this.launcher.start({ cwd: this.startCwd, sessionWd: this.sessionWd, sessionDir: this.sessionDir, environmentId: this.environmentId, workerPath: this.workerPath })
 		if (this.dead) {
 			handle.stop?.()
 			throw new Error("Tool executor was disposed before startup completed")
@@ -130,7 +149,6 @@ class ToolWorkerConnection {
 			throw error
 		}
 		if (signal?.aborted) throw new Error("Operation aborted")
-		this.workerHandle?.assertCwdAllowed?.(cwd)
 		if (onUpdate) this.pendingToolUpdates.set(id, onUpdate)
 		const cancel = () => {
 			this.rpc.request("cancelTool", { id }).catch(() => {})
@@ -165,6 +183,21 @@ class ToolWorkerConnection {
 			if (!this.pinanoApiRequest) throw new Error("Pinano JS API is unavailable for this session")
 			return this.pinanoApiRequest(params)
 		}
+		if (method === "internalHttp") {
+			if (!this.pinanoApiRequest) throw new Error("Pinano internal API is unavailable for this session")
+			return this.pinanoApiRequest({
+				op: "internalHttp",
+				request: params,
+				workerContext: {
+					environmentId: this.environmentId,
+					target: this.target,
+					sandbox: this.sandbox,
+					startCwd: this.startCwd,
+					sessionWd: this.sessionWd,
+					sessionDir: this.sessionDir,
+				},
+			})
+		}
 		throw new Error(`Unknown tool worker request: ${method}`)
 	}
 
@@ -173,6 +206,31 @@ class ToolWorkerConnection {
 			this.pendingToolUpdates.get(params.id)?.(params.update)
 			return
 		}
+	}
+
+	async inspect(key = "", options = {}) {
+		const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(1, options.timeoutMs) : DEFAULT_WORKER_INSPECT_TIMEOUT_MS
+		const base = {
+			keyHash: key ? shortHash(key) : undefined,
+			environmentId: this.environmentId,
+			startCwd: this.startCwd,
+			pid: this.child?.pid,
+			dead: this.dead,
+			pendingToolUpdateCount: this.pendingToolUpdates.size,
+			stderrBytes: Buffer.byteLength(this.workerStderr ?? "", "utf-8"),
+		}
+		if (this.dead) return base
+		const request = (async () => {
+			await this.ready
+			return this.requestWorker("inspect", {})
+		})().then(
+			(result) => ({ ...base, worker: result }),
+			(err) => ({ ...base, inspectError: err?.message ?? String(err) }),
+		)
+		return Promise.race([
+			request,
+			delay(timeoutMs, { ...base, inspectTimedOut: true }),
+		])
 	}
 
 	dispose() {
@@ -191,6 +249,7 @@ export class ToolExecutorRuntime {
 	 * @param {() => import("../session-manager/session.js").Session | null | undefined} [options.getSession]
 	 * @param {(request: any) => Promise<any>} [options.pinanoApiRequest]
 	 * @param {() => any} [options.environmentRegistry]
+	 * @param {() => any} [options.getSettings]
 	 */
 	constructor(options) {
 		this.cwd = options.cwd
@@ -199,6 +258,7 @@ export class ToolExecutorRuntime {
 		this.fixedWorkerLauncher = options.workerLauncher
 		this.workerPath = options.workerPath ?? defaultToolWorkerPath
 		this.environmentRegistry = options.environmentRegistry
+		this.getSettings = options.getSettings
 		this.workers = new Map()
 		this.startCwds = new Map()
 		this.disposed = false
@@ -226,16 +286,20 @@ export class ToolExecutorRuntime {
 		const session = this.getSession()
 		const props = session ? getEffectiveSessionProperties(session) : undefined
 		const target = resolveExecutionEnvironment(props, this.cwd, registry)
-		const sandboxRootCwd = resolveSandboxRootCwd(props, sandboxFallbackCwd(session, this.cwd), registry)
+		const config = session?.getSessionConfig?.() ?? {}
+		const sandbox = sandboxWithSessionMounts(target.sandbox, sessionSandboxMounts(config))
+		const sessionWd = resolveSessionWd(props, sandboxBaseWdForSession(session, this.cwd), registry)
 		const sessionId = session?.getMetadata?.()?.id
-		return { ...target, sandboxRootCwd, workerScope: sessionId ? `session:${sessionId}` : "runtime" }
+		const sessionDir = target.target?.type === "local" ? optionalSessionWorkspacePath(sessionId) : undefined
+		const pinanoStateMount = pinanoStateMountFromSettings(this.getSettings?.())
+		return { ...target, sandbox, sessionWd, sessionDir, pinanoStateMount, workerScope: sessionId ? `session:${sessionId}` : "runtime" }
 	}
 
 	async workerFor(target) {
-		const key = `${target.workerScope}\0${target.environmentId}\0${JSON.stringify(target.target)}\0${JSON.stringify(target.sandbox)}`
+		const key = `${target.workerScope}\0${target.environmentId}\0${JSON.stringify(target.target)}\0${JSON.stringify(target.sandbox)}\0${target.pinanoStateMount || false}`
 		let startCwd = target.cwd
 		if (target.sandbox?.type && target.sandbox.type !== "none") {
-			if (!this.startCwds.has(key)) this.startCwds.set(key, target.sandboxRootCwd ?? target.cwd)
+			if (!this.startCwds.has(key)) this.startCwds.set(key, target.sandbox?.useSessionWd === false ? undefined : target.sessionWd ?? target.cwd)
 			startCwd = this.startCwds.get(key)
 		}
 		const existing = this.workers.get(key)
@@ -249,8 +313,12 @@ export class ToolExecutorRuntime {
 		}
 		const worker = new ToolWorkerConnection({
 			environmentId: target.environmentId,
+			target: target.target,
+			sandbox: target.sandbox,
 			startCwd,
-			launcher: this.fixedWorkerLauncher ?? createWorkerLauncher({ target: target.target, sandbox: target.sandbox }),
+			sessionWd: target.sessionWd,
+			sessionDir: target.sessionDir,
+			launcher: this.fixedWorkerLauncher ?? createWorkerLauncher({ target: target.target, sandbox: target.sandbox, pinanoStateMount: target.pinanoStateMount }),
 			workerPath: this.workerPath,
 			getSession: this.getSession,
 			pinanoApiRequest: this.pinanoApiRequest,
@@ -278,6 +346,16 @@ export class ToolExecutorRuntime {
 			environmentId: target.environmentId,
 			toolProfile: options.toolProfile,
 		})
+	}
+
+	async inspect(options = {}) {
+		const workers = []
+		for (const [key, worker] of this.workers.entries()) workers.push(await worker.inspect(key, options))
+		return {
+			disposed: this.disposed,
+			workerCount: this.workers.size,
+			workers,
+		}
 	}
 
 	dispose() {

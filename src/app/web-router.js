@@ -1,5 +1,5 @@
 // Small Fetch-style router used by Pinano Web. It intentionally implements only
-// the tiny subset the browser gateway needs: ordered middleware, GET/POST
+// the tiny subset the browser gateway needs: ordered middleware, GET/POST/DELETE
 // routes, named single-segment params, prefix middleware, and a catch-all route.
 
 /**
@@ -93,6 +93,10 @@ export class WebRouter {
 
 	post(pattern, handler) {
 		this.#layers.push({ method: "POST", pattern, handler })
+	}
+
+	delete(pattern, handler) {
+		this.#layers.push({ method: "DELETE", pattern, handler })
 	}
 
 	async fetch(request) {

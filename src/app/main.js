@@ -8,7 +8,7 @@
 // Stored credentials are refreshed/resolved on demand.
 
 import { readFile } from "node:fs/promises"
-import { reexecRuntime } from "./reexec-runtime.js"
+import { reexecRuntime, staleRuntimeReexecEnvPatch } from "./reexec-runtime.js"
 
 const NO_MODEL_PROVIDER_CLI_MESSAGE = "No model provider configured. Run `pinano open /settings/credentials` to add your ChatGPT subscription or an API key."
 
@@ -268,18 +268,31 @@ async function reexecForStaleRuntime(err, cliArgs = process.argv.slice(2)) {
 	if (!target) return false
 	const runtime = desired.execPath ?? process.execPath
 	if (runtime === process.execPath && target === process.argv[1]) return false
-	const depth = Number(process.env.PINANO_STALE_RUNTIME_REEXEC_DEPTH ?? 0)
-	if (Number.isFinite(depth) && depth >= 3) return false
+	let envPatch
+	try {
+		envPatch = staleRuntimeReexecEnvPatch()
+	} catch {
+		return false
+	}
 	console.error("Pinano was updated; reopening…")
 	await reexecRuntime({
 		command: runtime,
 		args: [target, ...cliArgs],
 		cwd: process.cwd(),
-		envPatch: { PINANO_STALE_RUNTIME_REEXEC_DEPTH: String((Number.isFinite(depth) ? depth : 0) + 1) },
+		envPatch,
 	})
 	return true
 }
 
+function shouldAutoInstallBundledBubblewrap(args) {
+	return !args.version && !args.help && args.command !== "service-status"
+}
+
+async function autoInstallBundledBubblewrapForStartup(args) {
+	if (!shouldAutoInstallBundledBubblewrap(args)) return
+	const { bestEffortAutoInstallBundledBubblewrap } = await import("./bundled-bwrap.js")
+	await bestEffortAutoInstallBundledBubblewrap()
+}
 
 async function main() {
 	const args = parseArgs(process.argv.slice(2))
@@ -287,10 +300,11 @@ async function main() {
 		console.log(await packageVersion())
 		return
 	}
+	await autoInstallBundledBubblewrapForStartup(args)
 
 	const [
-		{ loadSettings },
-		{ availableModelEntries, modelEntryMatches, resolveModel },
+		{ loadSettings, pinanoStateMountFromSettings },
+		{ availableModelEntries, buildModel, modelEntryMatches, resolveModelWithProviderMetadata },
 		{ buildProjectContextMessage, isProjectContextMessage },
 		{ runPrintMode },
 		{ installStderrCapture },
@@ -333,15 +347,18 @@ async function main() {
 	const configuredModel = availableModels.find((m) => modelEntryMatches(m, settings.defaultModel))
 	const fallbackModel = configuredModel ?? availableModels[0]
 	const model = fallbackModel
-		? resolveModel(fallbackModel.id, { provider: fallbackModel.provider, providers: settings.providers })
-		: resolveModel(settings.defaultModel, { providers: settings.providers })
+		? buildModel(fallbackModel)
+		: await resolveModelWithProviderMetadata(settings.defaultModel, { providers: settings.providers })
 
-	const createAgent = ({ cwd = args.cwd, toolExecutor = undefined } = {}) => createPinanoAgent({
+	const environmentContextOptions = (currentSettings = settings) => ({
+		pinanoStateMount: pinanoStateMountFromSettings(currentSettings),
+	})
+	const createAgent = ({ cwd = args.cwd, toolExecutor = undefined, settings: currentSettings = settings } = {}) => createPinanoAgent({
 		cwd,
 		model,
 		settings,
 		noContextFiles: args.noContextFiles,
-		environmentContext: () => initialEnvironmentContextFor(cwd),
+		environmentContext: () => initialEnvironmentContextFor(cwd, undefined, environmentContextOptions(currentSettings)),
 		...(toolExecutor ? { toolExecutor } : {}),
 	})
 
@@ -355,9 +372,11 @@ async function main() {
 			serviceRunId: args.serviceRunId,
 			serviceClaimId: args.serviceClaimId,
 			noContextFiles: args.noContextFiles,
-			createAgent: ({ cwd }) => {
+			createAgent: ({ cwd, getSettings }) => {
+				const currentSettings = () => getSettings?.() ?? settings
 				const createExecutor = (getAgent) => new ToolExecutorRuntime({
 					cwd,
+					getSettings: currentSettings,
 					getSession: () => getAgent()?.session,
 					pinanoApiRequest: (request) => {
 						const target = getAgent()
@@ -373,7 +392,7 @@ async function main() {
 					settings,
 					noContextFiles: args.noContextFiles,
 					toolExecutor: executor,
-					environmentContext: () => initialEnvironmentContextFor(cwd),
+					environmentContext: () => initialEnvironmentContextFor(cwd, undefined, environmentContextOptions(currentSettings())),
 				})
 				agent.createSidecarAgent = (sidecarOptions) => {
 					let sidecar
@@ -473,7 +492,7 @@ async function main() {
 	// Print mode is hermetic: no session creation, no index work.
 	if (args.sessionCommand === "print") {
 		const { ToolExecutorRuntime } = await import("./tool-executor-runtime.js")
-		const executor = new ToolExecutorRuntime({ cwd: args.cwd })
+		const executor = new ToolExecutorRuntime({ cwd: args.cwd, getSettings: () => settings })
 		const agent = createAgent({ cwd: args.cwd, toolExecutor: executor })
 		let code = 1
 		try {

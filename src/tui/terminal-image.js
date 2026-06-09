@@ -1,10 +1,12 @@
 /** @typedef {"kitty" | "iterm2" | null} ImageProtocol */
+/** @typedef {"vscode"} LocalFileHyperlinkOpener */
 
 /**
  * @typedef {object} TerminalCapabilities
  * @property {ImageProtocol} images
  * @property {boolean} trueColor
  * @property {boolean} hyperlinks
+ * @property {LocalFileHyperlinkOpener | null} [localFileHyperlinkOpener]
  */
 
 /**
@@ -81,7 +83,7 @@ export function detectCapabilities() {
 	}
 
 	if (termProgram === "vscode") {
-		return { images: null, trueColor: true, hyperlinks: true };
+		return { images: null, trueColor: true, hyperlinks: true, localFileHyperlinkOpener: "vscode" };
 	}
 
 	if (termProgram === "alacritty") {
@@ -94,6 +96,42 @@ export function detectCapabilities() {
 	// have positively identified a hyperlink-capable terminal above.
 	const trueColor = colorTerm === "truecolor" || colorTerm === "24bit";
 	return { images: null, trueColor, hyperlinks: false };
+}
+
+const LOCAL_FILE_LINE_COLUMN_RE = /^(.*):([1-9]\d*):([1-9]\d*)$/;
+const LOCAL_FILE_LINE_RE = /^(.*):([1-9]\d*)$/;
+
+/**
+ * @param {string} url
+ * @returns {{ filePath: string, line: string | null, column: string | null } | null}
+ */
+function parseAbsoluteLocalFileHref(url) {
+	if (!url.startsWith("/")) return null;
+	const lineColumn = LOCAL_FILE_LINE_COLUMN_RE.exec(url);
+	if (lineColumn) return { filePath: lineColumn[1], line: lineColumn[2], column: lineColumn[3] };
+	const line = LOCAL_FILE_LINE_RE.exec(url);
+	if (line) return { filePath: line[1], line: line[2], column: null };
+	return { filePath: url, line: null, column: null };
+}
+
+/**
+ * @param {string} filePath
+ * @returns {string}
+ */
+function encodeUriPath(filePath) {
+	return filePath.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
+/**
+ * @param {string} url
+ * @returns {string}
+ */
+export function formatHyperlinkUrl(url) {
+	if (getCapabilities().localFileHyperlinkOpener !== "vscode") return url;
+	const file = parseAbsoluteLocalFileHref(url);
+	if (!file) return url;
+	const position = file.line ? `:${file.line}${file.column ? `:${file.column}` : ""}` : "";
+	return `vscode://file${encodeUriPath(file.filePath)}${position}`;
 }
 
 /** @returns {TerminalCapabilities} */
@@ -467,7 +505,7 @@ export function renderImage(base64Data, imageDimensions, options = {}) {
  * @returns {string}
  */
 export function hyperlink(text, url) {
-	return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
+	return `\x1b]8;;${formatHyperlinkUrl(url)}\x1b\\${text}\x1b]8;;\x1b\\`;
 }
 
 /**

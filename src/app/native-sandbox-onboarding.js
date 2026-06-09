@@ -9,6 +9,7 @@ import {
 import { defaultNativeSandboxEnvironment, disableEnvironmentSandbox, loadEnvironmentRegistry } from "./environments.js"
 import { theme } from "./theme.js"
 import { probeNativeSandbox } from "./worker-launchers.js"
+import { bestEffortAutoInstallBundledBubblewrap } from "./bundled-bwrap.js"
 
 export const nativeSandboxOnboardingPollMs = 5000
 
@@ -43,11 +44,24 @@ function titleForPlatform(platform) {
 	return "Native sandboxing is unavailable"
 }
 
-/** @param {string} platform */
-function bodyForPlatform(platform) {
+function canDownloadBundledBubblewrapFromProbe(probe) {
+	return Boolean(probe?.downloadableBundledBubblewrap)
+}
+
+/** @param {string} platform @param {any} [probe] */
+function bodyForPlatform(platform, probe) {
 	if (platform === "linux") {
-		return [
+		const base = [
 			"Pinano uses bubblewrap (bwrap) for Linux native tool sandboxing. The default local environment is configured for native sandboxing, but the sandbox probe failed.",
+		]
+		if (canDownloadBundledBubblewrapFromProbe(probe)) {
+			return [
+				...base,
+				"System bwrap was not found. Pinano normally prepares a verified bundled Bubblewrap binary automatically. Install bubblewrap or check network access, and keep this page open; Pinano checks again automatically.",
+			]
+		}
+		return [
+			...base,
 			"Install bubblewrap, or enable unprivileged user namespaces if your distro requires it, and keep this page open; Pinano checks again automatically.",
 		]
 	}
@@ -64,13 +78,15 @@ function bodyForPlatform(platform) {
 }
 
 /**
- * @param {{ platform?: string, registry?: ReturnType<typeof loadEnvironmentRegistry>, probe?: (options: { platform: string }) => Promise<any> }} [options]
+ * @param {{ platform?: string, registry?: ReturnType<typeof loadEnvironmentRegistry>, probe?: (options: { platform: string }) => Promise<any>, autoInstallBundledBubblewrap?: () => Promise<any> }} [options]
  */
 export async function nativeSandboxStartupIssue(options = {}) {
 	const platform = options.platform ?? process.platform
 	const registry = options.registry ?? loadEnvironmentRegistry()
 	const target = defaultNativeSandboxEnvironment(registry, platform)
 	if (!target) return undefined
+	const autoInstall = options.autoInstallBundledBubblewrap ?? (() => bestEffortAutoInstallBundledBubblewrap({ platform: target.platform }))
+	await autoInstall().catch(() => {})
 	const probe = options.probe ?? probeNativeSandbox
 	const result = await probe({ platform: target.platform })
 	return result.ok ? undefined : { target, probe: result }
@@ -191,7 +207,7 @@ export class NativeSandboxStartupPage extends RetainedComponent {
 			line(),
 			line(theme.bold(titleForPlatform(platform))),
 			line(),
-			...bodyForPlatform(platform).flatMap((paragraph) => [...wrap(paragraph), line()]),
+			...bodyForPlatform(platform, this.latestProbe).flatMap((paragraph) => [...wrap(paragraph), line()]),
 			line(theme.dim(`Environment: ${this.issue.target.environmentId}`)),
 			...(command ? [line(theme.dim(`Probe command: ${command}`))] : []),
 			...(probeDetail ? [line(), ...wrap(theme.fg("warning", `Last probe: ${probeDetail}`))] : []),

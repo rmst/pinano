@@ -4,3 +4,5 @@ inspiration/
 *.log
 devrel/demo/out/
 .pinano/
+.jix/
+.vscode/

@@ -7,25 +7,15 @@
 export const COMPACTION_MARKER_PREFIX = "[earlier context compacted]"
 export const COMPACTION_SUMMARY_DISPLAY_MAX_LINES = 10
 
-export const SUMMARY_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION for a coding-agent conversation. Create a handoff summary for a future model call that will resume the task after the older transcript is replaced.
+export const SUMMARY_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
-Write a detailed but compact, structured summary. Preserve all information needed to continue the work without reading the replaced transcript again.
-
-Use these headings:
-- Current goal and user intent
+Include:
 - Current progress and key decisions made
-- Important constraints, project instructions, user preferences, and assumptions
-- Files, functions, commands, tools, APIs, data shapes, IDs, or error messages that matter for follow-up
-- Work completed so far and the evidence/results that matter
-- What remains to be done, with clear next steps
-- Open questions, blockers, failed attempts, or risks
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
 
-Guidelines:
-- Prefer preserving exact names, paths, commands, and error text over vague prose.
-- If a previous compaction/handoff summary appears in the transcript, fold its durable facts into this checkpoint; do not summarize away important earlier state.
-- Be compact, but do not omit details that a future model would need to continue safely.
-
-Reply with the handoff summary only. No greetings, no code fences.`
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.`
 
 export const SUMMARY_USER_PREAMBLE = "Create a context checkpoint handoff from the transcript segment below. This checkpoint will replace that segment in future model context."
 

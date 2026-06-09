@@ -222,17 +222,19 @@ export class SqliteSessionStorage {
 
 	static create(db, options) {
 		const createdAt = options.createdAt ?? new Date().toISOString()
+		const initialWd = typeof options.initialWd === "string" && options.initialWd ? options.initialWd : options.cwd
 		db.prepare(`
-			INSERT INTO sessions (id, cwd, name, created_at, updated_at, deleted_at, active_leaf_entry_id, active_leaf_global_id)
-			VALUES (?, ?, NULL, ?, ?, NULL, NULL, NULL)
+			INSERT INTO sessions (id, cwd, initial_wd, name, created_at, updated_at, deleted_at, active_leaf_entry_id, active_leaf_global_id)
+			VALUES (?, ?, ?, NULL, ?, ?, NULL, NULL, NULL)
 			ON CONFLICT(id) DO UPDATE SET
 				cwd = excluded.cwd,
+				initial_wd = COALESCE(sessions.initial_wd, excluded.initial_wd),
 				created_at = COALESCE(sessions.created_at, excluded.created_at),
 				updated_at = excluded.updated_at,
 				deleted_at = NULL,
 				active_leaf_entry_id = COALESCE(sessions.active_leaf_entry_id, excluded.active_leaf_entry_id),
 				active_leaf_global_id = COALESCE(sessions.active_leaf_global_id, excluded.active_leaf_global_id)
-		`).run(options.sessionId, options.cwd, createdAt, options.updatedAt ?? createdAt)
+		`).run(options.sessionId, options.cwd, initialWd, createdAt, options.updatedAt ?? createdAt)
 		const row = db.prepare("SELECT mutation_version AS mutationVersion FROM sessions WHERE id = ?").get(options.sessionId)
 		return new SqliteSessionStorage(db, {
 			id: options.sessionId,
@@ -244,31 +246,38 @@ export class SqliteSessionStorage {
 	static branchFrom(db, sourceSessionId, options = {}) {
 		const createdAt = options.createdAt ?? new Date().toISOString()
 		const targetSessionId = options.sessionId ?? randomUUID()
+		const hasSourceEntryId = Object.prototype.hasOwnProperty.call(options, "sourceEntryId") && options.sourceEntryId !== undefined
 		const source = db.prepare(`
 			SELECT id, cwd, active_leaf_entry_id AS activeLeafEntryId, active_leaf_global_id AS activeLeafGlobalId
 			FROM sessions
 			WHERE id = ? AND deleted_at IS NULL
 		`).get(sourceSessionId)
 		if (!source) throw new Error(`Session not found: ${sourceSessionId}`)
-		const branch = source.activeLeafGlobalId || source.activeLeafEntryId
+		const targetCwd = options.cwd ?? source.cwd
+		const targetInitialWd = typeof options.initialWd === "string" && options.initialWd ? options.initialWd : targetCwd
+		const sourceEntryId = hasSourceEntryId ? options.sourceEntryId : source.activeLeafEntryId
+		if (sourceEntryId !== null && sourceEntryId !== undefined && (typeof sourceEntryId !== "string" || !sourceEntryId)) throw new Error("sourceEntryId must be a non-empty string or null")
+		const sourceEntryGlobalIdStmt = db.prepare(`
+			SELECT ser.global_id AS globalId
+			FROM session_entry_refs ser
+			JOIN conversation_entries ce ON ce.global_id = ser.global_id
+			WHERE ser.session_id = ? AND ce.id = ?
+			LIMIT 1
+		`)
+		const sourceEntryGlobalIdFor = (entryId) => entryId
+			? sourceEntryGlobalIdStmt.get(sourceSessionId, entryId)?.globalId
+			: null
+		const sourceEntryGlobalId = hasSourceEntryId
+			? sourceEntryGlobalIdFor(sourceEntryId)
+			: source.activeLeafGlobalId ?? sourceEntryGlobalIdFor(source.activeLeafEntryId)
+		if (hasSourceEntryId && sourceEntryId && !sourceEntryGlobalId) throw new Error(`Entry not found in session ${sourceSessionId}: ${sourceEntryId}`)
+		const branch = sourceEntryGlobalId
 			? db.prepare(`
 				WITH RECURSIVE
-					leaf(global_id) AS (
-						SELECT COALESCE(
-							?,
-							(
-								SELECT ser.global_id
-								FROM session_entry_refs ser
-								JOIN conversation_entries ce ON ce.global_id = ser.global_id
-								WHERE ser.session_id = ? AND ce.id = ?
-								LIMIT 1
-							)
-						)
-					),
 					branch(global_id, parent_global_id, depth) AS (
 						SELECT ce.global_id, ce.parent_global_id, 0
-						FROM leaf
-						JOIN conversation_entries ce ON ce.global_id = leaf.global_id
+						FROM conversation_entries ce
+						WHERE ce.global_id = ?
 						UNION ALL
 						SELECT parent.global_id, parent.parent_global_id, branch.depth + 1
 						FROM branch
@@ -278,15 +287,18 @@ export class SqliteSessionStorage {
 				FROM branch
 				JOIN conversation_entries ce ON ce.global_id = branch.global_id
 				ORDER BY branch.depth DESC
-			`).all(source.activeLeafGlobalId ?? null, sourceSessionId, source.activeLeafEntryId ?? null)
+			`).all(sourceEntryGlobalId)
 			: []
 		const activeLeaf = branch.at(-1)
+		const activeLeafEntryId = activeLeaf?.id ?? (hasSourceEntryId ? null : source.activeLeafEntryId ?? null)
+		const activeLeafGlobalId = activeLeaf?.globalId ?? (hasSourceEntryId ? null : source.activeLeafGlobalId ?? null)
 		db.exec("BEGIN IMMEDIATE")
 		try {
 			db.prepare(`
 				INSERT INTO sessions (
 					id,
 					cwd,
+					initial_wd,
 					name,
 					created_at,
 					updated_at,
@@ -298,17 +310,18 @@ export class SqliteSessionStorage {
 					branched_from_entry_global_id,
 					branched_at
 				)
-				VALUES (?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+				VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
 			`).run(
 				targetSessionId,
-				options.cwd ?? source.cwd,
+				targetCwd,
+				targetInitialWd,
 				createdAt,
 				createdAt,
-				activeLeaf?.id ?? source.activeLeafEntryId ?? null,
-				activeLeaf?.globalId ?? source.activeLeafGlobalId ?? null,
+				activeLeafEntryId,
+				activeLeafGlobalId,
 				sourceSessionId,
-				activeLeaf?.id ?? source.activeLeafEntryId ?? null,
-				activeLeaf?.globalId ?? source.activeLeafGlobalId ?? null,
+				activeLeafEntryId,
+				activeLeafGlobalId,
 				createdAt,
 			)
 			const insertRef = db.prepare("INSERT INTO session_entry_refs (session_id, global_id, seq) VALUES (?, ?, ?)")
@@ -584,7 +597,7 @@ function loadContextLoad(db, globalId) {
 	}
 	if (!row) return undefined
 	const files = db.prepare(`
-		SELECT path, scope_dir AS scopeDir, content, hash
+		SELECT path, scope_dir AS scopeDir, identity_path AS identityPath, content, hash
 		FROM entry_context_files
 		WHERE global_id = ?
 		ORDER BY ordinal ASC
@@ -749,9 +762,9 @@ function insertContextLoad(db, globalId, load) {
 	`).run(globalId, load.source ?? "unknown", load.cwd ?? null, load.loadedAt ?? new Date().toISOString(), load.disabled ? 1 : 0)
 	;(load.files ?? []).forEach((file, ordinal) => {
 		db.prepare(`
-			INSERT INTO entry_context_files (global_id, ordinal, path, scope_dir, content, hash)
-			VALUES (?, ?, ?, ?, ?, ?)
-		`).run(globalId, ordinal, file.path, file.scopeDir ?? null, file.content ?? "", file.hash ?? null)
+			INSERT INTO entry_context_files (global_id, ordinal, path, scope_dir, identity_path, content, hash)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`).run(globalId, ordinal, file.path, file.scopeDir ?? null, file.identityPath ?? null, file.content ?? "", file.hash ?? null)
 	})
 }
 

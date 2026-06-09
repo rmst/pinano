@@ -2,13 +2,16 @@
 // metadata store.
 
 import { randomUUID } from "node:crypto"
+import { lstat } from "node:fs/promises"
 
 import { Session, SqliteSessionStorage } from "../session-manager/index.js"
-import { serverDbPath } from "./paths.js"
+import { serverDbPath, sessionWorkspacePath } from "./paths.js"
 import { isProjectContextMessage } from "./project-context.js"
 import { openServerDb } from "./server-db.js"
 import { sessionActivityAt } from "./session-activity.js"
 import { deleteFileCheckpoints } from "./file-checkpoints.js"
+import { ensureSessionWorkspace } from "./session-workspaces.js"
+import { sessionWorkspaceDirName } from "./session-workspace-names.js"
 
 /** @typedef {import("../session-manager/types.js").SessionEntry} SessionEntry */
 /** @typedef {import("./server-db.js").ServerDb} ServerDb */
@@ -22,9 +25,65 @@ async function getMetadataDb() {
 	if (!metadataDb || metadataDb.path !== path) {
 		try { metadataDb?.db.close() } catch {}
 		const db = openServerDb()
+		try {
+			assertNoSessionWorkspaceNameCollisions(db)
+		} catch (err) {
+			db.close()
+			throw err
+		}
 		metadataDb = { path, db }
 	}
 	return metadataDb.db
+}
+
+/** @param {ServerDb} db */
+function assertNoSessionWorkspaceNameCollisions(db) {
+	const byWorkspaceName = new Map()
+	for (const session of db.listSessions()) {
+		const workspaceName = sessionWorkspaceDirName(session.id)
+		const existing = byWorkspaceName.get(workspaceName)
+		if (existing && existing !== session.id) {
+			throw new Error(`Cannot use shortened Pinano session workspace paths: active sessions ${existing} and ${session.id} both map to workspace dir ${workspaceName}`)
+		}
+		byWorkspaceName.set(workspaceName, session.id)
+	}
+}
+
+/** @param {ServerDb} db @param {string} id */
+function sessionWorkspaceNameUsedByActiveSession(db, id) {
+	const workspaceName = sessionWorkspaceDirName(id)
+	return db.listSessions().some((session) => session.id !== id && sessionWorkspaceDirName(session.id) === workspaceName)
+}
+
+/** @param {string} path */
+async function pathExists(path) {
+	try {
+		await lstat(path)
+		return true
+	} catch (/** @type {any} */ err) {
+		if (err?.code === "ENOENT") return false
+		throw err
+	}
+}
+
+/** @param {ServerDb} db @param {string} id */
+async function sessionWorkspaceNameAvailable(db, id) {
+	if (sessionWorkspaceNameUsedByActiveSession(db, id)) return false
+	return !await pathExists(sessionWorkspacePath(id))
+}
+
+/** @param {ServerDb} db */
+async function generateSessionId(db) {
+	for (let i = 0; i < 200; i++) {
+		const id = randomUUID()
+		if (await sessionWorkspaceNameAvailable(db, id)) return id
+	}
+	throw new Error("Could not allocate a Pinano session id with an unused workspace path")
+}
+
+/** @returns {Promise<string>} */
+export async function createSessionId() {
+	return generateSessionId(await getMetadataDb())
 }
 
 /** Ensure the SQLite session store has been opened and migrated for this home. */
@@ -141,9 +200,10 @@ export async function listSessions(filterCwd) {
  * @returns {Promise<{ session: Session, id: string }>}
  */
 export async function createSession(cwd) {
-	const id = randomUUID()
 	const db = await getMetadataDb()
+	const id = await generateSessionId(db)
 	const storage = SqliteSessionStorage.create(db.raw, { cwd, sessionId: id })
+	await ensureSessionWorkspace(id)
 	return { session: new Session(storage), id }
 }
 
@@ -152,13 +212,18 @@ export async function createSession(cwd) {
  * Conversation entries are immutable global DAG nodes, so this records new
  * session membership refs without duplicating message payload rows.
  * @param {string} sourceId
- * @param {{ cwd?: string }} [options]
+ * @param {{ cwd?: string, sessionId?: string, sourceEntryId?: string | null }} [options]
  * @returns {Promise<{ session: Session, id: string, sourceId: string }>}
  */
 export async function branchSession(sourceId, options = {}) {
-	const id = randomUUID()
 	const db = await getMetadataDb()
-	const storage = SqliteSessionStorage.branchFrom(db.raw, sourceId, { sessionId: id, cwd: options.cwd })
+	const id = options.sessionId ?? await generateSessionId(db)
+	const storage = SqliteSessionStorage.branchFrom(db.raw, sourceId, {
+		sessionId: id,
+		cwd: options.cwd,
+		...(Object.prototype.hasOwnProperty.call(options, "sourceEntryId") ? { sourceEntryId: options.sourceEntryId } : {}),
+	})
+	await ensureSessionWorkspace(id)
 	const session = new Session(storage)
 	return { session, id, sourceId }
 }

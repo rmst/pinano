@@ -9,10 +9,11 @@ import { activeContextFiles } from "./session-context.js"
 import { recordFileCheckpoint } from "./file-checkpoints.js"
 import { createSessionSetTool } from "./session-set-tool.js"
 import { createExecutorProxyTools } from "./tool-executor-tools.js"
-import { baseInstructionsForModel, toolProfileForModel } from "./model-instructions.js"
+import { PINANO_MANAGED_WORKTREE_INSTRUCTIONS, baseInstructionsForModel, toolProfileForModel } from "./model-instructions.js"
 import { prependEnvironmentContext } from "./environment-context.js"
 import { getEffectiveSessionProperties } from "./session-properties.js"
 
+const AUTO_COMPACT_THRESHOLD = 0.85
 
 /**
  * Build a streamFn that resolves app-level credentials, then lets the shared
@@ -76,7 +77,7 @@ export function systemPromptFor(cwd, model = undefined) {
 	const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`
 	const base = baseInstructionsForModel(model) ?? fallbackBaseInstructionsForToolProfile(toolProfileForModel(model))
 
-	let prompt = base
+	let prompt = [base, PINANO_MANAGED_WORKTREE_INSTRUCTIONS].filter(Boolean).join("\n\n")
 	prompt += `\n\nCurrent date: ${date}`
 	prompt += `\nInitial working directory: ${cwd} (change when convenient)`
 	return prompt
@@ -133,10 +134,7 @@ export function createPinanoAgent(options) {
 		createSessionSetTool({ request: () => agent?.pinanoApiRequest }),
 	]
 	const baseStreamFn = options.streamFn ?? buildDefaultStreamFn()
-	const streamFn = (/** @type {any} */ model, /** @type {any} */ ctx, /** @type {any} */ streamOptions) => baseStreamFn(model, ctx, {
-		...streamOptions,
-		autocompactThreshold: options.settings.autocompactThreshold,
-	})
+	const streamFn = (/** @type {any} */ model, /** @type {any} */ ctx, /** @type {any} */ streamOptions) => baseStreamFn(model, ctx, { ...streamOptions })
 	if (baseStreamFn.serviceMediated) streamFn.serviceMediated = true
 
 	agent = new Agent({
@@ -150,7 +148,7 @@ export function createPinanoAgent(options) {
 		// Auto-compact older messages just before each LLM call when usage is high.
 		transformContext: withEnvironmentContextTransform(
 			() => agent?.pinanoEnvironmentContext?.(),
-			makeAutoCompactTransform(() => agent, () => options.settings.autocompactThreshold),
+			makeAutoCompactTransform(() => agent, () => AUTO_COMPACT_THRESHOLD),
 		),
 		afterToolCall: async (ctx) => {
 			if (agent.contextFilesDisabled || options.noContextFiles || agent.session?.getSessionConfig?.().noContextFiles) return undefined
@@ -162,7 +160,8 @@ export function createPinanoAgent(options) {
 			}
 			const cwd = effectiveSessionCwd(agent, options.cwd)
 			lazyContext.setCwd(cwd)
-			const extracted = extractToolPaths(ctx.toolCall.name, ctx.args, cwd, ctx.isError ? undefined : ctx.result)
+			if (ctx.isError) return undefined
+			const extracted = extractToolPaths(ctx.toolCall.name, ctx.args, cwd, ctx.result)
 			lazyContext.markLoaded(extracted.manuallyLoadedContextPaths)
 			const newFiles = extracted.paths.flatMap((path) => lazyContext.loadForPath(path))
 			if (newFiles.length === 0) return undefined
@@ -188,6 +187,7 @@ export function createPinanoAgent(options) {
 		agent.state.tools = toolsForModel(model)
 	}
 	if (options.toolExecutor) {
+		Object.defineProperty(agent, "toolExecutor", { value: options.toolExecutor, writable: true, configurable: true })
 		Object.defineProperty(agent, "isDead", { get: () => options.toolExecutor.isDead === true && agent.state.isStreaming !== true })
 		if (options.toolExecutor.dispose) agent.dispose = () => options.toolExecutor.dispose()
 	}
@@ -215,7 +215,6 @@ export function createPinanoSidecarAgent(options) {
 		model: base.state.model,
 		settings: {
 			thinkingLevel: base.state.thinkingLevel,
-			autocompactThreshold: 1,
 		},
 		noContextFiles: base.contextFilesDisabled === true || base.session?.getSessionConfig?.().noContextFiles === true,
 		toolExecutor: options.toolExecutor,
