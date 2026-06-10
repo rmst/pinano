@@ -33,7 +33,7 @@ git clone https://github.com/rmst/pinano
 
 On first run, Pinano opens the model provider credentials view when no provider is configured. Pinano is currently optimized for use with a ChatGPT subscription.
 
-<details open>
+<details>
 <summary>Install and first setup demo</summary>
 
 <p>
