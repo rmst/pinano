@@ -1,6 +1,6 @@
 {
 	"name": "pinano",
-	"version": "0.0.3",
+	"version": "0.0.4",
 	"description": "AI coding assistant TUI",
 	"type": "module",
 	"bin": {
@@ -8,13 +8,16 @@
 	},
 	"files": [
 		"bin/",
-		"src/",
+		"cli/",
+		"packages/protocol/",
+		"packages/server/",
+		"packages/tui/",
 		"README.md",
-		"jsconfig.json"
+		"jsconfig.json",
+		"LICENSE"
 	],
 	"scripts": {
-		"test": "node --test --no-warnings --experimental-transform-types 'test/**/*.test.js' 'test/**/*.test.ts'",
-		"start": "node --no-warnings src/app/main.js"
+		"start": "node --no-warnings cli/main.js"
 	},
 	"engines": {
 		"node": ">=22.6.0"

@@ -49,7 +49,7 @@ API keys are also supported. Pinano can import supported API keys from the launc
 
 ```bash
 pinano                           # open the session overview
-pinano open /chat/<id>           # open a session directly
+pinano open /sessions/<id>       # open a session directly
 pinano service                   # show local service status
 pinano --help
 ```
@@ -90,6 +90,7 @@ Type `/` to autocomplete. `/help` shows the full command list for the current vi
 
 | Command | What it does |
 |---|---|
+| `/model` | select a compatible model for this session |
 | `/rewind` | rewind to an earlier prompt or switch branch |
 | `/branch` | create a new session from the current conversation branch |
 | `/context` | show context usage details |
@@ -155,17 +156,24 @@ See @README for project overview.
 @~/.pinano/personal-style.md
 ```
 
+Reusable task instructions can also be installed as local skills; see [skills](docs/skills.md).
+
 ## Repository layout
 
 ```text
-src/
-  agent-core/        AgentLoop + Agent (streamFn-driven), JSDoc types
-  ai-apis/           zero-dep OpenAI Chat-Completions / Responses / Codex clients
-  tools/             read/view_image, write, edit/apply_patch, exec_command/write_stdin, bash, ls, grep, find, js
-  fallback-tools/    PATH fallbacks for common external commands
-  session-manager/   SQLite + in-memory storage, parent-link tree
-  tui/               ported pi-tui — Markdown renderer restored with vendored marked, east-asian-width vendored
-  app/               CLI, service runtime, and terminal app UI
+cli/                         command-line composition root
+packages/
+  protocol/src/              shared transport and transcript presentation contracts
+  server/src/
+    agent-core/              AgentLoop + Agent (streamFn-driven), JSDoc types
+    ai-apis/                 zero-dep OpenAI Chat-Completions / Responses / Codex clients
+    tools/                   built-in coding and shell tools
+    fallback-tools/          PATH fallbacks for common external commands
+    session-manager/         SQLite + in-memory session storage
+    app/                     service and worker runtime
+  tui/src/
+    tui/                     reusable retained terminal UI framework
+    app/                     Pinano terminal application
 ```
 
 ## Notes

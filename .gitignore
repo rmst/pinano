@@ -2,7 +2,6 @@ node_modules/
 inspiration/
 .DS_Store
 *.log
-devrel/demo/out/
 .pinano/
 .jix/
 .vscode/

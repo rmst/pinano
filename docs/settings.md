@@ -26,7 +26,8 @@ Pinano reads settings from three layers, in order:
 		"modelIoLog": false
 	},
 	"updateCheck": true,
-	"thinkingLevel": "high"
+	"thinkingLevel": "high",
+	"showDeletedSessions": false
 }
 ```
 
@@ -43,10 +44,27 @@ Provider-level fields apply to all models under that provider:
 - `headers`: extra HTTP headers.
 - `compat`: OpenAI-compatible transport feature flags.
 - `transport`: `chat` or `responses`.
+- `codexTransport`: `auto` (prefer a cached secure WebSocket and fall back safely before output starts), `sse`, or `websocket` (force WebSocket without fallback). This only affects `openai-codex`; the default is `auto`.
 - `models`: custom or declared model entries, each with an `id`.
 - `modelOverrides`: registry model overrides keyed by model id.
 
-Model entries may set `displayName`, `extends`, `baseUrl`, `wireModel`, `contextWindow`, `maxTokens`, `reasoning`, `input`, `cost`, `headers`, `compat`, `transport`, `maintenanceModelRef`, `toolProfile`, and `tags`.
+Model entries may set `displayName`, `extends`, `baseUrl`, `wireModel`, `contextWindow`, `maxTokens`, `reasoning`, `input`, `cost`, `headers`, `compat`, `compaction`, `transport`, `codexTransport`, `maintenanceModelRef`, `toolProfile`, and `tags`.
+
+Official `openai-codex` models use explicit Responses remote-v2 compaction by default. To keep local summary compaction for a model, set `compaction.remoteResponses` to `false` in its `modelOverrides` entry:
+
+```json
+{
+	"providers": {
+		"openai-codex": {
+			"modelOverrides": {
+				"gpt-5.6-sol": {
+					"compaction": { "remoteResponses": false }
+				}
+			}
+		}
+	}
+}
+```
 
 ## Service
 
@@ -56,11 +74,16 @@ The `service` object configures the local background service:
 - `modelIoLog`: enable model I/O diagnostics.
 - `modelIoLogDb`: custom diagnostics SQLite path.
 - `diagnostics`: service trace/probe options.
-- `token`: fixed local service capability token.
+- `token`: fixed local service capability token. When unset, Pinano creates and reuses a generated token at `$PINANO_HOME/data/service-token`.
+- `workspaceRoot`: optional absolute directory root for service-managed sessions. When set, the service starts only from inside this root and user-supplied session cwd values must resolve inside it.
 
 ## Update Check
 
 `updateCheck` controls the notice-only GitHub release check shown in the session overview. It defaults to `true` for ordinary installs. When enabled, Pinano checks the public package metadata at most once per local Pinano day, where the day starts at 04:00, and briefly shows a yellow overview notice if a newer version is available. Set it to `false` in `default-settings.json` for managed deployments or in `settings.json` for a user preference.
+
+## Deleted Sessions
+
+`showDeletedSessions` controls whether the TUI session overview requests and shows soft-deleted sessions. It defaults to `false`. When set to `true`, deleted sessions appear in a separate overview section and can be restored with `Ctrl+X`.
 
 ## Credentials
 

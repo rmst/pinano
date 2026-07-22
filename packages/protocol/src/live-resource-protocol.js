@@ -1,0 +1,1 @@
+export const LIVE_RESOURCE_PROTOCOL_VERSION = 1

@@ -12,6 +12,6 @@
 		"resolveJsonModule": true,
 		"types": ["node"]
 	},
-	"include": ["src/**/*.js", "test/**/*.js"],
-	"exclude": ["node_modules", "src/tools/vendor"]
+	"include": ["cli/**/*.js", "packages/**/*.js"],
+	"exclude": ["node_modules", "packages/server/src/tools/vendor"]
 }
