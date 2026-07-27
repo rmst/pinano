@@ -328,10 +328,10 @@ export function previewLogPageResponse(options) {
 export function previewInjectScriptResponse() {
 	return new Response(`(() => {
 	const script = document.currentScript
-	const baseUrl = script && script.getAttribute("data-pinano-preview-log-page")
-	if (!baseUrl || document.getElementById("pinano-preview-log-link")) return
-	const host = document.createElement("pinano-preview-log-link")
-	host.id = "pinano-preview-log-link"
+	const baseUrl = script && script.getAttribute("data-preview-log-page")
+	if (!baseUrl || document.getElementById("cerex-preview-log-link")) return
+	const host = document.createElement("cerex-preview-log-link")
+	host.id = "cerex-preview-log-link"
 	const root = host.attachShadow ? host.attachShadow({ mode: "closed" }) : host
 	const style = document.createElement("style")
 	style.textContent = \`
@@ -393,10 +393,19 @@ svg {
 
 export function previewFrameBridgeScriptResponse() {
 	return new Response(`(() => {
-	const source = "pinano-preview-frame"
-	const target = "pinano-preview-frame-child"
-	if (window.__pinanoPreviewFrameBridge) return
-	window.__pinanoPreviewFrameBridge = true
+	const source = "cerex-preview-frame"
+	const target = "cerex-preview-frame-child"
+	if (window.__previewFrameBridge) return
+	window.__previewFrameBridge = true
+	const bridgeScript = document.currentScript
+	const documentLinks = bridgeScript?.hasAttribute("data-preview-document-links") === true
+	const openDocumentPath = bridgeScript?.getAttribute("data-preview-open-path") || ""
+	const documentPath = bridgeScript?.getAttribute("data-preview-document-path") || ""
+	const parentPostMessage = window.parent.postMessage.bind(window.parent)
+	const bridgeFetch = typeof window.fetch === "function" ? window.fetch.bind(window) : undefined
+	const stopImmediatePropagation = typeof Event === "function"
+		? Function.prototype.call.bind(Event.prototype.stopImmediatePropagation)
+		: (event) => event.stopImmediatePropagation?.()
 
 	if (window.parent !== window) {
 		// An embedded preview may call focus() after it owns keyboard focus or while handling an actual user interaction, but mount and update effects must not claim focus from the host.
@@ -440,6 +449,7 @@ export function previewFrameBridgeScriptResponse() {
 	let scrollCommandGeneration = 0
 	let applyingScrollCommand = false
 	let connected = false
+	let capability = ""
 	const zoomCommandForKeyboardEvent = (event) => {
 		if (!(event.metaKey || event.ctrlKey) || event.altKey) return ""
 		if (event.code === "Equal" || event.code === "NumpadAdd" || event.key === "=" || event.key === "+" || event.key === "Add") return "in"
@@ -452,12 +462,13 @@ export function previewFrameBridgeScriptResponse() {
 		pending = true
 		requestAnimationFrame(() => {
 			pending = false
-			window.parent.postMessage({
+			parentPostMessage({
 				source,
 				kind: "location",
 				reason,
 				href: window.location.href,
 				title: document.title || "",
+				...(documentPath ? { documentPath } : {}),
 			}, "*")
 		})
 	}
@@ -467,7 +478,7 @@ export function previewFrameBridgeScriptResponse() {
 		return maximum ? Math.min(Math.max(root.scrollTop / maximum, 0), 1) : 0
 	}
 	const postScroll = (cause, sequence) => {
-		window.parent.postMessage({
+		parentPostMessage({
 			source,
 			kind: "scroll",
 			cause,
@@ -513,8 +524,59 @@ export function previewFrameBridgeScriptResponse() {
 		if (!command) return
 		event.preventDefault()
 		event.stopImmediatePropagation()
-		window.parent.postMessage({ source, kind: "zoom", command }, "*")
+		parentPostMessage({ source, kind: "zoom", command }, "*")
 	}, true)
+
+	const anchorForClick = (event) => {
+		const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target]
+		return path.find((node) => node?.tagName?.toLowerCase?.() === "a" && typeof node.getAttribute === "function")
+	}
+	const navigateDocumentLink = async (endpoint) => {
+		if (!bridgeFetch) {
+			window.location.href = endpoint.href
+			return
+		}
+		try {
+			const response = await bridgeFetch(endpoint.href, { headers: { accept: "application/json" } })
+			if (!response.ok) throw new Error("Document link failed with status " + response.status)
+			const result = await response.json()
+			if (result?.kind === "preview" && typeof result.url === "string") window.location.href = result.url
+			else if (result?.kind === "workspace" && typeof result.url === "string" && capability) {
+				parentPostMessage({ source, kind: "open-workspace", url: result.url, capability }, "*")
+			}
+			else throw new Error("Invalid document link response")
+		} catch {
+			window.location.href = endpoint.href
+		}
+	}
+	if (documentLinks && openDocumentPath) {
+		window.addEventListener("click", (event) => {
+			if (event.defaultPrevented || !event.isTrusted || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+			const anchor = anchorForClick(event)
+			if (!anchor || anchor.hasAttribute("download")) return
+			const targetName = (anchor.getAttribute("target") || "").trim().toLowerCase()
+			if (targetName && targetName !== "_self" && targetName !== "_blank") return
+			const href = anchor.getAttribute("href")
+			if (!href || href.startsWith("#")) return
+			let resolved
+			let base
+			try {
+				base = new URL(document.baseURI || window.location.href)
+				resolved = new URL(href, base)
+			} catch {
+				return
+			}
+			if (resolved.origin !== window.location.origin || base.origin !== window.location.origin) return
+			const endpoint = new URL(openDocumentPath, window.location.origin)
+			endpoint.searchParams.set("from", base.pathname)
+			endpoint.searchParams.set("href", href)
+			event.preventDefault()
+			event.stopImmediatePropagation()
+			if (window.parent === window && targetName === "_blank") window.open(endpoint.href, "_blank", "noopener")
+			else if (window.parent === window) window.location.href = endpoint.href
+			else void navigateDocumentLink(endpoint)
+		}, true)
+	}
 
 	const title = document.querySelector("title")
 	if (title && "MutationObserver" in window) {
@@ -525,7 +587,11 @@ export function previewFrameBridgeScriptResponse() {
 		if (event.source !== window.parent) return
 		const message = event.data
 		if (!message || typeof message !== "object" || message.source !== source || message.target !== target) return
-		if (message.kind === "connect" && window.parent !== window) connected = true
+		stopImmediatePropagation(event)
+		if (message.kind === "connect" && window.parent !== window) {
+			connected = true
+			if (typeof message.capability === "string") capability = message.capability
+		}
 		else if (message.kind === "back") window.history.back()
 		else if (message.kind === "forward") window.history.forward()
 		else if (message.kind === "reload") window.location.reload()
@@ -585,6 +651,18 @@ function injectBeforeBodyEnd(html, snippet) {
 	return `${html}${snippet}`
 }
 
+export function injectPreviewFrameBridge(html, options) {
+	const scriptUrl = escapeAttribute(options.scriptUrl)
+	if (!scriptUrl) return html
+	const documentLinkAttributes = options.documentLinks
+		? ` data-preview-document-links data-preview-open-path="${escapeAttribute(options.openPath)}"`
+		: ""
+	const documentPathAttribute = options.documentPath
+		? ` data-preview-document-path="${escapeAttribute(options.documentPath)}"`
+		: ""
+	return injectBeforePageScripts(html, `<script src="${scriptUrl}" data-preview-frame-bridge${documentLinkAttributes}${documentPathAttribute}></script>`)
+}
+
 export async function injectPreviewPageScripts(response, options) {
 	if (!response.body || response.headers.get("content-encoding")) return response
 	const contentType = response.headers.get("content-type") || ""
@@ -597,8 +675,8 @@ export async function injectPreviewPageScripts(response, options) {
 	headers.delete("content-length")
 	headers.delete("content-security-policy")
 	headers.delete("content-security-policy-report-only")
-	if (frameBridgeScriptUrl) html = injectBeforePageScripts(html, `<script src="${frameBridgeScriptUrl}" data-pinano-preview-frame-bridge></script>`)
-	html = injectBeforeBodyEnd(html, `<script src="${logScriptUrl}" data-pinano-preview-log-page="${logPageUrl}" defer></script>`)
+	if (frameBridgeScriptUrl) html = injectPreviewFrameBridge(html, { scriptUrl: frameBridgeScriptUrl })
+	html = injectBeforeBodyEnd(html, `<script src="${logScriptUrl}" data-preview-log-page="${logPageUrl}" defer></script>`)
 	return new Response(html, {
 		status: response.status,
 		statusText: response.statusText,

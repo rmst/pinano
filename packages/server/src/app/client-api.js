@@ -1,13 +1,12 @@
 import { normalizeReasoningLevel } from "../../../protocol/src/reasoning.js"
 import { parseBashShortcut, recordBashShortcut, runAgentBashShortcut } from "./bash-shortcut.js"
-import { availableModelEntries, buildModel, canonicalModelRef, eligibleSessionModelEntries, modelChoice, modelEntryMatches, modelRef, parseModelRef, sessionModelEligibilityError } from "./models.js"
-import { overviewModelStatus } from "./overview-model-status.js"
-import { projectInfoForCwd } from "./project-labels.js"
-import { SESSION_ATTACHMENT_VARIANT_DISPLAY, SESSION_ATTACHMENT_VARIANT_ORIGINAL } from "./session-attachments.js"
+import { availableModelEntries, buildModel, canonicalModelRef, eligibleSessionModelEntries, modelChoice, modelEntryMatches, modelRef, parseModelRef, sessionModelEligibilityError } from "./model/registry.js"
+import { overviewModelStatus } from "./overview/model-status.js"
+import { SESSION_ATTACHMENT_VARIANT_DISPLAY, SESSION_ATTACHMENT_VARIANT_ORIGINAL } from "./session/attachments.js"
 import { loadSettings, redactedSettings, updateSetting, updateSettings } from "./settings.js"
 import { overviewDirectoryFilterUiStateKey, overviewDirectoryStateKey } from "./ui-state.js"
 import { WEB_CHAT_COMMANDS, WEB_COMMANDS, WEB_OVERVIEW_COMMANDS } from "../../../protocol/src/web-commands.js"
-import { webInitialRouteCwd, webInitialRouteFromSettings } from "./web-initial-route.js"
+import { webInitialRouteCwd, webInitialRouteFromSettings } from "./web/initial-route.js"
 
 export function json(data, status = 200, headers = {}) {
 	return new Response(JSON.stringify(data), {
@@ -35,7 +34,11 @@ export function error(message, status = 400) {
 }
 
 export function routeError(err) {
-	return error(/** @type {any} */ (err)?.message ?? String(err), /** @type {any} */ (err)?.status ?? 400)
+	const value = /** @type {any} */ (err)
+	return json({
+		error: value?.message ?? String(err),
+		...(typeof value?.code === "string" && value.code ? { code: value.code } : {}),
+	}, value?.status ?? 400)
 }
 
 export async function jsonBody(context) {
@@ -203,6 +206,7 @@ async function updateDefaultModel(ref) {
 
 const snapshotCursor = (snapshot) => {
 	const cursor = {}
+	if (typeof snapshot?.cursorGeneration === "string" && snapshot.cursorGeneration) cursor.cursorGeneration = snapshot.cursorGeneration
 	if (typeof snapshot?.seq === "number") cursor.seq = snapshot.seq
 	if (typeof snapshot?.viewEpoch === "number") cursor.viewEpoch = snapshot.viewEpoch
 	return Object.keys(cursor).length > 0 ? cursor : undefined
@@ -262,7 +266,8 @@ export function createManagerClientApi(options) {
 	const snapshot = (id, options = {}) => manager.snapshot(id || manager.initialSessionId, options)
 	const runtimeFor = (id) => manager.getRuntime(id)
 	const resolveInitialRoute = async () => options.initialRoute || await webInitialRouteFromSettings(await currentSettings(), {
-		workspaceRoot: manager.workspacePolicy?.root,
+		workspaceRoot: manager.workspaceRoot,
+		resolveDirectory: (path) => manager.workspace.paths.resolveDirectory(path, "Web initial route directory"),
 	})
 	const resolveOverviewCwd = async (cwd = undefined, fallback = options.cwd) => {
 		const requested = cwd ?? sessionListCwd ?? fallback
@@ -533,13 +538,18 @@ export function createServiceClientApi(options) {
 		return initialSessionId
 	}
 	const snapshot = async (id, snapshotOptions = {}) => client.snapshot(id || await ensureInitialSessionId(), snapshotOptions)
-	const overviewProject = (cwd = undefined) =>
-		(typeof client.overviewProject === "function"
-			? client.overviewProject(cwd ?? options.cwd)
-			: projectInfoForCwd(cwd ?? options.cwd)
-		).catch(() => undefined)
+	const overviewProject = (cwd = undefined) => {
+		const path = cwd ?? options.cwd
+		if (typeof client.overviewProject === "function") return client.overviewProject(path).catch(() => undefined)
+		if (client.workspace?.project?.info) return client.workspace.project.info(path).catch(() => undefined)
+		return Promise.resolve(undefined)
+	}
 	const resolveInitialRoute = async () => options.initialRoute || await webInitialRouteFromSettings((await client.getSettings())?.settings, {
 		workspaceRoot: options.workspaceRoot,
+		...(client.workspace?.paths?.resolveDirectory ? {
+			resolveDirectory: (path) => client.workspace.paths.resolveDirectory(path, "Web initial route directory"),
+			home: "",
+		} : {}),
 	})
 
 	return {
@@ -649,7 +659,7 @@ export function createServiceClientApi(options) {
 		deleteStoppedSession: async (id) => mutationResult(id, await client.deleteSession(id), ["session", "sessions"]),
 		restoreDeletedSession: async (id) => mutationResult(id, await client.restoreSession(id), ["session", "sessions"]),
 		setReasoning: async (id, body) => {
-			const response = await client.setThinking(id, body.level)
+			const response = await client.setReasoning(id, body.level)
 			return mutationResult(id, response)
 		},
 		setModel: async (id, body) => {

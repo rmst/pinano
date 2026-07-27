@@ -137,7 +137,7 @@ function createManualCodeEntry(onPrompt, state) {
 }
 
 function localCallbackDisabled() {
-	return process.env.PINANO_OAUTH_DISABLE_LOCALHOST_CALLBACK === "1"
+	return process.env.CEREX_OAUTH_DISABLE_LOCALHOST_CALLBACK === "1"
 }
 
 async function exchangeAuthorizationCode(code, verifier) {
@@ -293,7 +293,7 @@ export async function loginCodex({ onAuth, onPrompt, originator, signal } = {}) 
 	const { url, verifier, state } = await buildAuthorizationUrl({ originator })
 	let server
 	try {
-		if (localCallbackDisabled()) throw new Error("disabled by PINANO_OAUTH_DISABLE_LOCALHOST_CALLBACK")
+		if (localCallbackDisabled()) throw new Error("disabled by CEREX_OAUTH_DISABLE_LOCALHOST_CALLBACK")
 		server = await startCallbackServer(state)
 	} catch (err) {
 		// Port unavailable — fall back to manual paste.
@@ -315,7 +315,7 @@ export async function loginCodex({ onAuth, onPrompt, originator, signal } = {}) 
 		const manualCode = createManualCodeEntry(onPrompt, state)
 		onAuth({
 			url,
-			instructions: "A browser window should open. Complete login to finish. If the browser cannot return to Pinano, paste the code or full redirect URL here.",
+			instructions: "A browser window should open. Complete login to finish. If the browser cannot return to Cerex, paste the code or full redirect URL here.",
 			requestManualCode: manualCode?.request,
 		})
 

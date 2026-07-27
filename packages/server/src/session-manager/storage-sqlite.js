@@ -5,6 +5,7 @@ import {
 	recomputeSessionOverviewProjections,
 	updateSessionOverviewForAppendedEntry,
 } from "./session-overviews.js"
+import { normalizeLegacyEntryData, normalizeLegacyMetadata } from "./metadata-compatibility.js"
 
 /** @typedef {import("./types.js").SessionEntry} SessionEntry */
 /** @typedef {import("./types.js").SessionMetadata} SessionMetadata */
@@ -238,10 +239,10 @@ function sessionMutationRow(db, sessionId) {
 
 function assertSessionMutationAllowed(db, sessionId, expectedVersion, ownerRunId) {
 	const row = sessionMutationRow(db, sessionId)
-	if (!row) throw storageMutationError(`Session not found: ${sessionId}`, "PINANO_SESSION_NOT_FOUND")
+	if (!row) throw storageMutationError(`Session not found: ${sessionId}`, "CEREX_SESSION_NOT_FOUND")
 	const actualVersion = Number(row.mutationVersion ?? 0)
 	if (actualVersion !== expectedVersion) {
-		throw storageMutationError(`Session ${sessionId} changed in the database; reopen it before mutating.`, "PINANO_SESSION_STALE")
+		throw storageMutationError(`Session ${sessionId} changed in the database; reopen it before mutating.`, "CEREX_SESSION_STALE")
 	}
 	const actualOwnerRunId = row.mutationRunId ?? null
 	if (actualOwnerRunId !== ownerRunId) {
@@ -249,7 +250,7 @@ function assertSessionMutationAllowed(db, sessionId, expectedVersion, ownerRunId
 			actualOwnerRunId
 				? `Session ${sessionId} is being mutated by another run.`
 				: `Run ${ownerRunId} does not own session ${sessionId}.`,
-			"PINANO_SESSION_MUTATION_OWNER_MISMATCH",
+			"CEREX_SESSION_MUTATION_OWNER_MISMATCH",
 		)
 	}
 }
@@ -868,9 +869,9 @@ function entryFromRows(row, data) {
 		const custom = data.customEntries.get(row.globalId)
 		const customType = custom?.customType ?? "unknown"
 		const loadRecoveryMessage = () => data.recoveryMessageStmt.get(row.globalId)?.messageJson
-		const customData = customType === "tool_execution"
+		const customData = normalizeLegacyEntryData(customType === "tool_execution"
 			? toolExecutionDataFromRow(custom, loadRecoveryMessage)
-			: parseJson(custom?.dataJson)
+			: parseJson(custom?.dataJson))
 		return withContextLoad({ ...base, type: "custom", customType, data: customData })
 	}
 	if (row.entryType === "context") return { ...base, type: "context", contextLoad: contextLoad ?? { source: "unknown", files: [] } }
@@ -882,7 +883,7 @@ function messageFromRow(row, blockRows, usageRow) {
 	const blocks = blockRows.map(deserializeBlock)
 	const content = row.contentFormat === "string" ? (blocks[0]?.text ?? "") : blocks
 	const usage = usageFromRow(usageRow)
-	const extra = parseJson(row.extraJson, {}) ?? {}
+	const extra = normalizeLegacyMetadata(parseJson(row.extraJson, {}) ?? {})
 	const base = { role: row.role, ...extra }
 	if (row.timestamp !== null && row.timestamp !== undefined) base.timestamp = row.timestamp
 	if (row.role === "assistant") {

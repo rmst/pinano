@@ -1,6 +1,6 @@
 import { REASONING_LEVELS, reasoningLevelLabel } from "../../../../../protocol/src/reasoning.js"
 import { pickFromOverlay } from "../../components/picker.js"
-import { canonicalModelRef, parseModelRef } from "../../../../../server/src/app/models.js"
+import { canonicalModelRef, parseModelRef } from "../../../../../server/src/app/model/registry.js"
 import { defaultModelRef, loadSettings, updateSettings } from "../../../../../server/src/app/settings.js"
 
 /** @param {import("../../../../../server/src/app/settings.js").Settings | undefined} settings */

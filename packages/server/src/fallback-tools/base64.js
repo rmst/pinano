@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
-const VERSION = "pinano-base64 0.1 base64-compatible subset"
+const VERSION = "cerex-base64 0.1 base64-compatible subset"
 
 class Base64Error extends Error {
 	constructor(message, exitCode = 1) {
@@ -145,7 +145,7 @@ async function main() {
 		return await run(config)
 	} catch (err) {
 		const code = err?.exitCode ?? 1
-		process.stderr.write(`pinano base64 fallback: ${err?.message || err}\n`)
+		process.stderr.write(`cerex base64 fallback: ${err?.message || err}\n`)
 		if (code === 2) process.stderr.write("This fallback only supports common base64 usage. Install base64 for full support.\n")
 		return code
 	}

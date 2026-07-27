@@ -1,20 +1,22 @@
 #!/usr/bin/env node
-// pinano — interactive AI assistant TUI.
+// cerex — interactive AI assistant TUI.
 //
 // Usage:
-//   pinano [options]
+//   cerex [options]
 //
 // Auth: API keys and ChatGPT subscription OAuth are managed in credentials settings.
 // Stored credentials are refreshed/resolved on demand.
 
 import { readFile } from "node:fs/promises"
-import { clearReexecSupervisorEnv, reexecRuntime, staleRuntimeReexecEnvPatch } from "../packages/server/src/app/reexec-runtime.js"
-import { applyProcessTitleForArgs } from "../packages/server/src/app/process-title.js"
+import { clearReexecSupervisorEnv, reexecRuntime, staleRuntimeReexecEnvPatch } from "../packages/server/src/app/runtime/reexec.js"
+import { applyProcessTitleForArgs } from "../packages/server/src/app/runtime/process-title.js"
 import { WEB_BROWSER_UI_NAME } from "../packages/protocol/src/web-branding.js"
+import { applyProductEnvAliases, productErrorCodeMatches } from "../packages/protocol/src/product.js"
 
+applyProductEnvAliases(process.env)
 clearReexecSupervisorEnv()
 
-const NO_MODEL_PROVIDER_CLI_MESSAGE = "No model provider configured. Run `pinano open /settings/credentials` to add your ChatGPT subscription or an API key."
+const NO_MODEL_PROVIDER_CLI_MESSAGE = "No model provider configured. Run `cerex open /settings/credentials` to add your ChatGPT subscription or an API key."
 
 async function loadWebMode() {
 	try {
@@ -32,8 +34,7 @@ async function loadWebMode() {
  * @property {string} cwd
  * @property {boolean} help
  * @property {boolean} version
- * @property {"print" | "bg" | "logs" | "stop"} [sessionCommand]
- * @property {"text" | "json"} mode
+ * @property {"bg" | "logs" | "stop"} [sessionCommand]
  * @property {string[]} messages
  * @property {boolean} noContextFiles
  * @property {boolean} web
@@ -48,10 +49,10 @@ async function loadWebMode() {
  * @property {boolean} [serviceIdleShutdown]
  * @property {boolean} [serviceStatusJson]
  * @property {string} [commandArg]
- * @property {import("../packages/server/src/app/routes.js").PinanoRoute} [route]
+ * @property {import("../packages/server/src/app/navigation/routes.js").AppRoute} [route]
  */
 
-const HIDDEN_SESSION_SURFACE = "`pinano session` is a hidden, deferred CLI surface. It is kept for development but may not work correctly yet."
+const HIDDEN_SESSION_SURFACE = "`cerex session` is a hidden, deferred CLI surface. It is kept for development but may not work correctly yet."
 
 /** @param {string} message */
 function failUsage(message) {
@@ -80,27 +81,21 @@ function optionValue(argv, index, option) {
  */
 function parseSessionCommand(argv, index, args) {
 	const subcommand = argv[index + 1]
-	if (!subcommand) failUsage(`${HIDDEN_SESSION_SURFACE}\nUse one of: pinano session print|bg|logs|stop.`)
-	if (subcommand !== "print" && subcommand !== "bg" && subcommand !== "logs" && subcommand !== "stop") {
+	if (!subcommand) failUsage(`${HIDDEN_SESSION_SURFACE}\nUse one of: cerex session bg|logs|stop.`)
+	if (subcommand !== "bg" && subcommand !== "logs" && subcommand !== "stop") {
 		failUsage(`Unknown session command: ${subcommand}.`)
 	}
 	args.sessionCommand = subcommand
 	let i = index + 2
 	if (subcommand === "logs" || subcommand === "stop") {
 		args.commandArg = argv[i]
-		if (!args.commandArg) failUsage(`pinano session ${subcommand} requires a session id`)
-		if (argv[i + 1] !== undefined) failUsage(`Unexpected argument for pinano session ${subcommand}: ${argv[i + 1]}`)
+		if (!args.commandArg) failUsage(`cerex session ${subcommand} requires a session id`)
+		if (argv[i + 1] !== undefined) failUsage(`Unexpected argument for cerex session ${subcommand}: ${argv[i + 1]}`)
 		return argv.length
 	}
 	while (i < argv.length) {
 		const arg = argv[i]
-		if (arg === "--mode") {
-			if (subcommand !== "print") failUsage("--mode is only supported by `pinano session print`.")
-			const [mode, nextIndex] = optionValue(argv, i, "--mode")
-			if (mode === "text" || mode === "json") args.mode = mode
-			else failUsage(`Invalid --mode "${mode}". Use "text" or "json".`)
-			i = nextIndex + 1
-		} else if (arg === "--no-context-files") {
+		if (arg === "--no-context-files") {
 			args.noContextFiles = true
 			i++
 		} else {
@@ -121,7 +116,6 @@ function parseArgs(argv) {
 		cwd: process.cwd(),
 		help: false,
 		version: false,
-		mode: "text",
 		messages: [],
 		noContextFiles: false,
 		web: false,
@@ -132,8 +126,7 @@ function parseArgs(argv) {
 		if (arg === "--help" || arg === "-h") args.help = true
 		else if (arg === "--version" || arg === "-v") args.version = true
 		else if (arg === "--no-context-files") args.noContextFiles = true
-		else if (arg === "--cwd") failUsage("--cwd was removed. Run `cd <path> && pinano` instead.")
-		else if (arg === "--mode") failUsage("--mode is only supported by the hidden `pinano session print` command.")
+		else if (arg === "--cwd") failUsage("--cwd was removed. Run `cd <path> && cerex` instead.")
 		else if (arg === "--web" || arg === "web") args.web = true
 		else if (arg === "service") {
 			const next = argv[i + 1]
@@ -152,7 +145,7 @@ function parseArgs(argv) {
 			} else if (next === undefined || next.startsWith("-")) {
 				args.command = "service-status"
 			} else {
-				failUsage(`Unknown service command: ${next}. Use \`pinano service status\`, \`pinano service start\`, or \`pinano service stop\`.`)
+				failUsage(`Unknown service command: ${next}. Use \`cerex service status\`, \`cerex service start\`, or \`cerex service stop\`.`)
 			}
 		}
 		else if (arg === "--foreground" || arg === "--fg") args.serviceForeground = true
@@ -166,14 +159,13 @@ function parseArgs(argv) {
 		else if (arg === "--service-run-id") [args.serviceRunId, i] = optionValue(argv, i, arg)
 		else if (arg === "--service-claim-id") [args.serviceClaimId, i] = optionValue(argv, i, arg)
 		else if (arg === "--service-lifecycle-operation-id") [args.serviceLifecycleOperationId, i] = optionValue(argv, i, arg)
-		else if (arg === "service-status") failUsage("`pinano service-status` was removed. Use `pinano service status`.")
-		else if (arg === "--bg") failUsage("Top-level `--bg` was removed. The deferred helper is `pinano session bg`.")
-		else if (arg === "-p" || arg === "--print") failUsage("Top-level print mode was removed. The deferred helper is `pinano session print`.")
+		else if (arg === "service-status") failUsage("`cerex service-status` was removed. Use `cerex service status`.")
+		else if (arg === "--bg") failUsage("Top-level `--bg` was removed. The deferred helper is `cerex session bg`.")
 		else if (arg === "open") {
 			args.command = "open"
 			args.commandArg = argv[++i]
 		}
-		else if (arg === "logs" || arg === "stop") failUsage(`Top-level \`pinano ${arg}\` was removed. The deferred helper is \`pinano session ${arg}\`.`)
+		else if (arg === "logs" || arg === "stop") failUsage(`Top-level \`cerex ${arg}\` was removed. The deferred helper is \`cerex session ${arg}\`.`)
 		else if (arg === "session") i = parseSessionCommand(argv, i, args) - 1
 		else if (arg === "--json") args.serviceStatusJson = true
 		else if (!arg.startsWith("-")) {
@@ -185,29 +177,29 @@ function parseArgs(argv) {
 	if (!args.help && !args.version) {
 		if (args.command === "open" && !args.commandArg) failUsage("open requires a route: /browse, /sessions/<id>, or /settings/credentials")
 		if ((args.serviceHost || args.servicePort !== undefined || args.serviceRunId || args.serviceClaimId || args.serviceLifecycleOperationId) && !args.serviceRun) {
-			failUsage("Service internals require `pinano service run`.")
+			failUsage("Service internals require `cerex service run`.")
 		}
 		if (args.serviceRun && args.servicePort === undefined) {
 			failUsage("service run requires --service-port")
 		}
 		if (args.serviceStatusJson && args.command !== "service-status") {
-			failUsage("--json is only supported with `pinano service status`.")
+			failUsage("--json is only supported with `cerex service status`.")
 		}
 		if (args.serviceForeground && args.command !== "service-start") {
-			failUsage("--foreground is only supported with `pinano service start`.")
+			failUsage("--foreground is only supported with `cerex service start`.")
 		}
 		if (args.serviceIdleShutdown && !(args.command === "service-start" && args.serviceForeground)) {
-			failUsage("--idle-shutdown is only supported with `pinano service start --foreground`.")
+			failUsage("--idle-shutdown is only supported with `cerex service start --foreground`.")
 		}
-		if (args.messages.length > 0 && args.sessionCommand !== "print" && args.sessionCommand !== "bg") {
-			failUsage("Unexpected prompt text. Open Pinano without arguments, or use the hidden `pinano session print` / `pinano session bg` helpers.")
+		if (args.messages.length > 0 && args.sessionCommand !== "bg") {
+			failUsage("Unexpected prompt text. Open Cerex without arguments, or use the hidden `cerex session bg` helper.")
 		}
 	}
 	return args
 }
 
 function webDisabledMessage() {
-	return `${WEB_BROWSER_UI_NAME} is disabled. Set "web": true in $PINANO_HOME/default-settings.json or settings.json to enable it.`
+	return `${WEB_BROWSER_UI_NAME} is disabled. Set "web": true in $CEREX_HOME/default-settings.json or settings.json to enable it.`
 }
 
 function serviceEndpointLabel(info) {
@@ -217,18 +209,18 @@ function serviceEndpointLabel(info) {
 }
 
 function printServiceRunning(info) {
-	console.log(`pinano service running at ${serviceEndpointLabel(info)}`)
+	console.log(`cerex service running at ${serviceEndpointLabel(info)}`)
 }
 
 function serviceStopFailureMessage(result) {
-	if (result?.reason === "busy") return "Pinano service is busy; stop running sessions before stopping the service."
-	if (result?.reason === "timeout") return "Timed out waiting for Pinano service to stop."
-	return result?.error || "Failed to stop Pinano service."
+	if (result?.reason === "busy") return "Cerex service is busy; stop running sessions before stopping the service."
+	if (result?.reason === "timeout") return "Timed out waiting for Cerex service to stop."
+	return result?.error || "Failed to stop Cerex service."
 }
 
 async function packageVersion() {
 	const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf-8"))
-	if (typeof pkg.version !== "string" || !pkg.version) throw new Error("Pinano package.json is missing a version")
+	if (typeof pkg.version !== "string" || !pkg.version) throw new Error("Cerex package.json is missing a version")
 	return pkg.version
 }
 
@@ -243,17 +235,17 @@ function printHelp(args, settings) {
 /** @param {import("../packages/server/src/app/settings.js").Settings} settings */
 function mainHelpLines(settings) {
 	const usage = [
-		"  pinano                           # dispatch and monitor service sessions",
-		"  pinano open /browse              # open the session overview",
-		"  pinano open /sessions/<id>       # open a service session",
-		"  pinano open /settings/credentials # manage model provider credentials",
-		...(settings.web ? [`  pinano web                       # open ${WEB_BROWSER_UI_NAME}`] : []),
-		"  pinano service status [--json]  # show service status",
-		"  pinano service start [--foreground] # start the service",
-		"  pinano service stop             # stop the service",
+		"  cerex                           # dispatch and monitor service sessions",
+		"  cerex open /browse              # open the file explorer and session overview",
+		"  cerex open /sessions/<id>       # open a service session",
+		"  cerex open /settings/credentials # manage model provider credentials",
+		...(settings.web ? [`  cerex web                       # open ${WEB_BROWSER_UI_NAME}`] : []),
+		"  cerex service status [--json]  # show service status",
+		"  cerex service start [--foreground] # start the service",
+		"  cerex service stop             # stop the service",
 	]
 	return [
-		"pinano — interactive AI assistant",
+		"cerex — interactive AI assistant",
 		"",
 		"Usage:",
 		...usage,
@@ -268,27 +260,27 @@ function mainHelpLines(settings) {
 
 function serviceHelpLines() {
 	return [
-		"pinano service — service lifecycle",
+		"cerex service — service lifecycle",
 		"",
 		"Usage:",
-		"  pinano service status [--json]",
-		"  pinano service start [--foreground]",
-		"  pinano service stop",
+		"  cerex service status [--json]",
+		"  cerex service start [--foreground]",
+		"  cerex service stop",
 		"",
-		"`pinano service start` starts the background service and starts Web when web is enabled in settings.",
-		"`pinano service start --foreground` runs the same service in the current process for service managers.",
+		"`cerex service start` starts the background service and starts Web when web is enabled in settings.",
+		"`cerex service start --foreground` runs the same service in the current process for service managers.",
 	]
 }
 
 function webHelpLines() {
 	return [
-		`pinano web — ${WEB_BROWSER_UI_NAME}`,
+		`cerex web — ${WEB_BROWSER_UI_NAME}`,
 		"",
 		"Usage:",
-		"  pinano web",
+		"  cerex web",
 		"",
 		"Web uses the authenticated local service endpoint.",
-		"Endpoint and public URL defaults are read from service.web in Pinano settings.",
+		"Endpoint and public URL defaults are read from service.web in Cerex settings.",
 		`Use /web in the TUI to open ${WEB_BROWSER_UI_NAME}.`,
 	]
 }
@@ -308,7 +300,7 @@ function staleRuntimeDetails(err) {
 	let cur = /** @type {any} */ (err)
 	while (cur) {
 		const text = `${cur?.message ?? cur}`
-		if (cur?.code === "PINANO_STALE_RUNTIME" || /\bpinano client is stale\b/i.test(text)) {
+		if (productErrorCodeMatches(cur, "CEREX_STALE_RUNTIME") || /\b(?:cerex|pinano) client is stale\b/i.test(text)) {
 			return { desiredRuntime: cur.desiredRuntime, reason: cur.reason }
 		}
 		cur = cur.cause
@@ -335,7 +327,7 @@ async function reexecForStaleRuntime(err, cliArgs = process.argv.slice(2)) {
 	} catch {
 		return false
 	}
-	console.error("Pinano was updated; reopening…")
+	console.error("Cerex was updated; reopening…")
 	const runtimeArgs = runtime === process.execPath
 		? [...(process.execArgv ?? []), target, ...cliArgs]
 		: [target, ...cliArgs]
@@ -354,7 +346,7 @@ function shouldAutoInstallBundledBubblewrap(args) {
 
 async function autoInstallBundledBubblewrapForStartup(args) {
 	if (!shouldAutoInstallBundledBubblewrap(args)) return
-	const { bestEffortAutoInstallBundledBubblewrap } = await import("../packages/server/src/app/bundled-bwrap.js")
+	const { bestEffortAutoInstallBundledBubblewrap } = await import("../packages/server/src/app/sandbox/bwrap/bundled.js")
 	await bestEffortAutoInstallBundledBubblewrap()
 }
 
@@ -368,24 +360,22 @@ async function main() {
 	await autoInstallBundledBubblewrapForStartup(args)
 
 	const [
-		{ loadSettings, pinanoStateMountFromSettings },
+		{ loadSettings, stateMountFromSettings },
 		{ availableModelEntries, buildModel, modelEntryMatches, resolveModelWithProviderMetadata },
-		{ buildProjectContextMessage, isProjectContextMessage },
-		{ runPrintMode },
+		{ isProjectContextMessage },
 		{ installStderrCapture },
-		{ createPinanoAgent, createPinanoSidecarAgent },
+		{ createAgentRuntime, createSidecarAgentRuntime },
 		{ overviewRoute, parseRouteArg, routeToArg, sessionRoute },
 		{ initialEnvironmentContextFor },
 		{ previewPublicUrlFromSettings },
 	] = await Promise.all([
 		import("../packages/server/src/app/settings.js"),
-		import("../packages/server/src/app/models.js"),
-		import("../packages/server/src/app/project-context.js"),
-		import("../packages/server/src/app/print-mode.js"),
+		import("../packages/server/src/app/model/registry.js"),
+		import("../packages/server/src/app/project/context.js"),
 		import("../packages/server/src/app/stderr-capture.js"),
-		import("../packages/server/src/app/agent-factory.js"),
-		import("../packages/server/src/app/routes.js"),
-		import("../packages/server/src/app/environment-context.js"),
+		import("../packages/server/src/app/agent/factory.js"),
+		import("../packages/server/src/app/navigation/routes.js"),
+		import("../packages/server/src/app/environment/context.js"),
 		import("../packages/server/src/app/preview/manifest.js"),
 	])
 
@@ -407,7 +397,7 @@ async function main() {
 	}
 
 	const availableModels = await availableModelEntries(settings)
-	if (availableModels.length === 0 && (args.sessionCommand === "print" || args.sessionCommand === "bg")) {
+	if (availableModels.length === 0 && args.sessionCommand === "bg") {
 		console.error(NO_MODEL_PROVIDER_CLI_MESSAGE)
 		process.exit(2)
 	}
@@ -418,47 +408,42 @@ async function main() {
 		: await resolveModelWithProviderMetadata(settings.defaultModel, { providers: settings.providers })
 
 	const environmentContextOptions = (currentSettings = settings) => ({
-		pinanoStateMount: pinanoStateMountFromSettings(currentSettings),
+		stateMount: stateMountFromSettings(currentSettings),
 		previewPublicUrl: previewPublicUrlFromSettings(currentSettings),
 	})
-	const createAgent = ({ cwd = args.cwd, toolExecutor = undefined, settings: currentSettings = settings } = {}) => createPinanoAgent({
-		cwd,
-		model,
-		settings,
-		noContextFiles: args.noContextFiles,
-		environmentContext: () => initialEnvironmentContextFor(cwd, undefined, environmentContextOptions(currentSettings)),
-		...(toolExecutor ? { toolExecutor } : {}),
-	})
-	const createServiceAgentFactory = (ToolExecutorRuntime) => ({ cwd, getSettings }) => {
+	const createServiceAgentFactory = () => ({ cwd, getSettings, workspace, previewAccessToken }) => {
 		const currentSettings = () => getSettings?.() ?? settings
-		const createExecutor = (getAgent) => new ToolExecutorRuntime({
+		const createExecutor = (getAgent) => workspace.openToolExecutor({
 			cwd,
 			getSettings: currentSettings,
 			getSession: () => getAgent()?.session,
-			pinanoApiRequest: (request) => {
+			previewAccessToken,
+			codeModeApiRequest: (request) => {
 				const target = getAgent()
-				if (!target?.pinanoApiRequest) throw new Error("Pinano JS API is unavailable for this session")
-				return target.pinanoApiRequest(request)
+				if (!target?.codeModeApiRequest) throw new Error("Cerex JS API is unavailable for this session")
+				return target.codeModeApiRequest(request)
 			},
 		})
 		let agent
 		const executor = createExecutor(() => agent)
-		agent = createPinanoAgent({
+		agent = createAgentRuntime({
 			cwd,
 			model,
 			settings,
 			noContextFiles: args.noContextFiles,
 			toolExecutor: executor,
+			workspace,
 			environmentContext: () => initialEnvironmentContextFor(cwd, undefined, environmentContextOptions(currentSettings())),
 		})
 		agent.createSidecarAgent = (sidecarOptions) => {
 			let sidecar
 			const sidecarExecutor = createExecutor(() => sidecar)
-			sidecar = createPinanoSidecarAgent({
+			sidecar = createSidecarAgentRuntime({
 				cwd,
 				baseAgent: agent,
 				messages: sidecarOptions.messages,
 				toolExecutor: sidecarExecutor,
+				workspace,
 				transformContext: sidecarOptions.transformContext,
 				afterToolCall: sidecarOptions.afterToolCall,
 			})
@@ -469,7 +454,6 @@ async function main() {
 
 	if (args.serviceRun) {
 		const { runService } = await import("../packages/server/src/app/service/index.js")
-		const { ToolExecutorRuntime } = await import("../packages/server/src/app/tool-executor-runtime.js")
 		await runService({
 			cwd: args.cwd,
 			host: args.serviceHost,
@@ -479,7 +463,7 @@ async function main() {
 			serviceLifecycleOperationId: args.serviceLifecycleOperationId,
 			noContextFiles: args.noContextFiles,
 			loadWebMode,
-			createAgent: createServiceAgentFactory(ToolExecutorRuntime),
+			createAgent: createServiceAgentFactory(),
 		})
 		return
 	}
@@ -489,17 +473,15 @@ async function main() {
 		if (args.serviceForeground) {
 			const existing = await serviceStatus({ cwd: args.cwd })
 			if (existing.alive) {
-				console.error(`Pinano service is already running at ${serviceEndpointLabel(existing.info)}. Stop it first with \`pinano service stop\`.`)
+				console.error(`Cerex service is already running at ${serviceEndpointLabel(existing.info)}. Stop it first with \`cerex service stop\`.`)
 				process.exit(1)
 			}
 			const [
 				{ runService },
 				{ configuredServiceEndpointDefaults },
-				{ ToolExecutorRuntime },
 			] = await Promise.all([
 				import("../packages/server/src/app/service/index.js"),
-				import("../packages/server/src/app/service-config.js"),
-				import("../packages/server/src/app/tool-executor-runtime.js"),
+				import("../packages/server/src/app/service/config.js"),
 			])
 			const endpoint = configuredServiceEndpointDefaults()
 			const service = await runService({
@@ -511,7 +493,7 @@ async function main() {
 				allowPortFallback: false,
 				startWeb: settings.web === true,
 				loadWebMode,
-				createAgent: createServiceAgentFactory(ToolExecutorRuntime),
+				createAgent: createServiceAgentFactory(),
 			}).catch(async (err) => {
 				await reexecForStaleRuntime(err)
 				throw err
@@ -553,14 +535,14 @@ async function main() {
 		const { stopService } = await import("../packages/server/src/app/service/index.js")
 		const result = await stopService()
 		if (result.reason === "not_running") {
-			console.log("pinano service not running")
+			console.log("cerex service not running")
 			return
 		}
 		if (!result.stopped) {
 			console.error(serviceStopFailureMessage(result))
 			process.exit(1)
 		}
-		console.log("pinano service stopped")
+		console.log("cerex service stopped")
 		return
 	}
 
@@ -575,7 +557,7 @@ async function main() {
 	if (args.sessionCommand === "bg") {
 		const prompt = args.messages.join(" ").trim()
 		if (!prompt) {
-			console.error("pinano session bg requires a prompt")
+			console.error("cerex session bg requires a prompt")
 			process.exit(2)
 		}
 		const { dispatchBackground } = await import("../packages/server/src/app/service/index.js")
@@ -588,12 +570,12 @@ async function main() {
 			throw err
 		})
 		const shortId = result.sessionId.slice(0, 8)
-		const openCommand = `pinano open ${routeToArg(sessionRoute(result.sessionId))}`
+		const openCommand = `cerex open ${routeToArg(sessionRoute(result.sessionId))}`
 		console.log(`backgrounded · ${shortId}`)
-		console.log(`  pinano                         list sessions`)
+		console.log(`  cerex                         list sessions`)
 		console.log(`  ${openCommand.padEnd(31)} open in this terminal`)
-		console.log(`  pinano session logs ${result.sessionId}    show transcript`)
-		console.log(`  pinano session stop ${result.sessionId}    abort this session`)
+		console.log(`  cerex session logs ${result.sessionId}    show transcript`)
+		console.log(`  cerex session stop ${result.sessionId}    abort this session`)
 		return
 	}
 
@@ -647,24 +629,6 @@ async function main() {
 		return
 	}
 
-	// Print mode is hermetic: no session creation, no index work.
-	if (args.sessionCommand === "print") {
-		const { ToolExecutorRuntime } = await import("../packages/server/src/app/tool-executor-runtime.js")
-		const executor = new ToolExecutorRuntime({ cwd: args.cwd, getSettings: () => settings })
-		const agent = createAgent({ cwd: args.cwd, toolExecutor: executor })
-		let code = 1
-		try {
-			if (!args.noContextFiles) {
-				const ctxMsg = buildProjectContextMessage(args.cwd)
-				if (ctxMsg) agent.state.messages = [ctxMsg]
-			}
-			code = await runPrintMode(agent, { mode: args.mode, messages: args.messages })
-		} finally {
-			agent.dispose?.()
-		}
-		process.exit(code)
-	}
-
 	if (args.web) {
 		const { runWebMode } = await loadWebMode()
 		await runWebMode({
@@ -699,7 +663,7 @@ async function main() {
 }
 
 main().catch((err) => {
-	/** @type {any} */ (process).__pinanoStderrCapture?.setForwarding?.(true)
+	/** @type {any} */ (process).__stderrCapture?.setForwarding?.(true)
 	console.error(err)
 	process.exit(1)
 })

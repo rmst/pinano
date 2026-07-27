@@ -3,6 +3,7 @@ import {
 	BASH_SHORTCUT_MESSAGE_ROLE,
 	bashShortcutOverviewMessageForEntry,
 } from "./bash-shortcut-entry.js"
+import { normalizeLegacyMessage } from "./metadata-compatibility.js"
 
 const SESSION_OVERVIEW_BATCH_SIZE = 200
 
@@ -10,11 +11,11 @@ export const HIDDEN_MESSAGE_EXTRA_SQL = `
 	em.extra_json IS NOT NULL
 	AND json_valid(em.extra_json)
 	AND (
-		COALESCE(json_extract(em.extra_json, '$.pinanoAutomated'), 0) = 1
-		OR COALESCE(json_extract(em.extra_json, '$.pinanoHidden'), 0) = 1
-		OR COALESCE(json_extract(em.extra_json, '$.pinanoCompactionMemento'), 0) = 1
-		OR COALESCE(json_extract(em.extra_json, '$.pinanoCompactionSummary'), 0) = 1
-		OR json_type(em.extra_json, '$.pinanoMaintenance') IS NOT NULL
+		COALESCE(json_extract(em.extra_json, '$.automated'), json_extract(em.extra_json, '$.pinanoAutomated'), 0) = 1
+		OR COALESCE(json_extract(em.extra_json, '$.hidden'), json_extract(em.extra_json, '$.pinanoHidden'), 0) = 1
+		OR COALESCE(json_extract(em.extra_json, '$.compactionMemento'), json_extract(em.extra_json, '$.pinanoCompactionMemento'), 0) = 1
+		OR COALESCE(json_extract(em.extra_json, '$.compactionSummary'), json_extract(em.extra_json, '$.pinanoCompactionSummary'), 0) = 1
+		OR COALESCE(json_type(em.extra_json, '$.maintenance'), json_type(em.extra_json, '$.pinanoMaintenance')) IS NOT NULL
 	)
 `
 
@@ -38,12 +39,13 @@ function flagSet(value) {
 }
 
 export function visibleOverviewMessage(message) {
+	message = normalizeLegacyMessage(message)
 	if (!message) return undefined
-	if (flagSet(message.pinanoAutomated)) return undefined
-	if (flagSet(message.pinanoHidden)) return undefined
-	if (flagSet(message.pinanoCompactionMemento)) return undefined
-	if (flagSet(message.pinanoCompactionSummary)) return undefined
-	if (hasOwn(message, "pinanoMaintenance")) return undefined
+	if (flagSet(message.automated)) return undefined
+	if (flagSet(message.hidden)) return undefined
+	if (flagSet(message.compactionMemento)) return undefined
+	if (flagSet(message.compactionSummary)) return undefined
+	if (hasOwn(message, "maintenance")) return undefined
 	if (message.role === "user" && flagSet(message.projectContext)) return undefined
 	return message
 }

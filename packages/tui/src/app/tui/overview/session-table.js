@@ -1,11 +1,11 @@
 import { isAbsolute, resolve } from "node:path"
 import { ListViewportController, MouseWheelDeltaTracker, TUI, clickableRowSpan, clipLinesToViewport, truncateToWidth, visibleWidth } from "../../../tui/index.js"
-import { DEFERRED_FOLDED_GROUP_LIMIT, OVERVIEW_AGENT_PRIORITY, overviewLifecycleStateFor, overviewSortTimestampFor, overviewStateFor } from "../../../../../server/src/app/overview-state.js"
-import { projectHeaderLabel } from "../../../../../server/src/app/project-display.js"
-import { projectNamesEqual } from "../../../../../server/src/app/project-labels.js"
-import { runAcknowledgementKind } from "../../../../../server/src/app/run-acknowledgement.js"
-import { pathIsWithin } from "../../../../../server/src/app/sandbox-paths.js"
-import { sessionOverviewContextMenuItems } from "../../../../../server/src/app/session-overview-context-menu.js"
+import { OVERVIEW_AGENT_PRIORITY, OVERVIEW_FOLDED_GROUP_LIMIT, overviewLifecycleStateFor, overviewSortTimestampFor, overviewStateFor } from "../../../../../server/src/app/overview/state.js"
+import { projectHeaderLabel } from "../../../../../server/src/app/project/display.js"
+import { projectNamesEqual } from "../../../../../server/src/app/project/labels.js"
+import { runAcknowledgementKind } from "../../../../../server/src/app/overview/run-acknowledgement.js"
+import { pathIsWithin } from "../../../../../server/src/app/sandbox/paths.js"
+import { sessionOverviewContextMenuItems } from "../../../../../server/src/app/session/overview-context-menu.js"
 import { theme } from "../../theme.js"
 import { compactHomePath, explicitProjectOverrideLabel, fit, leftRightLine, projectLabel, sessionRowCanStillBeQueued, sessionRowIsRunning, shortSessionId, singleLine, stripAnsi } from "../format.js"
 import { formatOverviewWorktreeInfo, worktreeRowSignalText } from "../session/status.js"
@@ -28,7 +28,7 @@ const overviewRowIsFallbackSelectable = (row) => row?.type !== "more"
 
 /**
  * @typedef {{ type: "session", session: any } | { type: "more", row: any }} AgentTableActivation
- * @typedef {{ type: "session", session: any, event: import("../tui/tui.js").TuiMouseEvent }} AgentTableContextMenu
+ * @typedef {{ type: "session", session: any, event: import("../../../tui/tui.js").TuiMouseEvent }} AgentTableContextMenu
  */
 
 export class AgentTable {
@@ -326,7 +326,7 @@ export class AgentTable {
 			if (!group) return
 			const foldable = group === "Deferred"
 			const expanded = this.expandedGroups.has(group) || this.filter
-			const visible = foldable && !expanded ? groupSessions.slice(0, DEFERRED_FOLDED_GROUP_LIMIT) : groupSessions
+			const visible = foldable && !expanded ? groupSessions.slice(0, OVERVIEW_FOLDED_GROUP_LIMIT) : groupSessions
 			out.push(...visible)
 			const hidden = groupSessions.length - visible.length
 			if (hidden > 0) out.push({ type: "more", id: `more:${group}`, group, count: hidden })
@@ -423,7 +423,7 @@ export class AgentTable {
 		)
 	}
 
-	/** @param {string} id @param {import("../tui/tui.js").TuiMouseEvent} event */
+	/** @param {string} id @param {import("../../../tui/tui.js").TuiMouseEvent} event */
 	handleSessionRowContextMenu(id, event) {
 		if (!this.selectSessionId(id, { anchorSelection: false })) {
 			this.resetRowClick()
@@ -489,7 +489,7 @@ export class AgentTable {
 		return changed
 	}
 
-	/** @param {import("../tui/tui.js").TuiMouseEvent} event */
+	/** @param {import("../../../tui/tui.js").TuiMouseEvent} event */
 	handleMouseEvent(event) {
 		const delta = this.wheelDeltas.deltaFromEvent(event)
 		if (delta === 0) return { consume: false }
@@ -543,7 +543,7 @@ export class AgentTable {
 
 	/**
 	 * @param {number} width
-	 * @returns {{ lines: string[], spans: import("../tui/render-frame.js").RenderSpan[] }}
+	 * @returns {{ lines: string[], spans: import("../../../tui/render-frame.js").RenderSpan[] }}
 	 */
 	renderFrame(width) {
 		const maxLines = this.getMaxLines?.(width)
@@ -567,7 +567,7 @@ export class AgentTable {
 			bottomIndicator: (hidden) => theme.dim(fit(`↓ ${hidden} more`, width)),
 		})
 		this.viewportSelection.commitScrollOffset(viewport.scrollOffset)
-		/** @type {import("../tui/render-frame.js").RenderSpan[]} */
+		/** @type {import("../../../tui/render-frame.js").RenderSpan[]} */
 		const spans = []
 		for (let i = 0; i < viewport.sourceLineIndexes.length; i++) {
 			const sourceLine = viewport.sourceLineIndexes[i]
@@ -616,13 +616,13 @@ export class AgentTable {
 
 	/**
 	 * @param {number} width
-	 * @returns {{ lines: string[], spans: import("../tui/render-frame.js").RenderSpan[], selectedLine: number }}
+	 * @returns {{ lines: string[], spans: import("../../../tui/render-frame.js").RenderSpan[], selectedLine: number }}
 	 */
 	renderBodyFrame(width) {
 		const rows = this.rows()
 		/** @type {string[]} */
 		const lines = []
-		/** @type {import("../tui/render-frame.js").RenderSpan[]} */
+		/** @type {import("../../../tui/render-frame.js").RenderSpan[]} */
 		const spans = []
 		let selectedLine = 0
 
@@ -742,8 +742,8 @@ export class AgentTable {
 		if (this.isRunningSession(session)) return theme.cyan(this.spinnerFrame() || "✽")
 		const acknowledgementKind = runAcknowledgementKind(session)
 		if (acknowledgementKind === "problem") return theme.red("✖")
-		if (acknowledgementKind === "stopped") return theme.dim("Ⅱ")
-		if (runtimeState === "paused") return theme.dim("Ⅱ")
+		if (acknowledgementKind === "stopped") return theme.dim("⏸")
+		if (runtimeState === "paused") return theme.dim("⏸")
 		return theme.gray("∙")
 	}
 
@@ -858,7 +858,7 @@ export const overviewContextMenuTheme = {
  * @param {AgentTable} table
  * @param {any} session
  * @param {{ open?: () => void, markCompleted?: () => void, markDeferred?: () => void, lifecycle?: () => void }} handlers
- * @returns {import("../tui/components/context-menu.js").ContextMenuItem[]}
+ * @returns {import("../../../tui/components/context-menu.js").ContextMenuItem[]}
  */
 export function overviewSessionContextMenuItems(table, session, handlers = {}) {
 	if (!session) return []

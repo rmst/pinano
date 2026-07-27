@@ -1,5 +1,7 @@
 import { LIVE_RESOURCE_PROTOCOL_VERSION } from "./live-resource-protocol.js"
 
+import { canonicalProductErrorCode } from "./product.js"
+
 const DEFAULT_RECONNECT_DELAY_MS = 250
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 10_000
 const DEFAULT_SUBSCRIPTION_RETRY_DELAY_MS = 500
@@ -12,7 +14,7 @@ function socketIsOpen(socket) {
 function connectionClosedError(event) {
 	const detail = typeof event?.reason === "string" && event.reason ? `: ${event.reason}` : ""
 	return Object.assign(new Error(`Live connection closed${detail}`), {
-		code: "PINANO_LIVE_CONNECTION_CLOSED",
+		code: "CEREX_LIVE_CONNECTION_CLOSED",
 		closeCode: event?.code,
 	})
 }
@@ -27,7 +29,7 @@ function retryableSubscriptionError(message) {
 		|| status === 429
 }
 
-/** Runtime-independent multiplexed client for the Pinano live-resource protocol. onOpen reports a transport handshake; onReady reports that an individual subscription is established. Environment wrappers own URL construction and visibility/runtime lifecycle. */
+/** Runtime-independent multiplexed client for the Cerex live-resource protocol. onOpen reports a transport handshake; onReady reports that an individual subscription is established. Environment wrappers own URL construction and visibility/runtime lifecycle. */
 export class LiveResourceClient {
 	constructor(options = {}) {
 		this.options = options
@@ -208,6 +210,7 @@ export class LiveResourceClient {
 			subscription.failed = true
 			const error = Object.assign(new Error(message.error || "Live resource error"), {
 				...(Number.isSafeInteger(message.status) ? { status: message.status } : {}),
+				...(typeof message.code === "string" ? { code: canonicalProductErrorCode(message.code) } : {}),
 			})
 			this.callHandler(subscription.handlers.onError, error, message)
 			if (retryableSubscriptionError(message)) this.scheduleSubscriptionRetry(subscription)

@@ -3,7 +3,7 @@ import { resolve } from "node:path"
 
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../../tui/index.js"
 import { promptImageLabel, promptImagePlaceholders } from "../../../../protocol/src/prompt-images.js"
-import { projectNamesEqual } from "../../../../server/src/app/project-labels.js"
+import { projectNamesEqual } from "../../../../server/src/app/project/labels.js"
 import { theme } from "../theme.js"
 export function stripAnsi(text) {
 	return text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
@@ -156,7 +156,7 @@ export function leftRightLine(left, right, width, renderRight = theme.dim) {
 export function renderKeyHintsFrame(hints, width, component = undefined) {
 	let line = ""
 	let col = 0
-	/** @type {import("../tui/render-frame.js").RenderSpan[]} */
+	/** @type {import("../../tui/render-frame.js").RenderSpan[]} */
 	const spans = []
 	hints.forEach(([key, label, action], index) => {
 		if (index > 0) {

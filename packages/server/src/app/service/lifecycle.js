@@ -6,10 +6,10 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { serviceStateDir } from "../paths.js"
-import { canonicalModelRef, parseModelRef } from "../models.js"
+import { canonicalModelRef, parseModelRef } from "../model/registry.js"
 import { updateSettings } from "../settings.js"
 import { json } from "../client-api.js"
-import { clearStaleRuntimeReexecDepth } from "../reexec-runtime.js"
+import { clearStaleRuntimeReexecDepth } from "../runtime/reexec.js"
 import { WEB_BROWSER_UI_NAME } from "../../../../protocol/src/web-branding.js"
 
 export const SERVICE_PROTOCOL_VERSION = 6
@@ -105,10 +105,10 @@ export const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export function serviceIdleShutdownDelayMs(options = {}) {
 	if (options.idleShutdown === false) return null
-	const envEnabledRaw = process.env.PINANO_SERVICE_IDLE_SHUTDOWN
+	const envEnabledRaw = process.env.CEREX_SERVICE_IDLE_SHUTDOWN
 	if (envEnabledRaw !== undefined && FALSE_VALUES.has(envEnabledRaw.trim().toLowerCase())) return null
 	if (Number.isFinite(options.idleShutdownDelayMs)) return Math.max(0, Number(options.idleShutdownDelayMs))
-	const envRaw = process.env.PINANO_SERVICE_IDLE_SHUTDOWN_DELAY_MS
+	const envRaw = process.env.CEREX_SERVICE_IDLE_SHUTDOWN_DELAY_MS
 	const envValue = envRaw === undefined || envRaw.trim() === "" ? NaN : Number(envRaw)
 	return Number.isFinite(envValue) ? Math.max(0, envValue) : DEFAULT_SERVICE_IDLE_SHUTDOWN_DELAY_MS
 }
@@ -180,12 +180,12 @@ export function stripKnownRoutePrefix(pathname) {
 
 export function incomingRequestUrl(incoming) {
 	const path = incoming.url || "/"
-	const host = typeof incoming.headers.host === "string" && incoming.headers.host ? incoming.headers.host : "pinano.local"
+	const host = typeof incoming.headers.host === "string" && incoming.headers.host ? incoming.headers.host : "cerex.local"
 	const raw = `http://${host}${path}`
 	try {
 		return new URL(raw).href
 	} catch {
-		return new URL(path, "http://pinano.local").href
+		return new URL(path, "http://cerex.local").href
 	}
 }
 
@@ -218,11 +218,11 @@ export function listenServer(server, port, host) {
 }
 
 export function configuredPortInUseMessage(host, port) {
-	return `Configured Pinano service/web port ${port} on ${host} is already in use; falling back to an ephemeral service port for TUI clients. ${WEB_BROWSER_UI_NAME} will not start until the configured port is available.`
+	return `Configured Cerex service/web port ${port} on ${host} is already in use; falling back to an ephemeral service port for TUI clients. ${WEB_BROWSER_UI_NAME} will not start until the configured port is available.`
 }
 
 export function strictConfiguredPortInUseMessage(host, port) {
-	return `Configured Pinano service/web port ${port} on ${host} is already in use. Stop the existing service or change service.web.port in Pinano settings.`
+	return `Configured Cerex service/web port ${port} on ${host} is already in use. Stop the existing service or change service.web.port in Cerex settings.`
 }
 
 export async function listenTcpEndpoint(server, host, requestedPort, options = {}) {
@@ -802,8 +802,8 @@ export async function writeDesiredRuntimeIdentityUnlocked(identity, claim = {}, 
 }
 
 export function staleRuntimeError(desired, reason = "mismatch") {
-	return Object.assign(new Error(`This pinano client is stale (${reason}); desired runtime is ${desired?.mainPath || desired?.packageRoot || "unknown"}. Restart pinano.`), {
-		code: "PINANO_STALE_RUNTIME",
+	return Object.assign(new Error(`This Cerex client is stale (${reason}); desired runtime is ${desired?.mainPath || desired?.packageRoot || "unknown"}. Restart Cerex.`), {
+		code: "CEREX_STALE_RUNTIME",
 		reason,
 		desiredRuntime: desired,
 	})

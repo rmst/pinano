@@ -5,6 +5,7 @@
 // JS instead of TS, no typebox.
 
 import { EventStream, validateToolArguments } from "../ai-apis/index.js"
+import { messageHasResponsesCompactionItem } from "../../../protocol/src/responses-compaction.js"
 import { streamSimple as defaultStreamFn } from "./stream-adapter.js"
 import { isUncertainToolExecutionError } from "./tool-errors.js"
 
@@ -78,6 +79,8 @@ export function nextAgentAction(messages) {
 		if (last.stopReason === "error" || last.stopReason === "aborted" || last.errorMessage) return { type: "wait_for_user", reason: "failed_assistant" }
 		const pending = pendingToolBatch(messages)
 		if (pending) return { type: "execute_tool_calls", ...pending }
+		// A provider checkpoint is model context, not a user-visible assistant reply. The interrupted turn still needs its response.
+		if (messageHasResponsesCompactionItem(last)) return { type: "call_model" }
 		return { type: "wait_for_user", reason: "assistant_complete" }
 	}
 	if (last.role === "toolResult") {
@@ -245,12 +248,13 @@ async function runLoop(currentContext, newMessages, config, signal, emit, stream
 			hasMoreToolCalls = turn.hasMoreToolCalls
 			pendingMessages = (await config.getSteeringMessages?.()) || []
 			if (!hasMoreToolCalls) {
-				const actionMessages = await config.projectMessagesForNextAction?.({
+				const projectedActionMessages = await config.projectMessagesForNextAction?.({
 					message,
 					toolResults: turn.toolResults,
 					context: currentContext,
 					newMessages,
 				})
+				const actionMessages = projectedActionMessages ?? (messageHasResponsesCompactionItem(message) ? currentContext.messages : undefined)
 				if (actionMessages) {
 					const action = nextAgentAction(actionMessages)
 					if (action.type !== "wait_for_user") {

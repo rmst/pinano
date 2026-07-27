@@ -5,6 +5,12 @@ function cursorValid(cursor) {
 	return cursor && typeof cursor.epoch === "string" && Number.isSafeInteger(cursor.revision)
 }
 
+function eventWithCursorGeneration(event, cursor) {
+	if (!event || typeof event !== "object" || Array.isArray(event) || typeof cursor?.epoch !== "string" || !cursor.epoch) return event
+	if (typeof event.cursorGeneration === "string" && event.cursorGeneration) return event
+	return { ...event, cursorGeneration: cursor.epoch }
+}
+
 function abortError() {
 	const err = new Error("Live resource subscription was cancelled")
 	err.name = "AbortError"
@@ -60,7 +66,10 @@ export function createAppLiveResource({ api, hub }) {
 	return {
 		async open(params, context) {
 			const client = appLiveScope(params)
-			const subscription = hub.subscribe((record) => context.emit({ cursor: record.cursor, data: record.value }), {
+			const subscription = hub.subscribe((record) => context.emit({
+				cursor: record.cursor,
+				data: eventWithCursorGeneration(record.value, record.cursor),
+			}), {
 				...(cursorValid(context.cursor) ? { cursor: context.cursor } : {}),
 				filter: (event) => appLiveEventMatches(params, client, event),
 			})

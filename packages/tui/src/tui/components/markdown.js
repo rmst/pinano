@@ -1,5 +1,5 @@
 // Markdown terminal renderer, ported from pi-coding-agent's TUI.
-// Uses Pinano's shared Marked token pipeline so terminal and Web surfaces agree on Markdown structure.
+// Uses Cerex's shared Marked token pipeline so terminal and Web surfaces agree on Markdown structure.
 
 import { parseMarkdown } from "../../../../server/src/markdown/parser.js";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.js";

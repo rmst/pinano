@@ -1,15 +1,17 @@
-import * as http from "node:http"
-import * as net from "node:net"
 import { readFile } from "node:fs/promises"
+import { resolve } from "node:path"
 
-import { HOP_BY_HOP_HEADERS, proxyHttpRequest, requestPath } from "../http-proxy.js"
+import { HOP_BY_HOP_HEADERS, requestPath } from "../http/proxy.js"
 import { sessionWorkspacePath } from "../paths.js"
 import {
 	DEFAULT_PREVIEW_HOST,
 	DEFAULT_PREVIEW_IDLE_TIMEOUT_MS,
 	PREVIEW_AUTHORIZATION_HEADER,
 	PREVIEW_CONTROL_PATH_PREFIX,
+	LEGACY_PREVIEW_AUTHORIZATION_HEADER,
+	LEGACY_PREVIEW_CONTROL_PATH_PREFIX,
 	PREVIEW_FRAME_BRIDGE_SCRIPT_PATH,
+	PREVIEW_OPEN_DOCUMENT_PATH,
 	PREVIEW_INJECT_SCRIPT_PATH,
 	PREVIEW_LOG_PATH,
 	PREVIEW_LOG_PAGE_PATH,
@@ -18,7 +20,6 @@ import {
 	PREVIEW_ROOT_KIND_PROJECT,
 	PREVIEW_ROOT_KIND_SOURCE,
 	PREVIEW_ROOT_KIND_STATIC,
-	STATIC_PREVIEW_NAME,
 	matchPreviewHost,
 	previewDefinitionKey,
 	previewFileDefinitionFromPath,
@@ -26,16 +27,17 @@ import {
 	projectPreviewLogPath,
 	previewPublicUrl,
 	sessionPreviewScopeId,
-	readProjectPreviewDefinitions,
 	readSessionPreviewDefinitions,
 	staticPreviewDefinition,
 	staticPreviewPublicUrl,
 	staticPreviewScopeId,
 } from "./manifest.js"
-import { projectMaintenanceEligible, projectMaintenanceSetupStatus } from "../session-runtime/maintenance.js"
+import { isStaticPreviewDefinition, staticPreviewDefinitionForRecord } from "./static-definitions.js"
+import { projectMaintenanceEligible, projectMaintenanceSetupStatus } from "../session/runtime/maintenance.js"
 import { WEB_BROWSER_UI_NAME } from "../../../../protocol/src/web-branding.js"
+import { staticPreviewRootIsProjectDocuments } from "../project/documents.js"
 import { injectPreviewPageScripts, previewFrameBridgeScriptResponse, previewInjectScriptResponse, previewLogPageResponse, previewShellResponse } from "./shell.js"
-import { encodeStaticPreviewPath, serveStaticPreviewRequest } from "./static-server.js"
+import { encodeStaticPreviewPath } from "./static-server.js"
 
 const MAX_PREVIEW_LOG_BYTES = 256 * 1024
 const PREVIEW_PROXY_HOP = "service-preview-upstream"
@@ -78,9 +80,9 @@ function routeError(err) {
 function previewProxyErrorHeaders(err) {
 	if (err?.previewProxyHop !== PREVIEW_PROXY_HOP) return {}
 	return {
-		"x-pinano-preview-proxy-hop": PREVIEW_PROXY_HOP,
-		...(Number.isInteger(err?.previewProxyAttempts) ? { "x-pinano-preview-proxy-attempts": String(err.previewProxyAttempts) } : {}),
-		...(typeof err?.previewProxyErrorCode === "string" ? { "x-pinano-preview-proxy-error-code": err.previewProxyErrorCode } : {}),
+		"x-cerex-preview-proxy-hop": PREVIEW_PROXY_HOP,
+		...(Number.isInteger(err?.previewProxyAttempts) ? { "x-cerex-preview-proxy-attempts": String(err.previewProxyAttempts) } : {}),
+		...(typeof err?.previewProxyErrorCode === "string" ? { "x-cerex-preview-proxy-error-code": err.previewProxyErrorCode } : {}),
 	}
 }
 
@@ -94,15 +96,17 @@ function headerHost(headers) {
 	return typeof value === "string" ? value : ""
 }
 
-async function previewSourceDefinitionForRoot(rootRecord, match) {
-	const definition = await previewFileDefinitionFromPath(rootRecord.rootPath)
+async function previewSourceDefinitionForRoot(rootRecord, match, workspace) {
+	const definition = rootRecord.projectDir
+		? (await workspace.previews.resolveSource(rootRecord.rootPath, { projectDir: rootRecord.projectDir })).definition
+		: await previewFileDefinitionFromPath(rootRecord.rootPath)
 	if (definition.name !== match.name) throw Object.assign(new Error(`Preview source not found: ${match.name}`), { status: 404 })
 	return definition
 }
 
-async function projectPreviewOwner(db, projectDir, sessionId = undefined) {
+async function projectPreviewOwner(db, projectDir, sessionId = undefined, workspace = undefined) {
 	if (sessionId) return { sessionId }
-	const setup = await projectMaintenanceSetupStatus(projectDir)
+	const setup = await projectMaintenanceSetupStatus(projectDir, workspace)
 	if (!projectMaintenanceEligible(setup)) return undefined
 	return db?.getProjectMaintenanceSession?.(projectDir)
 }
@@ -115,6 +119,7 @@ function proxyRequestHeaders(request, preview, options = {}) {
 			HOP_BY_HOP_HEADERS.has(lower)
 			|| lower === "authorization"
 			|| lower === PREVIEW_AUTHORIZATION_HEADER.toLowerCase()
+			|| lower === LEGACY_PREVIEW_AUTHORIZATION_HEADER.toLowerCase()
 			|| lower === "cookie"
 			|| lower === "host"
 			|| lower === "origin"
@@ -170,7 +175,14 @@ function requestPathname(request) {
 }
 
 function isPreviewControlPath(pathname) {
-	return pathname === PREVIEW_CONTROL_PATH_PREFIX || pathname.startsWith(`${PREVIEW_CONTROL_PATH_PREFIX}/`)
+	return [PREVIEW_CONTROL_PATH_PREFIX, LEGACY_PREVIEW_CONTROL_PATH_PREFIX]
+		.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`))
+}
+
+function canonicalPreviewControlPath(pathname) {
+	return pathname.startsWith(LEGACY_PREVIEW_CONTROL_PATH_PREFIX)
+		? `${PREVIEW_CONTROL_PATH_PREFIX}${pathname.slice(LEGACY_PREVIEW_CONTROL_PATH_PREFIX.length)}`
+		: pathname
 }
 
 function acceptsHtml(request) {
@@ -290,41 +302,11 @@ function markPreviewProxyError(err, metadata) {
 	return error
 }
 
-function healthRequest(host, port, path, timeoutMs) {
-	return new Promise((resolve, reject) => {
-		let settled = false
-		let timer
-		const finish = (fn, value) => {
-			if (settled) return
-			settled = true
-			clearTimeout(timer)
-			req.destroy()
-			fn(value)
-		}
-		timer = setTimeout(() => {
-			finish(reject, new Error(`Preview health check timed out after ${timeoutMs}ms`))
-		}, timeoutMs)
-		timer.unref?.()
-		const req = http.request({
-			host,
-			port,
-			path,
-			method: "GET",
-			headers: { connection: "close" },
-		}, (res) => {
-			res.on("data", () => {})
-			finish(resolve, res.statusCode ?? 0)
-		})
-		req.once("error", (err) => finish(reject, err))
-		req.end()
-	})
-}
-
 function startupCancelledError() {
 	return Object.assign(new Error("Preview startup was cancelled"), { cancelled: true, status: 499 })
 }
 
-async function waitForPreviewHealth(host, port, path, timeoutMs, options = {}) {
+async function waitForPreviewHealth(workspace, target, path, timeoutMs, options = {}) {
 	const hasDeadline = Number.isFinite(timeoutMs)
 	const deadline = hasDeadline ? Date.now() + timeoutMs : Infinity
 	let lastError
@@ -332,7 +314,7 @@ async function waitForPreviewHealth(host, port, path, timeoutMs, options = {}) {
 		if (options.cancelled?.()) throw startupCancelledError()
 		try {
 			const remaining = hasDeadline ? Math.max(1, deadline - Date.now()) : 1000
-			const status = await healthRequest(host, port, path, Math.min(1000, remaining))
+			const status = await workspace.previews.process.health(target, path, Math.min(1000, remaining))
 			if ((status >= 200 && status < 400) || status === 401 || status === 403) return
 			lastError = new Error(`healthPath returned HTTP ${status}`)
 		} catch (err) {
@@ -341,27 +323,13 @@ async function waitForPreviewHealth(host, port, path, timeoutMs, options = {}) {
 		await delay(hasDeadline ? Math.min(100, Math.max(1, deadline - Date.now())) : 100)
 	}
 	const suffix = lastError?.message ? `: ${lastError.message}` : ""
-	throw Object.assign(new Error(`Preview process did not become healthy at http://${host}:${port}${path} within ${timeoutMs}ms${suffix}`), { status: 504 })
-}
-
-function allocatePreviewPort(host = DEFAULT_PREVIEW_HOST) {
-	return new Promise((resolve, reject) => {
-		const server = net.createServer()
-		server.once("error", reject)
-		server.listen(0, host, () => {
-			const address = server.address()
-			const port = typeof address === "object" && address ? address.port : undefined
-			server.close(() => {
-				if (Number.isInteger(port)) resolve(port)
-				else reject(new Error("Failed to allocate preview port"))
-			})
-		})
-	})
+	throw Object.assign(new Error(`Preview process did not become healthy at http://${target.host}:${target.port}${path} within ${timeoutMs}ms${suffix}`), { status: 504 })
 }
 
 export class PreviewManager {
 	constructor(options = {}) {
 		this.manager = options.manager
+		this.workspace = options.workspace ?? options.manager?.workspace
 		this.db = options.db
 		this.getPublicUrl = options.getPublicUrl ?? (() => options.publicUrl)
 		this.diagnostics = options.diagnostics
@@ -379,19 +347,27 @@ export class PreviewManager {
 		const value = String(match?.scopeId ?? "").trim().toLowerCase()
 		if (!/^[a-z0-9]{16}$/.test(value)) throw Object.assign(new Error("preview scope id must be a 16-character lowercase hash"), { status: 400 })
 		const rootRecord = this.db?.getPreviewRoot?.(value)
-		if (match?.name === STATIC_PREVIEW_NAME) {
-			if (rootRecord?.scopeKind === PREVIEW_ROOT_KIND_STATIC) return {
+		if (rootRecord?.scopeKind === PREVIEW_ROOT_KIND_STATIC) {
+			const definition = await staticPreviewDefinitionForRecord(this.workspace, rootRecord, match?.name)
+			if (definition) return {
 				scopeKind: "static",
 				scopeId: value,
 				rootPath: rootRecord.rootPath,
 				projectDir: rootRecord.projectDir,
-				definition: staticPreviewDefinition(rootRecord.rootPath),
+				definition,
 			}
 		}
 		if (rootRecord?.scopeKind === PREVIEW_ROOT_KIND_SOURCE) {
-			const definition = await previewSourceDefinitionForRoot(rootRecord, match)
+			const definition = await previewSourceDefinitionForRoot(rootRecord, match, this.workspace)
+			if (isStaticPreviewDefinition(definition) && rootRecord.projectDir) return {
+				scopeKind: "static",
+				scopeId: value,
+				rootPath: definition.source.path,
+				projectDir: rootRecord.projectDir,
+				definition,
+			}
 			if (rootRecord.projectDir) {
-				const owner = await projectPreviewOwner(this.db, rootRecord.projectDir, rootRecord.sessionId)
+				const owner = await projectPreviewOwner(this.db, rootRecord.projectDir, rootRecord.sessionId, this.workspace)
 				if (owner?.sessionId) return {
 					scopeKind: "project",
 					scopeId: value,
@@ -418,7 +394,7 @@ export class PreviewManager {
 			if (sessionPreviewScopeId(sessionDir) !== value) return undefined
 			const manifest = await readSessionPreviewDefinitions(sessionDir)
 			const definition = manifest.previews[match.name]
-			if (!definition) return undefined
+			if (!definition || isStaticPreviewDefinition(definition)) return undefined
 			return {
 				scopeKind: "session",
 				scopeId: value,
@@ -430,10 +406,10 @@ export class PreviewManager {
 		}))
 		const projectMatches = []
 		if (rootRecord?.scopeKind === PREVIEW_ROOT_KIND_PROJECT && rootRecord.projectDir) {
-			const manifest = await readProjectPreviewDefinitions(rootRecord.projectDir)
+			const manifest = await this.workspace.previews.projectManifest(rootRecord.projectDir)
 			const definition = manifest.previews[match.name]
-			if (definition) {
-				const owner = await projectPreviewOwner(this.db, rootRecord.projectDir, rootRecord.sessionId)
+			if (definition && !isStaticPreviewDefinition(definition)) {
+				const owner = await projectPreviewOwner(this.db, rootRecord.projectDir, rootRecord.sessionId, this.workspace)
 				if (owner?.sessionId) projectMatches.push({
 					scopeKind: "project",
 					scopeId: value,
@@ -495,19 +471,26 @@ export class PreviewManager {
 	async createStaticPreview(request = {}) {
 		const publicUrl = this.getPublicUrl()
 		if (!publicUrl) throw Object.assign(new Error(`${WEB_BROWSER_UI_NAME} publicUrl is required for previews`), { status: 404 })
-		const resolved = this.manager?.resolveStaticPreviewRequest
-			? await this.manager.resolveStaticPreviewRequest(request)
-			: request
+		const managerResolved = typeof this.manager?.resolveStaticPreviewRequest === "function"
+		const resolved = managerResolved ? await this.manager.resolveStaticPreviewRequest(request) : request
 		const rootPath = resolved.rootPath
+		const projectDir = resolved.projectDir
 		const relativePath = resolved.relativePath ?? ""
 		const routingSlug = resolved.routingSlug ?? request.routingSlug
 		if (typeof rootPath !== "string" || !rootPath) throw Object.assign(new Error("static preview rootPath is required"), { status: 400 })
-		const scopeId = staticPreviewScopeId(rootPath)
-		const record = this.db?.upsertPreviewRoot?.({
+		const definition = resolved.definition ?? (staticPreviewRootIsProjectDocuments(rootPath, projectDir)
+			? staticPreviewDefinition(rootPath)
+			: undefined)
+		if (!isStaticPreviewDefinition(definition) || resolve(definition.source.path) !== resolve(rootPath)) {
+			throw Object.assign(new Error("Static document preview root is not configured"), { status: 403 })
+		}
+		const sourceScoped = managerResolved && resolved.scopeKind === PREVIEW_ROOT_KIND_SOURCE && typeof resolved.scopeId === "string"
+		const scopeId = sourceScoped ? resolved.scopeId : staticPreviewScopeId(rootPath)
+		const record = sourceScoped ? { rootPath, projectDir } : this.db?.upsertPreviewRoot?.({
 			scopeId,
 			scopeKind: PREVIEW_ROOT_KIND_STATIC,
 			rootPath,
-			projectDir: resolved.projectDir ?? rootPath,
+			projectDir,
 		})
 		if (!record) throw Object.assign(new Error("Static previews require server database support"), { status: 501 })
 		return {
@@ -519,6 +502,7 @@ export class PreviewManager {
 				publicUrl,
 				scopeId,
 				routingSlug,
+				name: definition.name,
 				path: encodeStaticPreviewPath(relativePath),
 			}),
 		}
@@ -549,9 +533,9 @@ export class PreviewManager {
 		const { sessionId, definition } = target
 		const runtime = await this.manager.getRuntime(sessionId)
 		const toolExecutor = runtime.agent?.toolExecutor
-		if (!toolExecutor?.startPreviewProcess) throw Object.assign(new Error("Previews require service-side tool execution"), { status: 501 })
+		if (!toolExecutor?.startPreviewProcess) throw Object.assign(new Error("Previews require workspace-host tool execution"), { status: 501 })
 		const host = DEFAULT_PREVIEW_HOST
-		const port = await allocatePreviewPort(host)
+		const port = await this.workspace.previews.process.allocatePort(host)
 		if (options.cancelled?.()) throw startupCancelledError()
 		const id = `preview:${target.scopeKind}:${target.scopeId}:${definition.name}`
 		const next = {
@@ -589,9 +573,11 @@ export class PreviewManager {
 			next.port = started?.port ?? port
 			next.bindHost = started?.bindHost
 			next.bindPort = started?.bindPort
-			next.logPath = started?.logPath ?? next.logPath
+			if (started?.logPath !== undefined && started.logPath !== next.logPath) {
+				throw new Error(`Preview process reported log path ${started.logPath}, expected ${next.logPath}`)
+			}
 			this.scheduleIdleStop(next)
-			await waitForPreviewHealth(next.host, next.port, definition.healthPath, undefined, { cancelled: () => next.stopped || options.cancelled?.() })
+			await waitForPreviewHealth(this.workspace, next, definition.healthPath, undefined, { cancelled: () => next.stopped || options.cancelled?.() })
 			next.ready = true
 			this.scheduleIdleStop(next)
 			return next
@@ -683,6 +669,7 @@ export class PreviewManager {
 			definitionKey,
 			publicUrl: target.publicUrl,
 			logPath: target.logPath,
+			projectDir: target.projectDir,
 		}
 		if (target.scopeKind === "static") return { ...base, state: "ready", ready: true, rootPath: target.rootPath }
 		const existing = this.previews.get(key)
@@ -761,17 +748,19 @@ export class PreviewManager {
 	}
 
 	async proxyPreviewResponse(request, preview, options = {}, proxyOptions = {}) {
-		return await proxyHttpRequest(request, {
+		const upstream = await this.workspace.previews.process.fetch(request, {
 			host: preview.host,
 			port: preview.port,
-			path: requestPath(request.url),
+		}, {
 			headers: Object.fromEntries(proxyRequestHeaders(request, preview, {
 				...options,
 				stripAcceptEncoding: proxyOptions.injectPageScripts === true,
 			})),
-		}, {
-			responseHeaders: (headers) => proxyResponseHeaders({ headers }, preview),
 		})
+		const headers = proxyResponseHeaders(upstream, preview)
+		for (const name of [...upstream.headers.keys()]) upstream.headers.delete(name)
+		headers.forEach((value, name) => upstream.headers.set(name, value))
+		return upstream
 	}
 
 	async proxyPreviewResponseWithRetries(request, preview, options = {}, proxyOptions = {}) {
@@ -825,14 +814,22 @@ export class PreviewManager {
 		try {
 			const match = this.matchHost(headerHost(request.headers))
 			if (!match) return text("Not Found", 404)
-			const pathname = requestPathname(request)
+			const pathname = canonicalPreviewControlPath(requestPathname(request))
 			if (pathname === PREVIEW_STATUS_PATH) return json(await this.previewStatus(match))
 			if (pathname === PREVIEW_LOG_PATH) {
 				const state = await this.previewState(match)
-				return text(await readPreviewLog(state.logPath))
+				const log = state.scopeKind === "project"
+					? await this.workspace.previews.readProjectLog(state.projectDir, state.name, MAX_PREVIEW_LOG_BYTES)
+					: await readPreviewLog(state.logPath)
+				return text(log)
 			}
 			if (pathname === PREVIEW_INJECT_SCRIPT_PATH) return previewInjectScriptResponse()
 			if (pathname === PREVIEW_FRAME_BRIDGE_SCRIPT_PATH) return previewFrameBridgeScriptResponse()
+			if (pathname === PREVIEW_OPEN_DOCUMENT_PATH) {
+				const target = await this.definitionFor(match)
+				if (target.scopeKind !== "static") return text("Not Found", 404)
+				return await this.workspace.previews.static.openDocument(request, target, { appPublicUrl: this.getPublicUrl() })
+			}
 			if (pathname === PREVIEW_LOG_PAGE_PATH) return await this.previewLogPage(request, match)
 			if (pathname === PREVIEW_RESTART_PATH) {
 				if (request.method !== "POST") return text("Method Not Allowed", 405, { allow: "POST" })
@@ -840,8 +837,9 @@ export class PreviewManager {
 			}
 			if (isPreviewControlPath(pathname)) return text("Not Found", 404)
 			const target = await this.definitionFor(match)
-			if (target.scopeKind === "static") return await serveStaticPreviewRequest(request, target, {
+			if (target.scopeKind === "static") return await this.workspace.previews.static.fetch(request, target, {
 				bridgeScriptPath: PREVIEW_FRAME_BRIDGE_SCRIPT_PATH,
+				openDocumentPath: PREVIEW_OPEN_DOCUMENT_PATH,
 			})
 			const previewPage = wantsPreviewPage(request)
 			if (previewPage) {
@@ -878,6 +876,7 @@ export class PreviewManager {
 				lower === "cookie"
 				|| lower === "authorization"
 				|| lower === PREVIEW_AUTHORIZATION_HEADER.toLowerCase()
+				|| lower === LEGACY_PREVIEW_AUTHORIZATION_HEADER.toLowerCase()
 				|| lower === "host"
 				|| lower === "origin"
 				|| lower === "referer"
@@ -892,40 +891,10 @@ export class PreviewManager {
 		const authorization = cleanForwardedAuthorization(options.authorization)
 		if (authorization) headers.authorization = authorization
 
-		const upstream = http.request({
+		this.workspace.previews.process.upgrade(incoming, socket, head, {
 			host: preview.host,
 			port: preview.port,
-			method: incoming.method,
-			path: incoming.url || "/",
-			headers,
-		})
-		upstream.on("upgrade", (response, upstreamSocket, upstreamHead) => {
-			if (socket.destroyed) {
-				upstreamSocket.destroy()
-				return
-			}
-			const lines = [`HTTP/${response.httpVersion} ${response.statusCode} ${response.statusMessage}`]
-			for (const [name, value] of Object.entries(response.headers)) {
-				const lower = name.toLowerCase()
-				if (HOP_BY_HOP_HEADERS.has(lower) || lower === "set-cookie") continue
-				if (Array.isArray(value)) for (const item of value) lines.push(`${name}: ${item}`)
-				else if (value !== undefined) lines.push(`${name}: ${value}`)
-			}
-			lines.push("connection: Upgrade")
-			if (response.headers.upgrade) lines.push(`upgrade: ${response.headers.upgrade}`)
-			socket.write(`${lines.join("\r\n")}\r\n\r\n`)
-			if (upstreamHead?.length) socket.write(upstreamHead)
-			if (head?.length) upstreamSocket.write(head)
-			upstreamSocket.pipe(socket)
-			socket.pipe(upstreamSocket)
-		})
-		upstream.on("response", (response) => {
-			socket.write(`HTTP/${response.httpVersion} ${response.statusCode} ${response.statusMessage}\r\nconnection: close\r\n\r\n`)
-			response.pipe(socket)
-			response.on("end", () => socket.destroy())
-		})
-		upstream.on("error", (err) => socketError(socket, 502, err?.message ?? "Preview proxy error"))
-		upstream.end()
+		}, headers)
 		return true
 	}
 

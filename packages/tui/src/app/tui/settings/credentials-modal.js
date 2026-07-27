@@ -13,8 +13,8 @@ import {
 	wrapTextWithAnsi,
 } from "../../../tui/index.js"
 import { loginCodex } from "../../../../../server/src/ai-apis/codex/index.js"
-import { API_KEY_PROVIDER_INFOS, deleteCredential, detectedEnvApiKeys, getCredential, listProviders, setCredential } from "../../../../../server/src/app/auth.js"
-import { availableModelEntries, modelRef, modelRefMatches } from "../../../../../server/src/app/models.js"
+import { API_KEY_PROVIDER_INFOS, deleteCredential, detectedEnvApiKeys, getCredential, listProviders, setCredential } from "../../../../../server/src/app/auth/credentials.js"
+import { availableModelEntries, modelRef, modelRefMatches } from "../../../../../server/src/app/model/registry.js"
 import { loadSettings } from "../../../../../server/src/app/settings.js"
 import { authFilePath } from "../../../../../server/src/app/paths.js"
 import { pickFromOverlay } from "../../components/picker.js"
@@ -73,7 +73,7 @@ class ChatGptOAuthModal extends RetainedComponent {
 		this.onCancel = onCancel
 		this.onManualCode = undefined
 		this.status = "Starting ChatGPT OAuth…"
-		this.instructions = "Complete the login in your browser, then return to Pinano."
+		this.instructions = "Complete the login in your browser, then return to Cerex."
 		this.url = ""
 		this.cancelled = false
 		this.manualCodeBusy = false
@@ -222,9 +222,9 @@ export class CredentialsSettingsModal extends RetainedComponent {
 					value: `${saved ? "[x]" : "[ ]"}${differs ? " env differs" : saved ? " saved" : ""}`,
 					description: saved
 						? differs
-							? `A different ${candidate.providerLabel} API key is saved. Space updates Pinano to the environment value (${maskSecret(candidate.apiKey)}). Select it again after updating to remove it.`
-							: `${candidate.providerLabel} API key is saved (${maskSecret(candidate.apiKey)}). Space removes it from Pinano.`
-						: `Detected ${candidate.providerLabel} API key in the environment (${maskSecret(candidate.apiKey)}). Space saves it to Pinano's credential store.`,
+							? `A different ${candidate.providerLabel} API key is saved. Space updates Cerex to the environment value (${maskSecret(candidate.apiKey)}). Select it again after updating to remove it.`
+							: `${candidate.providerLabel} API key is saved (${maskSecret(candidate.apiKey)}). Space removes it from Cerex.`
+						: `Detected ${candidate.providerLabel} API key in the environment (${maskSecret(candidate.apiKey)}). Space saves it to Cerex's credential store.`,
 				}
 			}))
 		} else {
@@ -233,7 +233,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 				kind: "noop",
 				label: "Environment API keys",
 				value: "none found",
-				description: "Launch Pinano with OPENAI_API_KEY, MOONSHOT_API_KEY, KIMI_API_KEY, DEEPSEEK_API_KEY, or LLAMACPP_API_KEY to import supported API keys here.",
+				description: "Launch Cerex with OPENAI_API_KEY, MOONSHOT_API_KEY, KIMI_API_KEY, DEEPSEEK_API_KEY, or LLAMACPP_API_KEY to import supported API keys here.",
 			})
 		}
 
@@ -252,7 +252,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 				provider,
 				label: "Remove ChatGPT subscription",
 				value: credential.accountId ?? "connected",
-				description: "Deletes the stored OAuth refresh token from Pinano.",
+				description: "Deletes the stored OAuth refresh token from Cerex.",
 			})
 			else if (credential?.kind === "apiKey" && !envProviders.has(provider)) this.rows.push({
 				id: `remove:${provider}`,
@@ -260,7 +260,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 				provider,
 				label: `Remove ${providerLabel(provider)} API key`,
 				value: "saved",
-				description: "Deletes the stored API key from Pinano. This does not change environment variables or settings provider keys.",
+				description: "Deletes the stored API key from Cerex. This does not change environment variables or settings provider keys.",
 			})
 		}
 
@@ -434,7 +434,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 		const apiKey = (await promptForInput(this.tui, `${providerLabel(provider)} API key`, {
 			secret: true,
 			title: `${providerLabel(provider)} API key`,
-			subtitle: "Paste the key. It will be stored in Pinano's local credential store.",
+			subtitle: "Paste the key. It will be stored in Cerex's local credential store.",
 		}))?.trim() ?? ""
 		if (!apiKey) {
 			this.setStatus("API key entry cancelled")
@@ -462,11 +462,11 @@ export class CredentialsSettingsModal extends RetainedComponent {
 
 	async removeCredential(provider) {
 		const confirm = await pickFromOverlay(this.tui, [
-			{ value: "remove", label: "Remove credential", description: `Delete ${providerLabel(provider)} credentials from Pinano` },
+			{ value: "remove", label: "Remove credential", description: `Delete ${providerLabel(provider)} credentials from Cerex` },
 			{ value: "cancel", label: "Cancel", description: "Keep the credential" },
 		], {
 			title: "Remove credential",
-			subtitle: "This only changes Pinano's stored credentials.",
+			subtitle: "This only changes Cerex's stored credentials.",
 			maxVisible: 2,
 		})
 		if (confirm !== "remove") {
@@ -570,8 +570,8 @@ export class CredentialsSettingsModal extends RetainedComponent {
 		})
 		this.scrollOffset = visibleRows.scrollOffset
 		const subtitle = this.options.onboarding
-			? "No model provider is configured yet. Pinano is currently optimized for use with a ChatGPT subscription. API keys are also supported."
-			: "Pinano is currently optimized for use with a ChatGPT subscription. API keys are also supported."
+			? "No model provider is configured yet. Cerex is currently optimized for use with a ChatGPT subscription. API keys are also supported."
+			: "Cerex is currently optimized for use with a ChatGPT subscription. API keys are also supported."
 		/** @type {import("../../../tui/render-frame.js").RenderSpan[]} */
 		const spans = []
 		const lines = [

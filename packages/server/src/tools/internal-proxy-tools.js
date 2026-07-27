@@ -1,10 +1,10 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { delimiter, isAbsolute, join, resolve } from "node:path"
 
-import { PINANO_INTERNAL_API_BASE_URL_ENV, PINANO_INTERNAL_API_TOKEN_ENV } from "../../../protocol/src/internal-api-env.js"
+import { INTERNAL_API_BASE_URL_ENV, INTERNAL_API_TOKEN_ENV } from "../../../protocol/src/internal-api-env.js"
 import { DOCKER_PROXY_ROUTE } from "../../../protocol/src/internal-proxy-routes.js"
 
-export const PINANO_PROXY_TOOLS_BIN_ENV = "PINANO_PROXY_TOOLS_BIN"
+export const PROXY_TOOLS_BIN_ENV = "CEREX_PROXY_TOOLS_BIN"
 
 const DEFAULT_PROXY_TOOLS = [
 	{ name: "docker", route: DOCKER_PROXY_ROUTE },
@@ -19,16 +19,15 @@ function shellQuote(s) {
 }
 
 function toolTmpdir(baseEnv) {
-	if (baseEnv.PINANO_FALLBACK_TOOLS_TMPDIR && isAbsolute(baseEnv.PINANO_FALLBACK_TOOLS_TMPDIR)) return resolve(baseEnv.PINANO_FALLBACK_TOOLS_TMPDIR)
-	if (baseEnv.PINANO_SESSION_DIR && isAbsolute(baseEnv.PINANO_SESSION_DIR)) return join(resolve(baseEnv.PINANO_SESSION_DIR), ".tmp")
+	if (baseEnv.CEREX_FALLBACK_TOOLS_TMPDIR && isAbsolute(baseEnv.CEREX_FALLBACK_TOOLS_TMPDIR)) return resolve(baseEnv.CEREX_FALLBACK_TOOLS_TMPDIR)
 	return undefined
 }
 
 function createProxyClient(route) {
 	return `import * as http from "node:http"
 
-const baseUrl = process.env.${PINANO_INTERNAL_API_BASE_URL_ENV}
-const token = process.env.${PINANO_INTERNAL_API_TOKEN_ENV}
+const baseUrl = process.env.${INTERNAL_API_BASE_URL_ENV}
+const token = process.env.${INTERNAL_API_TOKEN_ENV}
 
 function write(stream, buffer) {
 	return new Promise((resolve) => {
@@ -49,7 +48,7 @@ async function finish(status, payload = {}) {
 }
 
 function fail(message, code = 1) {
-	process.stderr.write(\`pinano proxy tool failed: \${message}\\n\`)
+	process.stderr.write(\`Cerex proxy tool failed: \${message}\\n\`)
 	process.exit(code)
 }
 
@@ -58,7 +57,7 @@ if (!baseUrl || !token) fail("internal API bridge is unavailable")
 const body = JSON.stringify({
 	cwd: process.cwd(),
 	argv: process.argv.slice(2),
-	toolCallId: process.env.PINANO_TOOL_CALL_ID || undefined,
+	toolCallId: process.env.CEREX_TOOL_CALL_ID || undefined,
 })
 
 try {
@@ -101,14 +100,14 @@ exec ${shellQuote(runtimePath)} ${shellQuote(proxyPath)} "$@"
 }
 
 function ensureInternalProxyTools(baseEnv = process.env, tools = DEFAULT_PROXY_TOOLS) {
-	if (!baseEnv[PINANO_INTERNAL_API_BASE_URL_ENV] || !baseEnv[PINANO_INTERNAL_API_TOKEN_ENV]) return undefined
+	if (!baseEnv[INTERNAL_API_BASE_URL_ENV] || !baseEnv[INTERNAL_API_TOKEN_ENV]) return undefined
 	const parent = toolTmpdir(baseEnv)
 	if (!parent) return undefined
 	const key = `${parent}\0${process.execPath}\0${tools.map((tool) => `${tool.name}:${tool.route}`).join("\0")}`
 	if (proxyToolsBinDir && proxyToolsBinDirKey === key) return { bin: proxyToolsBinDir }
 	const removeParentOnExit = !existsSync(parent)
 	mkdirSync(parent, { recursive: true })
-	const dir = mkdtempSync(join(parent, ".pinano-proxy-tools-"))
+	const dir = mkdtempSync(join(parent, ".proxy-tools-"))
 	const bin = join(dir, "bin")
 	try {
 		mkdirSync(bin, { recursive: true })
@@ -144,7 +143,7 @@ export function envWithInternalProxyTools(baseEnv = process.env) {
 	const path = baseEnv.PATH ? `${tools.bin}${delimiter}${baseEnv.PATH}` : tools.bin
 	return {
 		...baseEnv,
-		[PINANO_PROXY_TOOLS_BIN_ENV]: tools.bin,
+		[PROXY_TOOLS_BIN_ENV]: tools.bin,
 		PATH: path,
 	}
 }

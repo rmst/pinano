@@ -34,14 +34,15 @@ import { promptImagePlaceholders } from "../../../../../protocol/src/prompt-imag
 import { parseBashShortcut } from "../../../../../server/src/app/bash-shortcut.js"
 import { clipboardImagePasteNotice, readClipboardImage } from "../../../../../server/src/app/clipboard-image.js"
 import { formatContextReport } from "../../../../../server/src/app/context/report.js"
-import { formatSystemReport, projectContextPathsInMessages } from "../../../../../server/src/app/project-context-display.js"
-import { REWIND_PICKER_SUBTITLE } from "../../../../../server/src/app/rewind-actions.js"
-import { modelRetryExhaustedText, modelRetryScheduledText } from "../../../../../server/src/app/model-retry-policy.js"
-import { availableModelEntries } from "../../../../../server/src/app/models.js"
-import { applySessionEvent, cloneSessionSnapshot } from "../../../../../server/src/app/session-state.js"
-import { sessionRoute } from "../../../../../server/src/app/routes.js"
+import { formatSystemReport, projectContextPathsInMessages } from "../../../../../server/src/app/project/context-display.js"
+import { REWIND_PICKER_SUBTITLE } from "../../../../../server/src/app/session/rewind-actions.js"
+import { modelRetryExhaustedText, modelRetryScheduledText } from "../../../../../server/src/app/model/retry-policy.js"
+import { availableModelEntries } from "../../../../../server/src/app/model/registry.js"
+import { applySessionEvent, cloneSessionSnapshot } from "../../../../../server/src/app/session/state.js"
+import { sessionRoute } from "../../../../../server/src/app/navigation/routes.js"
 import { updateSetting } from "../../../../../server/src/app/settings.js"
 import { WEB_BROWSER_UI_NAME } from "../../../../../protocol/src/web-branding.js"
+import { sessionCursorGeneration, sessionCursorGenerationChanged } from "../../../../../protocol/src/session-cursor.js"
 import { editorTheme, theme } from "../../theme.js"
 import { AccentDividerLine, SessionCwdLine, SessionInfoLine, sessionInfoBody } from "./status.js"
 import { flattenContent, isTranscriptMessageRenderable, mergeStaleSnapshotMessages, transcriptCursor, transcriptMessageFingerprint, transcriptMessageKey, transcriptMessageState, transcriptStateFromSnapshot, transcriptStatesEqual } from "./transcript-state.js"
@@ -94,8 +95,8 @@ export class Chat {
 	 * @param {(err: unknown) => boolean} [opts.onClientError]
 	 * @param {{ showThinkingOutput: boolean, showToolOutput: boolean }} opts.messageRenderOptions
 	 * @param {boolean} [opts.webEnabled]
-	 * @param {(settings: import("../settings.js").Settings) => void} [opts.onSettingsChanged]
-	 * @param {(payload: import("../codex-usage.js").CodexUsagePayload) => void} [opts.onCodexUsage]
+	 * @param {(settings: import("../../../../../server/src/app/settings.js").Settings) => void} [opts.onSettingsChanged]
+	 * @param {(payload: import("../../../../../server/src/app/usage/codex.js").CodexUsagePayload) => void} [opts.onCodexUsage]
 	 * @param {(model: any) => string | undefined} [opts.getCodexUsageBaseUrl]
 	 * @param {() => Promise<void>} [opts.refreshGlobalAuth]
 	 * @param {(sessionId: string, options?: { routeHistory?: "record" | "replace" }) => void} [opts.onSessionIdChanged]
@@ -172,6 +173,7 @@ export class Chat {
 		this.needsBranchSnapshotRebuild = false
 		this.lastSeq = -1
 		this.viewEpoch = undefined
+		this.retiredCursorGenerations = new Set()
 		this.subscriptionProviders = new Set()
 		this.footerAgent = agentAdapterForSnapshot(null)
 		this.footer = new Footer(
@@ -826,7 +828,7 @@ export class Chat {
 
 	/**
 	 * @param {any} msg
-	 * @param {import("../tui/tui.js").TuiMouseEvent} event
+	 * @param {import("../../../tui/tui.js").TuiMouseEvent} event
 	 */
 	handleTranscriptMessageContextMenu(msg, event) {
 		if (msg?.role !== "user" || !msg.entryId) return { consume: false }
@@ -1010,7 +1012,7 @@ export class Chat {
 			}
 			const level = await pickReasoningLevel(this.tui, "Session reasoning", "Applied only to this session") ?? undefined
 			if (!level) return
-			const res = await this.client.setThinking(this.sessionId, level)
+			const res = await this.client.setReasoning(this.sessionId, level)
 			await this.refreshAfterMutation(res)
 			this.appendLine(theme.dim(`session reasoning → ${level}`))
 			return
@@ -1539,12 +1541,18 @@ export class Chat {
 		const previousSessionId = this.snapshot?.sessionId
 		const firstSnapshot = !previousSessionId
 		const sessionChanged = !!previousSessionId && !!next.sessionId && next.sessionId !== previousSessionId
+		const cursorGenerationChanged = !sessionChanged && !!this.snapshot && sessionCursorGenerationChanged(this.snapshot, next)
 		if (next.sessionId) this.setSessionId(next.sessionId)
-		if (sessionChanged) {
+		if (sessionChanged) this.retiredCursorGenerations.clear()
+		else if (cursorGenerationChanged) this.retiredCursorGenerations.add(sessionCursorGeneration(this.snapshot))
+		if (sessionChanged || cursorGenerationChanged) {
 			this.lastSeq = -1
 			this.viewEpoch = undefined
 			this.needsSnapshotRebuild = false
 			this.needsBranchSnapshotRebuild = false
+			this.messageEventCursors.clear()
+		}
+		if (sessionChanged) {
 			this.lastPromptDraftVersion = -1
 			this.promptImages = []
 			this.promptImageCounter = 0
@@ -1555,9 +1563,9 @@ export class Chat {
 		if (next.promptDraft) this.applyPromptDraft(next.promptDraft, { force: firstSnapshot || sessionChanged })
 		if (!next.isStreaming && !this.promptRequestInFlight) this.interruptRequested = false
 		if (!next.isStreaming && !this.promptRequestInFlight && !this.promptCancelPromise) this.clearSubmittedPrompt()
-		if (typeof next.seq === "number") this.lastSeq = sessionChanged ? next.seq : Math.max(this.lastSeq, next.seq)
+		if (typeof next.seq === "number") this.lastSeq = sessionChanged || cursorGenerationChanged ? next.seq : Math.max(this.lastSeq, next.seq)
 		if (next.viewEpoch !== undefined) this.viewEpoch = next.viewEpoch
-		this.syncTranscript(next, { force: options.rebuildTranscript === true || sessionChanged })
+		this.syncTranscript(next, { force: options.rebuildTranscript === true || sessionChanged || cursorGenerationChanged })
 		this.renderStatus(next)
 		this.renderPendingUserMessages(next)
 		this.refreshFooter()
@@ -1567,6 +1575,11 @@ export class Chat {
 
 	/** @param {any} snapshot */
 	updateFromEventSnapshot(snapshot) {
+		if (
+			this.snapshot?.sessionId === snapshot?.sessionId
+			&& this.retiredCursorGenerations.has(sessionCursorGeneration(snapshot))
+		) return
+		const cursorGenerationChanged = !!this.snapshot && sessionCursorGenerationChanged(this.snapshot, snapshot)
 		const rebuildTranscript = this.needsSnapshotRebuild
 		const branchSnapshotRebuild = this.needsBranchSnapshotRebuild
 		this.needsSnapshotRebuild = false
@@ -1575,7 +1588,7 @@ export class Chat {
 			this.needsSnapshotRebuild = true
 			this.needsBranchSnapshotRebuild = branchSnapshotRebuild
 		}
-		if (typeof snapshot?.seq === "number" && snapshot.seq < this.lastSeq) {
+		if (!cursorGenerationChanged && typeof snapshot?.seq === "number" && snapshot.seq < this.lastSeq) {
 			const matchesCurrentTranscript = this.snapshot && transcriptStatesEqual(transcriptStateFromSnapshot(snapshot), transcriptStateFromSnapshot(this.snapshot))
 			if (matchesCurrentTranscript) {
 				this.syncTranscript(snapshot, { force: rebuildTranscript })
@@ -1602,7 +1615,7 @@ export class Chat {
 			} else if (rebuildTranscript) restoreSnapshotRebuild()
 			return
 		}
-		this.update(snapshot, { rebuildTranscript })
+		this.update(snapshot, { rebuildTranscript: rebuildTranscript || cursorGenerationChanged })
 	}
 
 	async refreshAfterMutation(result = {}, options = {}) {
@@ -1673,6 +1686,11 @@ export class Chat {
 	handleEvent(event) {
 		if (event.sessionId && event.sessionId !== this.sessionId) return
 		if (event.type === "session_activity") return
+		if (this.snapshot && sessionCursorGenerationChanged(this.snapshot, event)) {
+			this.needsSnapshotRebuild = true
+			this.needsBranchSnapshotRebuild = false
+			return
+		}
 		if (typeof event.seq === "number" && event.seq <= this.lastSeq) return
 		if (this.viewEpoch !== undefined && event.viewEpoch !== undefined && event.viewEpoch < this.viewEpoch) return
 		const next = applySessionEvent(this.snapshot, event)

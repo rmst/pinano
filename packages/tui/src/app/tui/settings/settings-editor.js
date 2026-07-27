@@ -1,8 +1,9 @@
 import { reasoningLevelLabel } from "../../../../../protocol/src/reasoning.js"
 import { pickModel, rowsForModels } from "../../components/model-selector.js"
 import { pickFromOverlay } from "../../components/picker.js"
-import { availableModelEntries } from "../../../../../server/src/app/models.js"
+import { availableModelEntries } from "../../../../../server/src/app/model/registry.js"
 import { loadSettings, updateSetting } from "../../../../../server/src/app/settings.js"
+import { WEB_BROWSER_UI_NAME } from "../../../../../protocol/src/web-branding.js"
 import { showCredentialsSettings } from "./credentials-modal.js"
 import { currentDefaultModelRef, pickReasoningLevel, updateDefaultModel } from "./model-preferences.js"
 
@@ -14,7 +15,8 @@ export async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDe
 			{ value: "credentials", label: "credentials", description: "manage ChatGPT subscription OAuth and API keys" },
 			{ value: "model", label: `model: ${currentDefaultModelRef(settings)}`, description: "default model for new sessions" },
 			{ value: "thinkingLevel", label: `reasoning: ${reasoningLevelLabel(settings.thinkingLevel)}`, description: "default reasoning effort for new sessions" },
-			{ value: "updateCheck", label: `updateCheck: ${settings.updateCheck ? "on" : "off"}`, description: "check GitHub once per day for new Pinano releases" },
+			{ value: "web", label: `web: ${settings.web ? "on" : "off"}`, description: `enable ${WEB_BROWSER_UI_NAME} CLI and /web commands` },
+			{ value: "updateCheck", label: `updateCheck: ${settings.updateCheck ? "on" : "off"}`, description: "check GitHub once per day for new Cerex releases" },
 		])
 		if (!choice) return
 		if (choice === "credentials") {
@@ -42,6 +44,13 @@ export async function showSettingsEditor(ctx, { notify, onSettingsChanged, setDe
 			const updated = await setDefaultReasoning?.(level) ?? await updateSetting("thinkingLevel", /** @type {any} */ (level))
 			await onSettingsChanged?.(updated)
 			write(`default reasoning → ${level}`)
+			continue
+		}
+		if (choice === "web") {
+			const next = !settings.web
+			const updated = await updateSetting("web", next)
+			await onSettingsChanged?.(updated)
+			write(`web → ${next ? "on" : "off"}`)
 			continue
 		}
 		if (choice === "updateCheck") {

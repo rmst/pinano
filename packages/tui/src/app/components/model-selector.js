@@ -16,11 +16,11 @@ import {
 	visibleWidth,
 } from "../../tui/index.js"
 import { theme } from "../theme.js"
-import { modelEntryMatches, modelRef, modelRefMatches } from "../../../../server/src/app/models.js"
+import { modelEntryMatches, modelRef, modelRefMatches } from "../../../../server/src/app/model/registry.js"
 
 /** @typedef {import("../../tui/index.js").Component} Component */
 /** @typedef {import("../../tui/index.js").Focusable} Focusable */
-/** @typedef {import("../../../../server/src/app/models.js").ModelEntry} ModelEntry */
+/** @typedef {import("../../../../server/src/app/model/registry.js").ModelEntry} ModelEntry */
 
 /**
  * @typedef {object} ModelRow

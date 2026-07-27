@@ -1,7 +1,7 @@
-import { routeToArg, sessionRoute, overviewRoute } from "../../../../server/src/app/routes.js"
-import { rewindPromptActionItems } from "../../../../server/src/app/rewind-actions.js"
-import { fetchCodexUsage, formatCodexUsage } from "../../../../server/src/app/codex-usage.js"
-import { isFastModeEligibleModel } from "../../../../server/src/app/fast-mode.js"
+import { routeToArg, sessionRoute, overviewRoute } from "../../../../server/src/app/navigation/routes.js"
+import { rewindPromptActionItems } from "../../../../server/src/app/session/rewind-actions.js"
+import { fetchCodexUsage, formatCodexUsage } from "../../../../server/src/app/usage/codex.js"
+import { isFastModeEligibleModel } from "../../../../server/src/app/agent/fast-mode.js"
 import { showTextModal } from "../components/text-modal.js"
 import { WEB_BROWSER_UI_NAME } from "../../../../protocol/src/web-branding.js"
 
@@ -86,7 +86,7 @@ export function serviceChatCommandLine(text, settings = undefined) {
 }
 
 export function sessionOpenCommand(sessionId) {
-	return `pinano open ${routeToArg(sessionRoute(sessionId))}`
+	return `cerex open ${routeToArg(sessionRoute(sessionId))}`
 }
 
 export function parseAgentSpawnArgs(arg) {

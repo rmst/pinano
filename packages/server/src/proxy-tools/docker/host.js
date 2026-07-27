@@ -2,15 +2,15 @@ import { spawn } from "node:child_process"
 import { isAbsolute, resolve } from "node:path"
 
 import { DOCKER_PROXY_ROUTE } from "../../../../protocol/src/internal-proxy-routes.js"
-import { effectiveSandboxMounts, hostPathForMountedPath } from "../../app/sandbox-paths.js"
-import { addSessionWorkspaceRootMount } from "../../app/tool-state-mounts.js"
-import { internalHttpJsonResponse, internalHttpRequestBodyText } from "../../app/worker-internal-http.js"
+import { effectiveSandboxMounts, hostPathForMountedPath } from "../../app/sandbox/paths.js"
+import { addSessionWorkspaceRootMount } from "../../app/workers/tool/state-mounts.js"
+import { internalHttpJsonResponse, internalHttpRequestBodyText } from "../../app/workers/internal-http.js"
 
 export { DOCKER_PROXY_ROUTE }
-export const DOCKER_PROXY_OWNER_LABEL = "com.pinano.proxy"
+export const DOCKER_PROXY_OWNER_LABEL = "app.cerex.proxy"
 export const DOCKER_PROXY_OWNER_VALUE = "docker"
-export const DOCKER_PROXY_SESSION_LABEL = "com.pinano.session"
-export const DOCKER_PROXY_ENVIRONMENT_LABEL = "com.pinano.environment"
+export const DOCKER_PROXY_SESSION_LABEL = "app.cerex.session"
+export const DOCKER_PROXY_ENVIRONMENT_LABEL = "app.cerex.environment"
 
 const DOCKER_CLI_ERROR_EXIT_CODE = 125
 const MAX_PROXY_OUTPUT_BYTES = 8 * 1024 * 1024
@@ -231,14 +231,14 @@ function userLabelName(value) {
 function assertUserLabelAllowed(value) {
 	const name = userLabelName(value)
 	if (!name) throw cliError("docker run --label requires a non-empty name")
-	if (name.startsWith("com.pinano.")) throw cliError("com.pinano.* Docker labels are reserved")
+	if (name.startsWith("app.cerex.") || name.startsWith("com.pinano.")) throw cliError("Cerex Docker labels are reserved")
 }
 
 function normalizeNetworkMode(value) {
 	const mode = String(value ?? "").trim()
 	if (!mode) throw cliError("docker run --network requires a non-empty value")
 	if (["host"].includes(mode) || mode.startsWith("container:")) throw cliError(`docker run --network=${mode} is not allowed`)
-	if (!["bridge", "none"].includes(mode)) throw cliError(`docker run --network=${mode} is not available through the Pinano proxy`)
+	if (!["bridge", "none"].includes(mode)) throw cliError(`docker run --network=${mode} is not available through the Cerex proxy`)
 	return mode
 }
 
@@ -261,7 +261,7 @@ function pathLikeVolumeSource(source) {
 }
 
 function rewriteBindSource(source, payload, context = {}) {
-	if (!pathLikeVolumeSource(source)) throw cliError("named and anonymous Docker volumes are not available through the Pinano proxy")
+	if (!pathLikeVolumeSource(source)) throw cliError("named and anonymous Docker volumes are not available through the Cerex proxy")
 	const workerPath = resolveWorkerPath(source, payload.cwd)
 	if (!workerPath) throw cliError(`bind mount source is not an absolute path and cwd is unavailable: ${source}`)
 	const mapped = hostPathForWorkerDockerPath(workerPath, context.workerContext)
@@ -300,8 +300,8 @@ function rewriteMountSpec(spec, payload, context = {}) {
 	const unknown = Object.keys(mount).filter((key) => !MOUNT_SPEC_KEYS.has(key))
 	if (unknown.length > 0) throw cliError(`unsupported docker mount option: ${unknown[0]}`)
 	const type = mount.type ?? "volume"
-	if (type !== "bind") throw cliError("only type=bind Docker mounts are available through the Pinano proxy")
-	if (mount["bind-propagation"]) throw cliError("Docker bind propagation options are not available through the Pinano proxy")
+	if (type !== "bind") throw cliError("only type=bind Docker mounts are available through the Cerex proxy")
+	if (mount["bind-propagation"]) throw cliError("Docker bind propagation options are not available through the Cerex proxy")
 	const source = mount.source ?? mount.src
 	const target = mount.target ?? mount.destination ?? mount.dst
 	if (!source) throw cliError("docker bind mount source is required")
@@ -332,7 +332,7 @@ function consumeLongValueOption(argv, index, out) {
 function consumeRejectedOption(argv, index, messagePrefix) {
 	const arg = argv[index]
 	const name = optionName(arg)
-	throw cliError(`${messagePrefix} ${name} is not available through the Pinano proxy`)
+	throw cliError(`${messagePrefix} ${name} is not available through the Cerex proxy`)
 }
 
 function consumeRunVolume(argv, index, payload, context, out) {
@@ -374,7 +374,7 @@ function consumeRunMount(argv, index, payload, context, out) {
 
 function consumeRunShortOption(argv, index, out) {
 	const arg = argv[index]
-	if (/^-[dit]+$/.test(arg) && arg.includes("d")) throw cliError("detached docker run containers are not available through the Pinano proxy")
+	if (/^-[dit]+$/.test(arg) && arg.includes("d")) throw cliError("detached docker run containers are not available through the Cerex proxy")
 	if (/^-[it]+$/.test(arg)) {
 		out.push(arg)
 		return index + 1
@@ -401,22 +401,22 @@ function consumeRunShortOption(argv, index, out) {
 			return index + 1
 		}
 	}
-	if (arg === "-p" || arg.startsWith("-p") || arg === "-P") throw cliError("docker run port publishing is not available through the Pinano proxy")
+	if (arg === "-p" || arg.startsWith("-p") || arg === "-P") throw cliError("docker run port publishing is not available through the Cerex proxy")
 	return undefined
 }
 
 function consumeRunLongOption(argv, index, out, state = {}) {
 	const arg = argv[index]
 	const name = optionName(arg)
-	if (name === "--detach") throw cliError("detached docker run containers are not available through the Pinano proxy")
+	if (name === "--detach") throw cliError("detached docker run containers are not available through the Cerex proxy")
 	if (RUN_REJECTED_FLAGS.has(name)) return consumeRejectedOption(argv, index, "docker run")
 	if (RUN_BOOLEAN_FLAGS.has(name)) {
-		if (name === "--privileged" && !arg.includes("=")) throw cliError("docker run --privileged is not available through the Pinano proxy")
-		if (name === "--publish-all") throw cliError("docker run --publish-all is not available through the Pinano proxy")
-		if (name === "--privileged" && inlineOptionValue(arg) !== "false") throw cliError("docker run --privileged is not available through the Pinano proxy")
+		if (name === "--privileged" && !arg.includes("=")) throw cliError("docker run --privileged is not available through the Cerex proxy")
+		if (name === "--publish-all") throw cliError("docker run --publish-all is not available through the Cerex proxy")
+		if (name === "--privileged" && inlineOptionValue(arg) !== "false") throw cliError("docker run --privileged is not available through the Cerex proxy")
 		if (name === "--rm") {
 			const value = inlineOptionValue(arg)
-			if (value !== undefined && value !== "true") throw cliError("docker run --rm=false is not available through the Pinano proxy")
+			if (value !== undefined && value !== "true") throw cliError("docker run --rm=false is not available through the Cerex proxy")
 			state.autoRemove = true
 			out.push("--rm")
 			return index + 1
@@ -502,7 +502,7 @@ function consumeSimpleFlag(argv, index, out, spec) {
 	const arg = argv[index]
 	if (!arg.startsWith("-") || arg === "-") return undefined
 	const name = optionName(arg)
-	if (spec.rejectFilter && (name === "--filter" || arg === "-f" || arg.startsWith("-f"))) throw cliError(`${spec.command} --filter is not available through the Pinano proxy`)
+	if (spec.rejectFilter && (name === "--filter" || arg === "-f" || arg.startsWith("-f"))) throw cliError(`${spec.command} --filter is not available through the Cerex proxy`)
 	if (arg === "--") return index + 1
 	if (arg.startsWith("--")) {
 		if (spec.boolean.has(name)) {
@@ -594,10 +594,10 @@ function planDockerExec(prefix, rest) {
 			index++
 			break
 		}
-		if (!optionsEnded && arg === "--privileged") throw cliError("docker exec --privileged is not available through the Pinano proxy")
-		if (!optionsEnded && (arg === "--env-file" || arg.startsWith("--env-file="))) throw cliError("docker exec --env-file is not available through the Pinano proxy")
-		if (!optionsEnded && optionName(arg) === "--detach") throw cliError("detached docker exec processes are not available through the Pinano proxy")
-		if (!optionsEnded && /^-[dit]+$/.test(arg) && arg.includes("d")) throw cliError("detached docker exec processes are not available through the Pinano proxy")
+		if (!optionsEnded && arg === "--privileged") throw cliError("docker exec --privileged is not available through the Cerex proxy")
+		if (!optionsEnded && (arg === "--env-file" || arg.startsWith("--env-file="))) throw cliError("docker exec --env-file is not available through the Cerex proxy")
+		if (!optionsEnded && optionName(arg) === "--detach") throw cliError("detached docker exec processes are not available through the Cerex proxy")
+		if (!optionsEnded && /^-[dit]+$/.test(arg) && arg.includes("d")) throw cliError("detached docker exec processes are not available through the Cerex proxy")
 		if (!optionsEnded && arg.startsWith("-") && arg !== "-") {
 			const next = consumeSimpleFlag(rest, index, out, {
 				command: "docker exec",
@@ -625,10 +625,10 @@ function planDockerExec(prefix, rest) {
 function commandHelpResponse() {
 	return proxyToolResponse({
 		stdout: [
-			"Pinano Docker proxy",
+			"Cerex Docker proxy",
 			"",
 			"Supported commands: run, ps, container ls, logs, stop, rm, exec, inspect.",
-			"Containers are limited to this Pinano session and bind mounts are mapped through the active sandbox.",
+			"Containers are limited to this Cerex session and bind mounts are mapped through the active sandbox.",
 			"",
 		].join("\n"),
 	})
@@ -637,7 +637,7 @@ function commandHelpResponse() {
 export function planDockerProxyCommand(payload, context = {}) {
 	const argv = payload.argv ?? []
 	if (argv.length === 0 || argv[0] === "--help" || argv[0] === "help") return { response: commandHelpResponse() }
-	if (argv[0] === "--version" || argv[0] === "version") throw cliError("host Docker version information is not exposed through the Pinano proxy")
+	if (argv[0] === "--version" || argv[0] === "version") throw cliError("host Docker version information is not exposed through the Cerex proxy")
 	if (argv[0]?.startsWith("-")) throw cliError(`unsupported docker global option: ${optionName(argv[0])}`)
 
 	const command = argv[0]
@@ -741,7 +741,7 @@ export function runDockerCli(args, options = {}) {
 		})
 		child.on("close", (code, signal) => {
 			const truncated = stdoutState.truncated || stderrState.truncated
-			const suffix = truncated ? Buffer.from("\n[pinano docker proxy: output truncated]\n", "utf-8") : Buffer.alloc(0)
+			const suffix = truncated ? Buffer.from("\n[cerex docker proxy: output truncated]\n", "utf-8") : Buffer.alloc(0)
 			resolve({
 				exitCode: code ?? (signal ? 128 : 1),
 				stdout: Buffer.concat(stdoutChunks),
@@ -766,7 +766,7 @@ async function assertOwnedContainers(refs = [], context = {}, runDocker = runDoc
 	for (const ref of refs) {
 		const labels = await inspectContainerLabels(ref, context, runDocker)
 		if (!labels || Object.entries(expected).some(([name, value]) => labels[name] !== value)) {
-			throw cliError(`container is not managed by this Pinano session: ${ref}`)
+			throw cliError(`container is not managed by this Cerex session: ${ref}`)
 		}
 	}
 }

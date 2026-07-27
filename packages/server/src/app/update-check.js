@@ -1,16 +1,16 @@
-// Daily public-release update check. This is intentionally notice-only: Pinano
+// Daily public-release update check. This is intentionally notice-only: Cerex
 // never runs npm or mutates its installation from inside the app.
 
 import { readFile, writeFile, mkdir } from "node:fs/promises"
 import { dirname } from "node:path"
 
-import { isPinanoTestProcess, updateCheckStatePath } from "./paths.js"
+import { isTestProcess, updateCheckStatePath } from "./paths.js"
 
-export const UPDATE_CHECK_PACKAGE_URL = "https://raw.githubusercontent.com/rmst/pinano/public/package.json"
+export const UPDATE_CHECK_PACKAGE_URL = "https://raw.githubusercontent.com/rmst/cerex/public/package.json"
 export const UPDATE_CHECK_NOTICE_MS = 10_000
-export const UPDATE_CHECK_INSTALL_COMMAND = "npm install -g github:rmst/pinano"
+export const UPDATE_CHECK_INSTALL_COMMAND = "npm install -g github:rmst/cerex"
 
-const PINANO_DAY_START_HOUR = 4
+const UPDATE_DAY_START_HOUR = 4
 const DEFAULT_TIMEOUT_MS = 2_000
 
 /** @param {number} value */
@@ -18,7 +18,7 @@ const pad2 = (value) => String(value).padStart(2, "0")
 
 /** @param {Date} now */
 export function updateCheckDay(now = new Date()) {
-	const shifted = new Date(now.getTime() - PINANO_DAY_START_HOUR * 60 * 60 * 1000)
+	const shifted = new Date(now.getTime() - UPDATE_DAY_START_HOUR * 60 * 60 * 1000)
 	return `${shifted.getFullYear()}-${pad2(shifted.getMonth() + 1)}-${pad2(shifted.getDate())}`
 }
 
@@ -74,7 +74,7 @@ export function compareSemver(a, b) {
 
 async function currentPackageVersion() {
 	const pkg = JSON.parse(await readFile(new URL("../../../../package.json", import.meta.url), "utf-8"))
-	if (typeof pkg.version !== "string" || !pkg.version) throw new Error("Pinano package.json is missing a version")
+	if (typeof pkg.version !== "string" || !pkg.version) throw new Error("Cerex package.json is missing a version")
 	return pkg.version
 }
 
@@ -131,7 +131,7 @@ function errorMessage(err) {
 }
 
 /**
- * Checks GitHub's public package metadata at most once per Pinano day, where a
+ * Checks GitHub's public package metadata at most once per Cerex day, where a
  * day starts at 04:00 local time. Returns a user-facing notice only when a newer
  * semver is available.
  *
@@ -149,7 +149,7 @@ function errorMessage(err) {
  */
 export async function checkForUpdateNotice(settings, options = {}) {
 	if (settings?.updateCheck !== true) return null
-	if (isPinanoTestProcess() && options.allowTestProcess !== true) return null
+	if (isTestProcess() && options.allowTestProcess !== true) return null
 
 	const now = options.now ?? new Date()
 	const day = updateCheckDay(now)
@@ -182,7 +182,7 @@ export async function checkForUpdateNotice(settings, options = {}) {
 				currentVersion,
 				latestVersion,
 				installCommand: UPDATE_CHECK_INSTALL_COMMAND,
-				message: `Pinano update available: ${latestVersion}. Run ${UPDATE_CHECK_INSTALL_COMMAND}`,
+				message: `Cerex update available: ${latestVersion}. Run ${UPDATE_CHECK_INSTALL_COMMAND}`,
 			}
 		}
 		await writeState(path, nextState)

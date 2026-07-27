@@ -142,7 +142,7 @@ function extractKittyImageIds(line) {
  * Components emit this at the cursor position when focused.
  * TUI finds and strips this marker, then positions the hardware cursor there.
  */
-export const CURSOR_MARKER = `\x1b_pinano:cursor:${randomUUID()}\x07`;
+export const CURSOR_MARKER = `\x1b_tui:cursor:${randomUUID()}\x07`;
 
 let terminalBaseStyle = "";
 

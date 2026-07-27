@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { basename, dirname, resolve } from "node:path"
 import { URL, fileURLToPath } from "node:url"
 
-const VERSION = "pinano-curl 0.1 curl-compatible HTTP(S) subset"
+const VERSION = "cerex-curl 0.1 curl-compatible HTTP(S) subset"
 const DEFAULT_MAX_REDIRECTS = 30
 const unsupportedExitCode = 2
 
@@ -255,7 +255,7 @@ export function parseArgs(args) {
 function validateConfig(config) {
 	if (config.version || config.help) return
 	if (config.urls.length === 0) throw new CurlUsageError("no URL specified")
-	if (config.urls.length > 1) throw new CurlUsageError("multiple URLs are not supported by the pinano curl fallback")
+	if (config.urls.length > 1) throw new CurlUsageError("multiple URLs are not supported by the cerex curl fallback")
 	if (config.cookieJar) throw new CurlUsageError("unsupported option --cookie-jar/-c")
 	if (config.forms.length > 0 && (config.data.length > 0 || config.dataBinary.length > 0 || config.json !== undefined)) {
 		throw new CurlUsageError("mixing -F/--form with data/json options is not supported")
@@ -309,7 +309,7 @@ async function readStdin() {
 }
 
 async function buildMultipart(forms) {
-	const boundary = `pinano-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+	const boundary = `cerex-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 	const chunks = []
 	for (const form of forms) {
 		const [namePart, valuePart = ""] = form.value.split(/=(.*)/s)
@@ -609,7 +609,7 @@ async function main() {
 		return await perform(config)
 	} catch (err) {
 		const code = err?.exitCode || (err?.name === "AbortError" ? 28 : 1)
-		const prefix = code === unsupportedExitCode ? "pinano curl fallback" : "curl"
+		const prefix = code === unsupportedExitCode ? "cerex curl fallback" : "curl"
 		writeStderr(`${prefix}: ${err?.message || err}\n`)
 		if (code === unsupportedExitCode) writeStderr("This fallback only supports common HTTP(S) curl usage. Install curl for full support.\n")
 		return code

@@ -11,7 +11,7 @@ export function bootstrapSource(tools, storedValues, maxOutputChars) {
 		}
 		const timerCallbacks = new Map()
 		const outbox = []
-		const wakeHost = typeof globalThis.__pinanoCodeModeWake === "function" ? globalThis.__pinanoCodeModeWake : undefined
+		const wakeHost = typeof globalThis.__codeModeWake === "function" ? globalThis.__codeModeWake : undefined
 		const enqueue = (entry) => {
 			outbox.push(entry)
 			wakeHost?.()
@@ -96,17 +96,30 @@ export function bootstrapSource(tools, storedValues, maxOutputChars) {
 				return String(value)
 			}
 		}
+		const imageDetails = new Set(["auto", "low", "high", "original"])
+		const normalizeImageDetail = (detail) => {
+			if (detail === undefined || detail === null) return undefined
+			if (typeof detail !== "string") throw new TypeError("image detail must be a string when provided")
+			const normalized = detail.toLowerCase()
+			if (!imageDetails.has(normalized)) throw new TypeError("image detail must be one of: auto, low, high, original")
+			return normalized
+		}
 		const normalizeImage = (value, detail) => {
+			const detailOverride = normalizeImageDetail(detail)
 			if (typeof value === "string") {
 				const match = /^data:(image\\/[^;,]+);base64,(.+)$/s.exec(value)
 				if (!match) throw new TypeError("image string must be a base64 data: URL")
-				return { type: "image", mimeType: match[1], data: match[2], ...(detail ? { detail } : {}) }
+				return { type: "image", mimeType: match[1], data: match[2], ...(detailOverride ? { detail: detailOverride } : {}) }
 			}
 			if (!value || typeof value !== "object") throw new TypeError("image expects an image object or data: URL")
 			if (value.type === "image" && typeof value.data === "string" && typeof value.mimeType === "string") {
-				return { ...clone(value), ...(detail ? { detail } : {}) }
+				const cloned = clone(value)
+				const normalizedDetail = detailOverride ?? normalizeImageDetail(cloned.detail)
+				if (normalizedDetail === undefined) delete cloned.detail
+				else cloned.detail = normalizedDetail
+				return cloned
 			}
-			if (typeof value.image_url === "string") return normalizeImage(value.image_url, detail ?? value.detail)
+			if (typeof value.image_url === "string") return normalizeImage(value.image_url, detailOverride ?? value.detail)
 			throw new TypeError("image object is missing image data")
 		}
 		const callTool = (definition, input) => {
@@ -142,7 +155,7 @@ export function bootstrapSource(tools, storedValues, maxOutputChars) {
 				flushOutputTail()
 				enqueue({ type: "yield" })
 			},
-			exit: () => { throw { __pinanoCodeModeExit: true } },
+			exit: () => { throw { __codeModeExit: true } },
 			setTimeout: (callback, delay = 0) => {
 				if (typeof callback !== "function") throw new TypeError("setTimeout callback must be a function")
 				const id = nextTimerId++
@@ -279,7 +292,7 @@ export function runCodeModeRunner(createCell) {
 		active = false
 		for (const timer of timers.values()) hostClearTimeout(timer)
 		timers.clear()
-		const exited = Boolean(error && typeof error === "object" && error.__pinanoCodeModeExit === true)
+		const exited = Boolean(error && typeof error === "object" && error.__codeModeExit === true)
 		const rawError = error instanceof HostError
 			? error.stack && error.message && !error.stack.includes(error.message)
 				? `${error.message}\n${error.stack}`

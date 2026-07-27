@@ -1,51 +1,90 @@
-// Centralized path resolution for pinano on-disk state.
-//
-// Defaults to ~/.pinano. Override the entire user, data, and environment root
-// with $PINANO_HOME — useful for tests and custom installs.
+// Centralized path resolution for Cerex on-disk state.
 
-import { statSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync, renameSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
-import { safePathComponent, sessionWorkspaceDirName } from "./session-workspace-names.js"
+import { LEGACY_PRODUCT_STATE_DIRECTORY, PRODUCT_STATE_DIRECTORY, readProductEnv } from "../../../protocol/src/product.js"
+import { safePathComponent, sessionWorkspaceDirName } from "./session/workspace-names.js"
 
-function pinanoHome() {
-	return process.env.PINANO_HOME || join(homedir(), ".pinano")
+function pathsReferToSameDirectory(left, right) {
+	try {
+		return realpathSync(left) === realpathSync(right)
+	} catch {
+		return false
+	}
 }
 
-export function isPinanoTestProcess() {
-	if (process.env.PINANO_TEST === "1") return true
+function legacyServiceAppearsActive(home) {
+	try {
+		const info = JSON.parse(readFileSync(join(home, "data", "services", "global", "service.json"), "utf-8"))
+		const pid = Number(info?.pid)
+		if (!Number.isInteger(pid) || pid <= 0) return false
+		process.kill(pid, 0)
+		return true
+	} catch (err) {
+		return err?.code === "EPERM"
+	}
+}
+
+function defaultProductHome() {
+	const canonical = join(homedir(), PRODUCT_STATE_DIRECTORY)
+	const legacy = join(homedir(), LEGACY_PRODUCT_STATE_DIRECTORY)
+	const canonicalExists = existsSync(canonical)
+	const legacyExists = existsSync(legacy)
+	if (canonicalExists && legacyExists) {
+		if (pathsReferToSameDirectory(canonical, legacy)) return canonical
+		throw new Error(`Both ${canonical} and legacy ${legacy} exist. Merge or remove one before starting Cerex; Cerex will not choose between two state directories.`)
+	}
+	if (canonicalExists || !legacyExists) return canonical
+	if (legacyServiceAppearsActive(legacy)) {
+		throw new Error(`Legacy state exists at ${legacy}, but its service still appears to be running. Stop it with \`pinano service stop\`, then start Cerex again to migrate the state to ${canonical}.`)
+	}
+	try {
+		renameSync(legacy, canonical)
+	} catch (err) {
+		throw new Error(`Could not migrate legacy state from ${legacy} to ${canonical}: ${err?.message ?? err}`, { cause: err })
+	}
+	return canonical
+}
+
+function productHome() {
+	return readProductEnv(process.env, "HOME") || defaultProductHome()
+}
+
+export function isTestProcess() {
+	if (readProductEnv(process.env, "TEST") === "1") return true
 	if (process.env.NODE_TEST_CONTEXT) return true
 	return process.argv.some((arg) => arg === "--test" || /\.test\.[cm]?[jt]s$/.test(arg))
 }
 
 function assertSafeTestHome() {
-	if (!isPinanoTestProcess() || process.env.PINANO_ALLOW_PRODUCTION_HOME_IN_TESTS === "1") return
-	const home = process.env.PINANO_HOME
-	const persistentAgentHome = resolve(homedir(), ".pinano")
+	if (!isTestProcess() || readProductEnv(process.env, "ALLOW_PRODUCTION_HOME_IN_TESTS") === "1") return
+	const home = readProductEnv(process.env, "HOME")
+	const persistentHomes = [PRODUCT_STATE_DIRECTORY, LEGACY_PRODUCT_STATE_DIRECTORY].map((name) => resolve(homedir(), name))
 	if (!home) {
-		throw new Error("Pinano tests require an isolated PINANO_HOME. Set PINANO_HOME to a temp directory.")
+		throw new Error("Cerex tests require an isolated CEREX_HOME. Set CEREX_HOME to a temp directory.")
 	}
 	const resolved = resolve(home)
-	if (resolved === persistentAgentHome || resolved.startsWith(`${persistentAgentHome}/`)) {
-		throw new Error(`Pinano tests refuse to use persistent PINANO_HOME (${home}). Set PINANO_HOME to a temp directory.`)
+	if (persistentHomes.some((persistentHome) => resolved === persistentHome || resolved.startsWith(`${persistentHome}/`))) {
+		throw new Error(`Cerex tests refuse to use persistent CEREX_HOME (${home}). Set CEREX_HOME to a temp directory.`)
 	}
 }
 
 function isUnsafeTestHomeError(err) {
-	return isPinanoTestProcess() && /Pinano tests refuse to use persistent PINANO_HOME|Pinano tests require an isolated PINANO_HOME/.test(err?.message ?? String(err))
+	return isTestProcess() && /Cerex tests refuse to use persistent CEREX_HOME|Cerex tests require an isolated CEREX_HOME/.test(err?.message ?? String(err))
 }
 
 /** @returns {string} */
-export function pinanoHomePath() {
+export function productHomePath() {
 	assertSafeTestHome()
-	return pinanoHome()
+	return productHome()
 }
 
 /** @returns {string | undefined} */
-export function optionalPinanoHomePath() {
-	if (isPinanoTestProcess() && !process.env.PINANO_HOME) return undefined
+export function optionalProductHomePath() {
+	if (isTestProcess() && !readProductEnv(process.env, "HOME")) return undefined
 	try {
-		return pinanoHomePath()
+		return productHomePath()
 	} catch (err) {
 		if (isUnsafeTestHomeError(err)) return undefined
 		throw err
@@ -55,11 +94,11 @@ export function optionalPinanoHomePath() {
 /** @returns {string} */
 export function dataRoot() {
 	assertSafeTestHome()
-	return join(pinanoHome(), "data")
+	return join(productHome(), "data")
 }
 
 function configuredServiceRoot() {
-	return process.env.PINANO_SERVICE_DIR
+	return readProductEnv(process.env, "SERVICE_DIR")
 }
 
 /** @returns {string} */
@@ -67,7 +106,7 @@ export function serviceStateRoot() {
 	const configured = configuredServiceRoot()
 	if (configured) return configured
 	assertSafeTestHome()
-	return join(pinanoHome(), "data", "services")
+	return join(productHome(), "data", "services")
 }
 
 /** @returns {string} */
@@ -87,12 +126,12 @@ export function runtimeSourceReferencePath() {
 
 /**
  * Launchers and context rendering can run in unit tests that intentionally do
- * not use a Pinano state directory. In that case there is no service-created
+ * not use a product state directory. In that case there is no service-created
  * source reference to mount or describe.
  * @returns {string | undefined}
  */
 export function optionalRuntimeSourceReferencePath() {
-	if (isPinanoTestProcess() && !process.env.PINANO_HOME) return undefined
+	if (isTestProcess() && !readProductEnv(process.env, "HOME")) return undefined
 	let path
 	try {
 		path = runtimeSourceReferencePath()
@@ -111,23 +150,23 @@ export function optionalRuntimeSourceReferencePath() {
 /** @returns {string} */
 export function environmentsRoot() {
 	assertSafeTestHome()
-	return join(pinanoHome(), "environments")
+	return join(productHome(), "environments")
 }
 
 /** @returns {string} */
 export function sessionWorkspacesRoot() {
 	assertSafeTestHome()
-	return join(pinanoHome(), "sessions")
+	return join(productHome(), "sessions")
 }
 
 /** @returns {string | undefined} */
 export function optionalSessionWorkspacesRoot() {
-	const home = optionalPinanoHomePath()
+	const home = optionalProductHomePath()
 	return home ? join(home, "sessions") : undefined
 }
 
 /**
- * Per-session workspace for scratch files and tool temp state.
+ * Service-owned directory for durable files associated with one session.
  * @param {string} sessionId
  * @returns {string}
  */
@@ -136,7 +175,7 @@ export function sessionWorkspacePath(sessionId) {
 }
 
 /**
- * Per-session workspace path when a safe Pinano home is available.
+ * Per-session workspace path when a safe Cerex home is available.
  * @param {string | undefined} sessionId
  * @returns {string | undefined}
  */
@@ -155,10 +194,10 @@ export function environmentHomePath(environmentId) {
 	return join(environmentsRoot(), safePathComponent(environmentId), "home")
 }
 
-export const managedContainerHomePath = "/home/pinano"
+export const managedContainerHomePath = "/home/cerex"
 
 /**
- * Host-side home directory for Pinano-managed container environments.
+ * Host-side home directory for Cerex-managed container environments.
  * @param {string | undefined} environmentId
  * @returns {string}
  */
@@ -168,22 +207,22 @@ export function environmentContainerHomePath(environmentId) {
 
 /** @returns {string} */
 export function settingsPath() {
-	return join(pinanoHomePath(), "settings.json")
+	return join(productHomePath(), "settings.json")
 }
 
 /** @returns {string} */
 export function defaultSettingsPath() {
-	return join(pinanoHomePath(), "default-settings.json")
+	return join(productHomePath(), "default-settings.json")
 }
 
 /** @returns {string} */
 export function environmentsConfigPath() {
-	return join(pinanoHomePath(), "environments.json")
+	return join(productHomePath(), "environments.json")
 }
 
 /** @returns {string} */
 export function authDir() {
-	return join(pinanoHomePath(), "auth")
+	return join(productHomePath(), "auth")
 }
 
 /**
@@ -195,7 +234,7 @@ export function authFilePath(provider) {
 }
 
 /**
- * SQLite database used by Pinano server/web mode and the TUI/RPC session store.
+ * SQLite database used by Cerex server/web mode and the TUI/RPC session store.
  * It is the canonical store for session metadata, transcript entries, run state,
  * and service lifecycle records.
  * @returns {string}

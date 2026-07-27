@@ -3,5 +3,6 @@ inspiration/
 .DS_Store
 *.log
 .pinano/
+.cerex/
 .jix/
 .vscode/

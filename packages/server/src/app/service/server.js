@@ -1,6 +1,6 @@
-// Supervisor service for background Pinano agent sessions.
+// Supervisor service for background Cerex agent sessions.
 //
-// The service owns RuntimeManager and all live Agent runtimes for one Pinano home.
+// The service owns RuntimeManager and all live Agent runtimes for one Cerex home.
 // Frontends (agent view, open routes, shell helpers, and web) talk to it over
 // authenticated local HTTP and WebSocket endpoints over loopback TCP.
 
@@ -9,31 +9,40 @@ import { mkdir, readFile, rm } from "node:fs/promises"
 import * as http from "node:http"
 import { join, resolve } from "node:path"
 
-import { ensureRuntimeSourceReference } from "../runtime-source-reference.js"
+import { ensureRuntimeSourceReference } from "../runtime/source-reference.js"
 import { loadSettings, updateSetting } from "../settings.js"
-import { RuntimeManager } from "../session-runtime/index.js"
-import { authenticateRequest, authenticateRequestParts, bearerTokenFromHeader } from "../http-auth.js"
-import { configuredServiceDebug, configuredServiceDiagnostics, configuredWebDefaults } from "../service-config.js"
-import { getOrCreateServiceToken } from "../service-token.js"
-import { createServiceDiagnostics } from "../service-diagnostics.js"
+import { RuntimeManager } from "../session/runtime/index.js"
+import { authenticateRequest, authenticateRequestParts, bearerTokenFromHeader } from "../http/auth.js"
+import { configuredServiceDebug, configuredServiceDiagnostics, configuredWebDefaults } from "./config.js"
+import { getOrCreateServiceToken } from "./token.js"
+import { createServiceDiagnostics } from "./diagnostics.js"
 import { createDebugInspectApp, isDebugRequestPath } from "../debug-inspect.js"
-import { HttpRouter } from "../http-router.js"
+import { HttpRouter } from "../http/router.js"
+import { HOP_BY_HOP_HEADERS } from "../http/proxy.js"
 import { createManagerClientApi, json, jsonBody, registerClientApiRoutes, routeError } from "../client-api.js"
-import { writeResponseBody } from "../http-response.js"
+import { writeResponseBody } from "../http/response.js"
 import { createLiveEventHub } from "../live/event-hub.js"
-import { createAppLiveResource } from "../live/resources.js"
-import { createSessionListLiveResource } from "../session-list-live-resource.js"
+import { createAppLiveResource, createSharedWatchResource } from "../live/resources.js"
+import { createSessionListLiveResource } from "../session/list-live-resource.js"
 import { createLiveResourceWebSocketServer } from "../live/resource-websocket.js"
-import { startCodexUsagePoller } from "../codex-usage-poller.js"
-import { bestEffortAutoInstallBundledBubblewrap } from "../bundled-bwrap.js"
-import { createWorkspaceRootPolicyFromSettings } from "../workspace-root-policy.js"
-import { webPasswordAuthConfigKey, webPasswordAuthStatus } from "../web-config.js"
+import { startCodexUsagePoller } from "../usage/codex-poller.js"
+import { bestEffortAutoInstallBundledBubblewrap } from "../sandbox/bwrap/bundled.js"
+import { workspaceRootFromSettings } from "../sandbox/workspace-root-policy.js"
+import { createLocalWorkspaceHost } from "../workspace/local-host.js"
+import { webPasswordAuthConfigKey, webPasswordAuthStatus } from "../web/config.js"
 import { WEB_BROWSER_UI_NAME } from "../../../../protocol/src/web-branding.js"
+import {
+	WORKSPACE_CONTRACT_ROUTE,
+	WORKSPACE_DIRECTORY_RESOURCE,
+	WORKSPACE_FILES_ROUTE,
+	WORKSPACE_INTERNAL_HEADER_PREFIX,
+} from "../../../../protocol/src/workspace-contract.js"
 import { PreviewManager } from "../preview/manager.js"
+import { previewAccessTokenForServiceToken } from "../preview/access.js"
 import { PREVIEW_AUTHORIZATION_HEADER, previewPublicUrlFromSettings, previewRoutingSlugFromSettings } from "../preview/manifest.js"
 import { serviceHostForListen } from "./network.js"
 
-/** @typedef {import("../agent-runtime.js").AgentRuntime} Agent */
+/** @typedef {import("../agent/runtime.js").AgentRuntime} Agent */
 import {
 	SERVICE_PROTOCOL_VERSION,
 	SERVICE_OWNERSHIP_CHECK_INTERVAL_MS,
@@ -82,24 +91,52 @@ import {
  * @param {number} [options.idleShutdownDelayMs]
  * @param {boolean} [options.allowPortFallback]
  * @param {boolean} [options.startWeb]
- * @param {() => Promise<{ createManagerWebApp: Function, webPublicUrl: Function }>} [options.loadWebMode]
+ * @param {() => Promise<{ createManagerWebApp: Function, createProjectWorkspaceBackend: Function, webPublicUrl: Function }>} [options.loadWebMode]
  * @param {number} [options.serviceOwnershipCheckIntervalMs]
  * @param {any} [options.webAppOptions]
+ * @param {{ kind?: string, client: import("../workspace/client.js").WorkspaceClient, peer: { call: Function }, close?: () => void | Promise<void> }} [options.workspaceHost]
  * @param {(identity: any) => Promise<{ path: string, generation: string }>} [options.prepareRuntimeSourceReference]
- * @param {(info: { sessionId: string, session: any, cwd: string }) => Agent} options.createAgent
+ * @param {(info: { sessionId: string, session: any, cwd: string, getSettings?: () => any, workspace?: any, previewAccessToken?: string }) => Agent} options.createAgent
  */
 export async function runService(options) {
 	await bestEffortAutoInstallBundledBubblewrap()
-	let serviceSettings = await loadSettings()
-	const workspacePolicy = await createWorkspaceRootPolicyFromSettings(serviceSettings)
-	const serviceCwd = workspacePolicy ? await workspacePolicy.normalizeUserCwd(options.cwd, "service startup cwd") : options.cwd
+	const serviceSettings = await loadSettings()
+	const workspaceHost = options.workspaceHost ?? await createLocalWorkspaceHost({
+		workspaceRoot: workspaceRootFromSettings(serviceSettings),
+		...(typeof options.loadWebMode === "function" ? {
+			createProjectWorkspace: async (workspaceOptions) => {
+				const { createProjectWorkspaceBackend } = await options.loadWebMode()
+				return createProjectWorkspaceBackend(workspaceOptions)
+			},
+		} : {}),
+	})
+	let workspaceHostClosed = false
+	const closeWorkspaceHost = async () => {
+		if (workspaceHostClosed) return
+		workspaceHostClosed = true
+		await workspaceHost.close?.()
+	}
+	try {
+		return await startServiceWithWorkspaceHost(options, { serviceSettings, workspaceHost, closeWorkspaceHost })
+	} catch (err) {
+		try { await closeWorkspaceHost() } catch {}
+		throw err
+	}
+}
+
+async function startServiceWithWorkspaceHost(options, startup) {
+	let serviceSettings = startup.serviceSettings
+	const { workspaceHost, closeWorkspaceHost } = startup
+	const workspace = workspaceHost.client
+	const serviceCwd = await workspace.paths.normalizeUserCwd(options.cwd, "service startup cwd")
 	const diagnosticsOptions = configuredServiceDiagnostics()
 	const diagnostics = createServiceDiagnostics({
 		...diagnosticsOptions,
 		path: diagnosticsOptions.path || join(serviceDir(), "diagnostics.jsonl"),
-		processName: "pinano service",
+		processName: "cerex service",
 	})
 	const serviceToken = typeof options.token === "string" && options.token ? options.token : await getOrCreateServiceToken()
+	const previewAccessToken = previewAccessTokenForServiceToken(serviceToken)
 	const runtimeIdentity = await processRuntimeIdentity()
 	const codeFingerprint = runtimeIdentity.codeFingerprint
 	if (options.serviceClaimId) await ensureCurrentRuntimeIsDesired(runtimeIdentity, options.serviceClaimId)
@@ -153,8 +190,8 @@ export async function runService(options) {
 	}
 	const manager = await RuntimeManager.create({
 		cwd: serviceCwd,
-		workspacePolicy,
-		createAgent: options.createAgent,
+		workspace,
+		createAgent: (info) => options.createAgent({ ...info, previewAccessToken }),
 		getSettings: () => serviceModelOverride ? serviceSettings : { ...serviceSettings, defaultModel: undefined },
 		getPreviewPublicUrl: webPreviewPublicUrl,
 		noContextFiles: options.noContextFiles === true,
@@ -243,7 +280,7 @@ export async function runService(options) {
 				ownerPid: owner?.info?.pid,
 				missingInfo: owner?.missing === true || undefined,
 			})
-			try { hub.send({ type: "error", error: "Pinano service lost ownership; reconnecting." }) } catch {}
+			try { hub.send({ type: "error", error: "Cerex service lost ownership; reconnecting." }) } catch {}
 			try { serviceLiveServer?.close() } catch {}
 			try { hub.closeAll?.() } catch {}
 			try { await stopWeb() } catch {}
@@ -353,13 +390,13 @@ export async function runService(options) {
 		const anyExplicit = Object.values(explicit).some(Boolean)
 		const endpointHost = serviceHostForListen(serviceEndpoint.host)
 		const endpointPort = Number(serviceEndpoint.port)
-		if (!Number.isInteger(endpointPort) || endpointPort <= 0) throw new Error("Pinano service endpoint is not ready")
+		if (!Number.isInteger(endpointPort) || endpointPort <= 0) throw new Error("Cerex service endpoint is not ready")
 		const configuredHost = typeof defaults.host === "string" && defaults.host ? defaults.host : undefined
 		const configuredFixedPort = Number.isInteger(defaults.port) && defaults.port > 0 ? defaults.port : undefined
 		const fallbackPort = Number(serviceEndpoint.requestedPort)
-		if (configuredHost && configuredHost !== endpointHost) throw Object.assign(new Error(`${WEB_BROWSER_UI_NAME} is configured for host ${configuredHost}, but the running service is bound to ${endpointHost}; restart the service after updating service.web in Pinano settings.`), { status: 409 })
-		if (configuredFixedPort && configuredFixedPort !== endpointPort) throw Object.assign(new Error(`${WEB_BROWSER_UI_NAME} is configured for port ${configuredFixedPort}, but the running service is on ${endpointHost}:${endpointPort}. Free the configured port and restart the service, or update service.web in Pinano settings.`), { status: 409 })
-		if (serviceEndpoint.portFallback && fallbackPort > 0) throw Object.assign(new Error(`${WEB_BROWSER_UI_NAME} cannot start on fallback service port ${endpointPort}; requested port ${fallbackPort} was unavailable when the service started. Free the requested port and restart the service, or update service.web in Pinano settings.`), { status: 409 })
+		if (configuredHost && configuredHost !== endpointHost) throw Object.assign(new Error(`${WEB_BROWSER_UI_NAME} is configured for host ${configuredHost}, but the running service is bound to ${endpointHost}; restart the service after updating service.web in Cerex settings.`), { status: 409 })
+		if (configuredFixedPort && configuredFixedPort !== endpointPort) throw Object.assign(new Error(`${WEB_BROWSER_UI_NAME} is configured for port ${configuredFixedPort}, but the running service is on ${endpointHost}:${endpointPort}. Free the configured port and restart the service, or update service.web in Cerex settings.`), { status: 409 })
+		if (serviceEndpoint.portFallback && fallbackPort > 0) throw Object.assign(new Error(`${WEB_BROWSER_UI_NAME} cannot start on fallback service port ${endpointPort}; requested port ${fallbackPort} was unavailable when the service started. Free the requested port and restart the service, or update service.web in Cerex settings.`), { status: 409 })
 		const requestedPort = Number.isInteger(body.port) ? Math.max(0, body.port) : undefined
 		const requestedToken = typeof body.token === "string" && body.token ? body.token : undefined
 		if (explicit.host && body.host && body.host !== endpointHost) throw Object.assign(new Error(`${WEB_BROWSER_UI_NAME} shares the service endpoint; restart the service to change its host.`), { status: 409 })
@@ -408,7 +445,8 @@ export async function runService(options) {
 			initialRoute: desired.initialRoute,
 			dev: desired.dev,
 			auth: desired.webAuth,
-			workspaceRoot: manager.workspacePolicy?.root,
+			workspaceRoot: manager.workspaceRoot,
+			workspace: manager.workspace,
 			createStaticPreview: (request) => previewManager.createStaticPreview({
 				...request,
 				routingSlug: previewRoutingSlugFromSettings(serviceSettings),
@@ -459,11 +497,22 @@ export async function runService(options) {
 			return () => subscription.unsubscribe()
 		},
 	})
+	const workspaceDirectories = createSharedWatchResource({
+		key: ({ root, path }) => JSON.stringify([root, path]),
+		normalize: (params) => {
+			if (typeof params?.root !== "string" || !params.root || typeof params?.path !== "string" || !params.path) {
+				throw Object.assign(new Error("workspace directory subscription needs a root and path"), { status: 400 })
+			}
+			return { root: params.root, path: params.path }
+		},
+		watch: ({ root, path }, onChange, onError) => workspace.files.watchDirectory(root, path, onChange, onError),
+	})
 	serviceLiveServer = createLiveResourceWebSocketServer({
 		path: `${SERVICE_ROUTE_PREFIX}/live`,
 		resources: {
 			app: createAppLiveResource({ api: serviceApi, hub }),
 			sessions: sessionLists,
+			[WORKSPACE_DIRECTORY_RESOURCE]: workspaceDirectories,
 		},
 		authenticate: (incoming, url) => authenticateRequestParts({
 			url: url.href,
@@ -542,6 +591,28 @@ export async function runService(options) {
 		serviceApp.get(path("/web/status"), safeServiceRoute(async () => json({ ok: true, web: webStatus() })))
 		serviceApp.post(path("/web/start"), safeServiceRoute(async (context) => json(await startWeb(await jsonBody(context)))))
 		serviceApp.post(path("/web/stop"), safeServiceRoute(async () => json({ ok: true, stopped: await stopWeb(), web: webStatus() })))
+		serviceApp.post(path(WORKSPACE_CONTRACT_ROUTE), safeServiceRoute(async (context) => {
+			return json(await workspaceHost.peer.call(await jsonBody(context), { signal: context.req.signal }))
+		}))
+		serviceApp.use(`${path(WORKSPACE_FILES_ROUTE)}/*`, safeServiceRoute(async (context) => {
+			const request = context.req.raw
+			const url = new URL(request.url)
+			url.pathname = url.pathname.slice(path(WORKSPACE_FILES_ROUTE).length) || "/"
+			const headers = new Headers(request.headers)
+			for (const name of [...headers.keys()]) {
+				if (HOP_BY_HOP_HEADERS.has(name) || name.startsWith(WORKSPACE_INTERNAL_HEADER_PREFIX)) headers.delete(name)
+			}
+			for (const name of ["authorization", "content-length", "cookie", "host"]) headers.delete(name)
+			const hasBody = request.method !== "GET" && request.method !== "HEAD"
+			const forwarded = new Request(url, {
+				method: request.method,
+				headers,
+				body: hasBody ? request.body : undefined,
+				duplex: hasBody ? "half" : undefined,
+				signal: request.signal,
+			})
+			return workspace.files.fetch(forwarded)
+		}))
 		serviceApp.post(path("/interrupt"), safeServiceRoute(async (context) => {
 			const body = await jsonBody(context)
 			const mode = body.mode === "hard" ? "hard" : "soft"
@@ -799,6 +870,7 @@ export async function runService(options) {
 		try { await stopWeb() } catch {}
 		try { server.close() } catch {}
 		try { manager.dispose() } catch {}
+		try { await closeWorkspaceHost() } catch {}
 		try { db.finishServiceRun(serviceRunId, { status: "clean_exit", reason: shutdownReason }) } catch {}
 		try { db.close() } catch {}
 		try { await diagnostics.close() } catch {}
@@ -831,6 +903,7 @@ export async function runService(options) {
 	process.once("exit", () => {
 		if (!closed) {
 			try { db.finishServiceRun(serviceRunId, { status: "process_exit", reason: "process_exit_without_cleanup" }) } catch {}
+			try { void closeWorkspaceHost().catch(() => {}) } catch {}
 		}
 		try { manager.dispose() } catch {}
 		try { db.close() } catch {}

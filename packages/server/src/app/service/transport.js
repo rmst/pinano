@@ -1,14 +1,15 @@
 import * as http from "node:http"
 
+import { canonicalProductErrorCode, productErrorCodeMatches } from "../../../../protocol/src/product.js"
 import { serviceHostForConnect } from "./network.js"
 
 export function serviceHttpOptions(info, path) {
 	if (info.transport === "tcp") return { host: serviceHostForConnect(info.host), port: info.port, path }
-	throw Object.assign(new Error(`Unsupported Pinano service transport: ${info.transport || "unknown"}`), { code: "PINANO_UNSUPPORTED_SERVICE_TRANSPORT" })
+	throw Object.assign(new Error(`Unsupported Cerex service transport: ${info.transport || "unknown"}`), { code: "CEREX_UNSUPPORTED_SERVICE_TRANSPORT" })
 }
 
 export function serviceWebSocketUrl(info, path) {
-	if (info.transport !== "tcp") throw Object.assign(new Error(`Unsupported Pinano service transport: ${info.transport || "unknown"}`), { code: "PINANO_UNSUPPORTED_SERVICE_TRANSPORT" })
+	if (info.transport !== "tcp") throw Object.assign(new Error(`Unsupported Cerex service transport: ${info.transport || "unknown"}`), { code: "CEREX_UNSUPPORTED_SERVICE_TRANSPORT" })
 	const host = serviceHostForConnect(info.host)
 	const authority = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host
 	const url = new URL(`ws://${authority}:${info.port}${path}`)
@@ -18,11 +19,11 @@ export function serviceWebSocketUrl(info, path) {
 
 export function serviceTimeoutError(kind, path, timeoutMs) {
 	const suffix = path ? ` (${path})` : ""
-	return Object.assign(new Error(`Pinano service ${kind} timed out after ${timeoutMs}ms${suffix}`), { code: "PINANO_SERVICE_TIMEOUT" })
+	return Object.assign(new Error(`Cerex service ${kind} timed out after ${timeoutMs}ms${suffix}`), { code: "CEREX_SERVICE_TIMEOUT" })
 }
 
 export function isServiceTimeoutError(err) {
-	if (/** @type {any} */ (err)?.code === "PINANO_SERVICE_TIMEOUT") return true
+	if (productErrorCodeMatches(err, "CEREX_SERVICE_TIMEOUT")) return true
 	return /timed out/i.test(String(/** @type {any} */ (err)?.message ?? err))
 }
 
@@ -65,7 +66,7 @@ export function requestBytes(info, path, options = {}) {
 		}
 		const fail = (err) => settle(reject, err)
 		const abortRequest = () => {
-			const err = Object.assign(new Error(`Pinano service request aborted (${path})`), { code: "ABORT_ERR" })
+			const err = Object.assign(new Error(`Cerex service request aborted (${path})`), { code: "ABORT_ERR" })
 			fail(err)
 			req?.destroy?.(err)
 		}
@@ -73,7 +74,7 @@ export function requestBytes(info, path, options = {}) {
 			...serviceHttpOptions(info, path),
 			method: options.method ?? "GET",
 			headers: {
-				"host": "pinano.local",
+				"host": "cerex.local",
 				"connection": "close",
 				...(info.token ? { "authorization": `Bearer ${info.token}` } : {}),
 				...(body ? { "content-length": String(Buffer.byteLength(body)) } : {}),
@@ -90,7 +91,7 @@ export function requestBytes(info, path, options = {}) {
 				})
 				req.destroy?.()
 			})
-			res.on("aborted", () => fail(Object.assign(new Error(`Pinano service response aborted (${path})`), { code: "ECONNRESET" })))
+			res.on("aborted", () => fail(Object.assign(new Error(`Cerex service response aborted (${path})`), { code: "ECONNRESET" })))
 			res.on("error", fail)
 		})
 		req.on("error", fail)
@@ -121,6 +122,11 @@ export async function requestJson(info, path, options = {}) {
 		},
 	})
 	const data = res.body ? JSON.parse(res.body) : {}
-	if (res.status < 200 || res.status >= 300) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status })
+	if (res.status < 200 || res.status >= 300) {
+		throw Object.assign(new Error(data.error || `HTTP ${res.status}`), {
+			status: res.status,
+			...(typeof data.code === "string" ? { code: canonicalProductErrorCode(data.code) } : {}),
+		})
+	}
 	return data
 }

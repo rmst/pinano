@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto"
 
 import { validateToolArguments } from "../../ai-apis/validate.js"
 import { isUncertainToolExecutionError } from "../../agent-core/tool-errors.js"
-import { executorProxyInfo } from "../tool-executor-tools.js"
+import { executorProxyInfo } from "../workers/tool/executor-tools.js"
 import { UPDATE_PLAN_TOOL_NAME } from "../update-plan-tool.js"
 import { codeModeToolMetadata, createCodeModeToolDefinitions, parseExecSource } from "./description.js"
 import { ToolDispatchGate } from "./dispatch-gate.js"
@@ -27,7 +27,7 @@ function syntheticAssistantMessage(agent) {
 	return [...messages].reverse().find((message) => message?.role === "assistant") ?? {
 		role: "assistant",
 		content: [],
-		provider: agent?.state?.model?.provider ?? "pinano",
+		provider: agent?.state?.model?.provider ?? "unknown",
 		model: agent?.state?.model?.id ?? "unknown",
 		stopReason: "toolUse",
 		timestamp: Date.now(),

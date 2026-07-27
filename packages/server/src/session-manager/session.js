@@ -1,4 +1,4 @@
-// Stateful wrapper around a session storage. Pinano sessions view a tree of
+// Stateful wrapper around a session storage. Cerex sessions view a tree of
 // immutable conversation entries (parent-pointer adjacency list); a "branch" is
 // the sequence of entries from the current leaf to the root.
 //
@@ -59,7 +59,7 @@ function normalizeContextFile(file) {
 function replacementMessagesForCompactionEntry(entry) {
 	const data = entry.data ?? {}
 	const context = data.replacementContext
-	if (context?.kind === "pinano-messages" && Array.isArray(context.messages)) return context.messages
+	if ((context?.kind === "messages" || context?.kind === "pinano-messages") && Array.isArray(context.messages)) return context.messages
 	return []
 }
 
@@ -71,7 +71,7 @@ function displayMessageForCompactionEntry(entry) {
 export function compactionReplacementEntryId(entryId, replacementMessages, index) {
 	if (replacementMessages.length === 1) return entryId
 	const markerIndex = replacementMessages.reduce(
-		(latest, message, i) => (message?.compaction === true || message?.pinanoCompactionSummary === true) ? i : latest,
+		(latest, message, i) => (message?.compaction === true || message?.compactionSummary === true) ? i : latest,
 		-1,
 	)
 	const durableIndex = markerIndex >= 0 ? markerIndex : replacementMessages.length - 1

@@ -58,7 +58,7 @@ function runTextCommand(command, args, input, options = {}) {
 }
 
 /**
- * Copy text to a native host clipboard when Pinano is running directly on a supported host.
+ * Copy text to a native host clipboard when Cerex is running directly on a supported host.
  * @param {string} text
  * @param {{ platform?: string, env?: NodeJS.ProcessEnv, runTextCommand?: RunTextCommand, timeoutMs?: number }} [options]
  * @returns {Promise<boolean>} true when a native clipboard command was attempted

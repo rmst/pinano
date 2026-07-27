@@ -4,7 +4,7 @@ Fallback tools are small compatibility subsets, not full reimplementations. Pref
 
 When adding or changing a fallback:
 
-- Print an honest `--version` that identifies the Pinano fallback.
+- Print an honest `--version` that identifies the Cerex fallback.
 - Reject unsupported options/features clearly; reject before network I/O or other side effects when practical.
 - Do not silently approximate semantics that scripts may depend on.
 - Use capability detection for runtime-dependent behavior instead of runtime-name checks.

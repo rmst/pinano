@@ -37,7 +37,7 @@ function defaultScheduleExit(fn) {
 
 /**
  * Install a best-effort process-wide terminal restore lease for the interval
- * where Pinano owns stdin/stdout. It restores only terminal modes Pinano may
+ * where Cerex owns stdin/stdout. It restores only terminal modes Cerex may
  * enable.
  * @param {{ processLike?: NodeJS.Process, writeSync?: (text: string) => void, restoreInput?: () => void, scheduleExit?: (fn: () => void) => void }} [options]
  * @returns {{ restore: () => void, dispose: () => void }}

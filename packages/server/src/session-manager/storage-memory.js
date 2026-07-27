@@ -2,6 +2,7 @@
 // the user has not opted into on-disk persistence yet.
 
 import { randomUUID } from "node:crypto"
+import { normalizeLegacyEntryData, normalizeLegacyMessage } from "./metadata-compatibility.js"
 
 function shortId(byId) {
 	for (let i = 0; i < 200; i++) {
@@ -51,6 +52,8 @@ export class MemorySessionStorage {
 		return this.labels.get(id)
 	}
 	async appendEntry(entry) {
+		if (entry.type === "message") entry = { ...entry, message: normalizeLegacyMessage(entry.message) }
+		if (entry.type === "custom") entry = { ...entry, data: normalizeLegacyEntryData(entry.data) }
 		this.entries.push(entry)
 		this.byId.set(entry.id, entry)
 		if (entry.type === "label") {

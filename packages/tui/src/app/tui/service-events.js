@@ -1,4 +1,4 @@
-import { eventInvalidatesSessionSnapshot, eventNeedsSessionListRefresh } from "../../../../server/src/app/session-state.js"
+import { eventInvalidatesSessionSnapshot, eventNeedsSessionListRefresh } from "../../../../server/src/app/session/state.js"
 
 /** @param {unknown} err */
 export function isConnectionReset(err) {
@@ -29,7 +29,7 @@ export function isStaleRuntimeError(err) {
 	let cur = /** @type {any} */ (err)
 	while (cur) {
 		const text = `${cur?.message ?? cur}`
-		if (/\bpinano client is stale\b/i.test(text)) return true
+		if (/\b(?:cerex|pinano) client is stale\b/i.test(text)) return true
 		cur = cur.cause
 	}
 	return false

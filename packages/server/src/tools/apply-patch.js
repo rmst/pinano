@@ -153,7 +153,7 @@ function parseUpdate(lines, state, path) {
 }
 
 /**
- * Parse a strict Pinano/Codex-style patch.
+ * Parse a strict Cerex/Codex-style patch.
  * @param {string} input
  * @returns {{ operations: any[] }}
  */

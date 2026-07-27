@@ -36,7 +36,7 @@ elif [ -x "$fallback_runtime" ]; then
 elif command -v qn >/dev/null 2>&1; then
 	exec qn "$script" "$@"
 else
-	echo "pinano ${toolName} fallback requires node or qn" >&2
+	echo "cerex ${toolName} fallback requires node or qn" >&2
 	exit 127
 fi
 `
@@ -55,9 +55,9 @@ function runtimeWrapperNames(runtimePath) {
 }
 
 function fallbackToolsTmpdir(baseEnv) {
-	const configured = baseEnv.PINANO_FALLBACK_TOOLS_TMPDIR
+	const configured = baseEnv.CEREX_FALLBACK_TOOLS_TMPDIR
 	if (!configured) return tmpdir()
-	if (!isAbsolute(configured)) throw new Error(`PINANO_FALLBACK_TOOLS_TMPDIR must be absolute: ${configured}`)
+	if (!isAbsolute(configured)) throw new Error(`CEREX_FALLBACK_TOOLS_TMPDIR must be absolute: ${configured}`)
 	return resolve(configured)
 }
 
@@ -67,7 +67,7 @@ function ensureFallbackToolsBin(baseEnv = process.env) {
 	if (binDir && binDirKey === key) return binDir
 	const removeParentOnExit = !existsSync(parent)
 	mkdirSync(parent, { recursive: true })
-	const dir = mkdtempSync(join(parent, ".pinano-fallback-tools-"))
+	const dir = mkdtempSync(join(parent, ".fallback-tools-"))
 	const bin = join(dir, "bin")
 	binDir = bin
 	binDirKey = key
@@ -102,7 +102,7 @@ function ensureFallbackToolsBin(baseEnv = process.env) {
 }
 
 /**
- * Return an environment for shell commands with Pinano fallback tools appended
+ * Return an environment for shell commands with Cerex fallback tools appended
  * to PATH. Appending is deliberate: real system tools always win.
  *
  * @param {NodeJS.ProcessEnv} [baseEnv]

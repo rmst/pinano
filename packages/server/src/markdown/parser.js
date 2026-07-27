@@ -4,7 +4,27 @@ import { markdownMathExtensions, MAX_LATEX_LENGTH } from "./math.js"
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/
 const ALERT_TYPES = new Set(["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"])
 
-class StrictStrikethroughTokenizer extends Tokenizer {
+function nextBlockExtensionStart(source, lexer) {
+	const starts = lexer.options.extensions?.startBlock
+	if (!starts?.length) return undefined
+	const rest = source.slice(1)
+	let first = Infinity
+	for (const start of starts) {
+		const index = start.call({ lexer }, rest)
+		if (typeof index === "number" && index >= 0) first = Math.min(first, index + 1)
+	}
+	return first < Infinity ? first : undefined
+}
+
+class MarkdownTokenizer extends Tokenizer {
+	lheading(source) {
+		const token = super.lheading(source)
+		if (!token) return undefined
+		// Marked checks Setext headings before applying extension start hints, so a heading must not consume an earlier custom block boundary.
+		const blockStart = nextBlockExtensionStart(source, this.lexer)
+		return blockStart !== undefined && blockStart < token.raw.length ? undefined : token
+	}
+
 	del(source) {
 		const match = STRICT_STRIKETHROUGH_REGEX.exec(source)
 		if (!match) return undefined
@@ -72,7 +92,7 @@ const footnoteExtensions = [
 ]
 
 const markdownParser = new Marked({ extensions: [...markdownMathExtensions, ...footnoteExtensions] })
-markdownParser.setOptions({ tokenizer: new StrictStrikethroughTokenizer() })
+markdownParser.setOptions({ tokenizer: new MarkdownTokenizer() })
 
 function splitFrontmatter(source) {
 	const opening = /^(?:\uFEFF)?---[ \t]*(?:\r?\n)/.exec(source)

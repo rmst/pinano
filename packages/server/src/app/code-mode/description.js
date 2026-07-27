@@ -20,7 +20,7 @@ const EXEC_PREAMBLE = `Runs raw JavaScript in an isolated cell for orchestrating
 
 Global helpers:
 - \`text(value)\` appends text to the result.
-- \`image(value, detail?)\` appends an image returned by a nested tool or a base64 \`data:\` URL.
+- \`image(value, detail?)\` appends an image returned by a nested tool or a base64 \`data:\` URL. Detail, when supplied, must be \`auto\`, \`low\`, \`high\`, or \`original\`.
 - \`store(key, value)\` and \`load(key)\` persist JSON-serializable values between cells in this agent.
 - \`yield_control()\` yields accumulated output while the cell keeps running.
 - \`exit()\` completes the cell successfully.
@@ -159,7 +159,7 @@ export function createCodeModeToolDefinitions(tools) {
 	| string
 	| {
 		output?: string;
-		content?: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string; detail?: string }>;
+		content?: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string; detail?: "auto" | "low" | "high" | "original" }>;
 		[key: string]: unknown;
 	};`
 	const description = [

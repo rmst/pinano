@@ -1,9 +1,9 @@
 import { truncateToWidth, visibleWidth } from "../../tui/index.js"
-import { overviewRoute, routeToArg } from "../../../../server/src/app/routes.js"
+import { overviewRoute, routeToArg } from "../../../../server/src/app/navigation/routes.js"
 import { theme } from "../theme.js"
 import { fit, renderKeyHintsFrame, shortSessionId, singleLine, stripAnsi } from "./format.js"
 
-/** @typedef {import("../../../../server/src/app/routes.js").PinanoRoute} PinanoRoute */
+/** @typedef {import("../../../../server/src/app/navigation/routes.js").AppRoute} AppRoute */
 
 export class PromptLabel {
 	/** @param {() => string} text */
@@ -82,7 +82,7 @@ export class StaleRuntimeOverlay {
 					? theme.red("Reopen failed")
 					: `${theme.cyan("Enter")} retry`
 		const content = [
-			theme.bold("Pinano was updated"),
+			theme.bold("Cerex was updated"),
 			"",
 			action,
 			...(state.error ? [theme.yellow(`Last error: ${state.error}`)] : []),
@@ -103,7 +103,7 @@ export class RouteLoadingShell {
 		this.error = undefined
 	}
 
-	/** @param {PinanoRoute} route @param {{ error?: unknown }} [options] */
+	/** @param {AppRoute} route @param {{ error?: unknown }} [options] */
 	setRoute(route, options = {}) {
 		this.route = route
 		this.error = options.error
@@ -137,7 +137,7 @@ export class OverviewKeyHints {
 	}
 	invalidate() {}
 
-	/** @param {number} width @returns {{ lines: string[], spans: import("../tui/render-frame.js").RenderSpan[] }} */
+	/** @param {number} width @returns {{ lines: string[], spans: import("../../tui/render-frame.js").RenderSpan[] }} */
 	renderFrame(width) {
 		const state = this.state()
 		const helpAction = this.actions.onHelp ? {
@@ -195,7 +195,7 @@ export class SessionKeyHints {
 	}
 	invalidate() {}
 
-	/** @param {number} width @returns {{ lines: string[], spans: import("../tui/render-frame.js").RenderSpan[] }} */
+	/** @param {number} width @returns {{ lines: string[], spans: import("../../tui/render-frame.js").RenderSpan[] }} */
 	renderFrame(width) {
 		const state = this.state()
 		const backAction = this.actions.onBack ? {

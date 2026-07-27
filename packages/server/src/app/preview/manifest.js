@@ -1,25 +1,31 @@
 import { createHash } from "node:crypto"
-import { readdir, readFile, stat } from "node:fs/promises"
-import { basename, join, resolve } from "node:path"
+import { mkdir, readdir, readFile, rename, stat } from "node:fs/promises"
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
+
+import { cleanupLegacyProjectStateDirectory, ensureProjectStateDirectoryIgnored, LEGACY_PROJECT_STATE_DIRNAME, PROJECT_STATE_DIRNAME } from "../project/labels.js"
+import { projectDocumentsDirectory } from "../project/documents.js"
 
 export const PREVIEW_DIRECTORY_NAME = "previews"
 export const PREVIEW_FILE_SUFFIX = ".preview.js"
-export const PROJECT_PINANO_DIRNAME = ".pinano"
+export const STATIC_PREVIEW_FILE_SUFFIX = ".preview.json"
 export const PROJECT_PREVIEW_LOG_DIRNAME = "preview-logs"
 export const DEFAULT_PREVIEW_HOST = "127.0.0.1"
 export const DEFAULT_PREVIEW_HEALTH_PATH = "/"
 export const DEFAULT_PREVIEW_IDLE_TIMEOUT_MS = 10 * 60 * 1000
-export const PREVIEW_AUTHORIZATION_HEADER = "X-Pinano-Preview-Authorization"
+export const PREVIEW_AUTHORIZATION_HEADER = "X-Cerex-Preview-Authorization"
+export const LEGACY_PREVIEW_AUTHORIZATION_HEADER = "X-Pinano-Preview-Authorization"
 export const PREVIEW_LOG_DIRNAME = "previews"
-export const PREVIEW_CONTROL_PATH_PREFIX = "/.pinano/preview"
+export const PREVIEW_CONTROL_PATH_PREFIX = "/.cerex/preview"
+export const LEGACY_PREVIEW_CONTROL_PATH_PREFIX = "/.pinano/preview"
 export const PREVIEW_STATUS_PATH = `${PREVIEW_CONTROL_PATH_PREFIX}/status`
 export const PREVIEW_LOG_PATH = `${PREVIEW_CONTROL_PATH_PREFIX}/log`
 export const PREVIEW_LOG_PAGE_PATH = `${PREVIEW_CONTROL_PATH_PREFIX}/logs`
 export const PREVIEW_INJECT_SCRIPT_PATH = `${PREVIEW_CONTROL_PATH_PREFIX}/link.js`
 export const PREVIEW_FRAME_BRIDGE_SCRIPT_PATH = `${PREVIEW_CONTROL_PATH_PREFIX}/frame-bridge.js`
+export const PREVIEW_OPEN_DOCUMENT_PATH = `${PREVIEW_CONTROL_PATH_PREFIX}/open-document`
 export const PREVIEW_RESTART_PATH = `${PREVIEW_CONTROL_PATH_PREFIX}/restart`
-export const STATIC_PREVIEW_NAME = "static"
+export const STATIC_PREVIEW_NAME = "docs"
 export const PREVIEW_ROOT_KIND_SESSION = "session"
 export const PREVIEW_ROOT_KIND_PROJECT = "project"
 export const PREVIEW_ROOT_KIND_STATIC = "static"
@@ -35,7 +41,8 @@ const MAX_PREVIEW_NAME_LENGTH = 63 - 2 - MAX_PREVIEW_SCOPE_LABEL_LENGTH
 const PREVIEW_NAME_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
 const PREVIEW_ROUTING_SLUG_RE = PREVIEW_NAME_RE
 const MAX_PREVIEW_DESCRIPTION_LENGTH = 512
-const PREVIEW_MODULE_TAG = "pinano-preview-module"
+const PREVIEW_MODULE_TAG = "cerex-preview-module"
+const projectPreviewMigrations = new Map()
 
 const PREVIEW_MODULE_LOADER_SOURCE = [
 	"import { readFile } from \"node:fs/promises\"",
@@ -66,6 +73,101 @@ const PREVIEW_MODULE_REGISTER_URL = `data:text/javascript,${encodeURIComponent(P
 
 function shellQuote(value) {
 	return `'${String(value).replaceAll("'", "'\\''")}'`
+}
+
+function staticPreviewNameFromFilename(filename) {
+	if (!filename.endsWith(STATIC_PREVIEW_FILE_SUFFIX)) return undefined
+	const name = filename.slice(0, -STATIC_PREVIEW_FILE_SUFFIX.length)
+	if (!PREVIEW_NAME_RE.test(name) || name.length > MAX_PREVIEW_NAME_LENGTH) return undefined
+	return cleanPreviewName(name)
+}
+
+function isProperPathWithin(rootPath, candidatePath) {
+	const path = relative(rootPath, candidatePath)
+	return Boolean(path) && path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path)
+}
+
+function staticPreviewRoot(projectDir, value, context) {
+	if (typeof value !== "string" || !value.trim()) throw new Error(`${context} root must be a non-empty project-relative path`)
+	const path = value.trim()
+	if (path.includes("\0") || path.includes("\\") || isAbsolute(path)) throw new Error(`${context} root must be a project-relative path`)
+	const projectPath = resolve(projectDir)
+	const rootPath = resolve(projectPath, path)
+	if (!isProperPathWithin(projectPath, rootPath)) throw new Error(`${context} root must resolve to a subdirectory of the project`)
+	return rootPath
+}
+
+function defaultStaticPreviewRoot(projectDir, configPath, context) {
+	const projectPath = resolve(projectDir)
+	const rootPath = resolve(dirname(configPath))
+	if (!isProperPathWithin(projectPath, rootPath)) throw new Error(`${context} root must resolve to a subdirectory of the project`)
+	if (rootPath === resolve(projectPreviewDirectory(projectPath))) {
+		throw new Error(`${context} root is required for definitions under ${projectPreviewDirectory(projectPath)}`)
+	}
+	return rootPath
+}
+
+function staticPreviewEntryPath(value, context) {
+	if (value === undefined) return undefined
+	if (typeof value !== "string" || !value.trim()) throw new Error(`${context} entry must be a non-empty relative path`)
+	const path = value.trim()
+	if (path.includes("\0") || path.includes("\\") || path.includes("?") || path.includes("#") || path.startsWith("/")) {
+		throw new Error(`${context} entry must be a local relative path without a query or fragment`)
+	}
+	const trailingSlash = path.endsWith("/")
+	const parts = path.split("/").filter((part) => part && part !== ".")
+	if (parts.length === 0 || parts.some((part) => part === "..")) throw new Error(`${context} entry must stay within the static root`)
+	return `/${parts.map(encodeURIComponent).join("/")}${trailingSlash ? "/" : ""}`
+}
+
+export async function staticPreviewFileDefinitionFromPath(path, options = {}) {
+	const resolvedPath = resolve(path)
+	if (!basename(resolvedPath).endsWith(STATIC_PREVIEW_FILE_SUFFIX)) throw new Error(`static preview source file must end with ${STATIC_PREVIEW_FILE_SUFFIX}`)
+	const projectDir = typeof options.projectDir === "string" && options.projectDir ? resolve(options.projectDir) : undefined
+	if (!projectDir) throw new Error("static preview project directory is required")
+	if (!isProperPathWithin(projectDir, resolvedPath)) throw new Error("static preview source must be a file within the project")
+	const info = await stat(resolvedPath)
+	if (!info.isFile()) throw new Error(`static preview source is not a file: ${resolvedPath}`)
+	const name = cleanPreviewName(options.name ?? sourcePreviewName(resolvedPath))
+	if (name === STATIC_PREVIEW_NAME) throw new Error(`${basename(resolvedPath)} uses the reserved built-in preview name ${STATIC_PREVIEW_NAME}`)
+	let config
+	try {
+		const text = await readFile(resolvedPath, "utf-8")
+		config = text.trim() ? JSON.parse(text) : {}
+	} catch (err) {
+		if (err?.code === "ENOENT" || err?.code === "ENOTDIR") throw err
+		throw Object.assign(new Error(`Invalid static preview definition ${resolvedPath}: ${err?.message ?? err}`), { cause: err })
+	}
+	const context = `static preview ${name}`
+	if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error(`${context} must be a JSON object`)
+	const supported = new Set(["root", "entry", "description"])
+	const unknown = Object.keys(config).filter((key) => !supported.has(key))
+	if (unknown.length > 0) throw new Error(`${context} has unsupported ${unknown.length === 1 ? "property" : "properties"}: ${unknown.join(", ")}`)
+	if (config.description !== undefined && typeof config.description !== "string") throw new Error(`${context} description must be a string`)
+	const rootPath = config.root === undefined
+		? defaultStaticPreviewRoot(projectDir, resolvedPath, context)
+		: staticPreviewRoot(projectDir, config.root, context)
+	if (rootPath === projectDocumentsDirectory(projectDir)) throw new Error(`${context} root is reserved for the built-in docs preview`)
+	if (rootPath === resolve(projectPreviewDirectory(projectDir))) throw new Error(`${context} root is reserved for preview definitions`)
+	return staticPreviewDefinition(rootPath, {
+		name,
+		description: cleanDescription(config.description),
+		entryPath: staticPreviewEntryPath(config.entry, context),
+		configPath: resolvedPath,
+	})
+}
+
+async function staticPreviewEntryDefinition(projectDir, previewsDir, entry) {
+	if (!entry.isFile()) return undefined
+	const name = staticPreviewNameFromFilename(entry.name)
+	if (!name) return undefined
+	const path = join(previewsDir, entry.name)
+	try {
+		return await staticPreviewFileDefinitionFromPath(path, { name, projectDir })
+	} catch (err) {
+		if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return undefined
+		throw err
+	}
 }
 
 export function cleanPreviewName(name, context = "preview name") {
@@ -309,10 +411,10 @@ function previewModuleRunnerCommand(path) {
 		"	process.once('SIGINT', abort)",
 		"	process.once('SIGTERM', abort)",
 		"	await exec({",
-		"		host: requiredEnv('PINANO_HOST'),",
-		"		port: Number(requiredEnv('PINANO_PORT')),",
-		"		publicUrl: process.env.PINANO_PUBLIC_URL || '',",
-		"		logPath: process.env.PINANO_PREVIEW_LOG || '',",
+		"		host: requiredEnv('CEREX_HOST'),",
+		"		port: Number(requiredEnv('CEREX_PORT')),",
+		"		publicUrl: process.env.CEREX_PUBLIC_URL || '',",
+		"		logPath: process.env.CEREX_PREVIEW_LOG || '',",
 		"		signal: controller.signal,",
 		"		env: process.env,",
 		"	})",
@@ -363,9 +465,8 @@ export function sourcePreviewScopeId(path) {
 
 export function sourcePreviewName(path) {
 	const filename = basename(path)
-	const stem = filename.endsWith(PREVIEW_FILE_SUFFIX)
-		? filename.slice(0, -PREVIEW_FILE_SUFFIX.length)
-		: filename
+	const suffix = [PREVIEW_FILE_SUFFIX, STATIC_PREVIEW_FILE_SUFFIX].find((candidate) => filename.endsWith(candidate))
+	const stem = suffix ? filename.slice(0, -suffix.length) : filename
 	const hash = sourcePreviewScopeId(path).slice(0, 8)
 	const maxBaseLength = Math.max(1, MAX_PREVIEW_NAME_LENGTH - hash.length - 1)
 	const base = previewNamePart(stem).slice(0, maxBaseLength).replace(/-+$/g, "") || "preview"
@@ -383,7 +484,7 @@ export async function previewFileDefinitionFromPath(path, options = {}) {
 	return {
 		name,
 		command: previewModuleRunnerCommand(resolvedPath),
-		description: metadata.description,
+		...(metadata.description ? { description: metadata.description } : {}),
 		healthPath: metadata.healthPath ?? DEFAULT_PREVIEW_HEALTH_PATH,
 		source: { kind: "preview-js", ...sourceFileMetadata(resolvedPath, info) },
 	}
@@ -402,7 +503,7 @@ async function previewFileEntryDefinition(previewsDir, entry) {
 	}
 }
 
-export async function readPreviewDirectory(previewsDir) {
+export async function readPreviewDirectory(previewsDir, options = {}) {
 	let entries
 	try {
 		entries = await readdir(previewsDir, { withFileTypes: true })
@@ -411,9 +512,19 @@ export async function readPreviewDirectory(previewsDir) {
 		throw err
 	}
 	const previews = {}
-	for (const entry of entries) {
+	for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
 		const definition = await previewFileEntryDefinition(previewsDir, entry)
-		if (definition) previews[definition.name] = definition
+			?? (options.projectDir ? await staticPreviewEntryDefinition(options.projectDir, previewsDir, entry) : undefined)
+		if (!definition) continue
+		if (previews[definition.name]) throw new Error(`Duplicate preview name: ${definition.name}`)
+		previews[definition.name] = definition
+	}
+	const staticRoots = new Map()
+	for (const definition of Object.values(previews)) {
+		if (definition.source?.kind !== "static-directory") continue
+		const existing = staticRoots.get(definition.source.path)
+		if (existing) throw new Error(`Static previews ${existing} and ${definition.name} use the same root`)
+		staticRoots.set(definition.source.path, definition.name)
 	}
 	return { path: previewsDir, manifest: { previews } }
 }
@@ -428,21 +539,75 @@ export function sessionPreviewDirectory(sessionDir) {
 }
 
 export function projectPreviewDirectory(projectDir) {
-	return join(projectDir, PROJECT_PINANO_DIRNAME, PREVIEW_DIRECTORY_NAME)
+	return join(projectDir, PROJECT_STATE_DIRNAME, PREVIEW_DIRECTORY_NAME)
+}
+
+function legacyProjectPreviewDirectory(projectDir) {
+	return join(projectDir, LEGACY_PROJECT_STATE_DIRNAME, PREVIEW_DIRECTORY_NAME)
 }
 
 export function projectPreviewLogPath(projectDir, name) {
-	return join(projectDir, PROJECT_PINANO_DIRNAME, PROJECT_PREVIEW_LOG_DIRNAME, `${cleanPreviewName(name)}.log`)
+	return join(projectDir, PROJECT_STATE_DIRNAME, PROJECT_PREVIEW_LOG_DIRNAME, `${cleanPreviewName(name)}.log`)
+}
+
+async function directoryExists(path) {
+	try {
+		const info = await stat(path)
+		if (!info.isDirectory()) throw new Error(`Project preview path is not a directory: ${path}`)
+		return true
+	} catch (err) {
+		if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return false
+		throw err
+	}
+}
+
+async function migrateLegacyProjectPreviewsOnce(projectDir) {
+	const canonical = projectPreviewDirectory(projectDir)
+	const legacy = legacyProjectPreviewDirectory(projectDir)
+	const [canonicalExists, legacyExists] = await Promise.all([directoryExists(canonical), directoryExists(legacy)])
+	if (!legacyExists) return false
+	if (canonicalExists) throw new Error(`Project previews exist at both ${canonical} and legacy ${legacy}. Remove or reconcile one directory.`)
+	await ensureProjectStateDirectoryIgnored(projectDir)
+	await rename(legacy, canonical)
+	await cleanupLegacyProjectStateDirectory(projectDir)
+	return true
+}
+
+/** Move legacy project preview definitions into `.cerex` before use. @param {string} projectDir */
+export async function migrateLegacyProjectPreviews(projectDir) {
+	const root = resolve(projectDir)
+	const pending = projectPreviewMigrations.get(root)
+	if (pending) return pending
+	const migration = migrateLegacyProjectPreviewsOnce(root)
+	projectPreviewMigrations.set(root, migration)
+	try {
+		return await migration
+	} finally {
+		if (projectPreviewMigrations.get(root) === migration) projectPreviewMigrations.delete(root)
+	}
 }
 
 export async function readProjectPreviewDefinitions(projectDir) {
-	const { manifest } = await readPreviewDirectory(projectPreviewDirectory(projectDir))
+	await migrateLegacyProjectPreviews(projectDir)
+	const { manifest } = await readPreviewDirectory(projectPreviewDirectory(projectDir), { projectDir })
 	return manifest
+}
+
+export async function ensureProjectPreviewDirectory(projectDir) {
+	await migrateLegacyProjectPreviews(projectDir)
+	await ensureProjectStateDirectoryIgnored(projectDir)
+	const directory = projectPreviewDirectory(projectDir)
+	try {
+		await mkdir(directory)
+	} catch (err) {
+		if (err?.code !== "EEXIST" || !(await stat(directory)).isDirectory()) throw err
+	}
 }
 
 export function previewDefinitionKey(definition) {
 	return JSON.stringify({
 		command: definition.command,
+		entryPath: definition.entryPath,
 		healthPath: definition.healthPath,
 		source: definition.source,
 	})
@@ -471,7 +636,7 @@ function cleanPreviewRootUri(rootUri) {
 export function previewScopeHash(rootUri) {
 	const source = cleanPreviewRootUri(rootUri)
 	return createHash("sha256")
-		.update("pinano-preview-root-v1\0")
+		.update("cerex-preview-root-v1\0")
 		.update(source)
 		.digest("hex")
 		.slice(0, PREVIEW_SCOPE_HASH_LENGTH)
@@ -499,17 +664,24 @@ export function staticPreviewScopeId(rootPath) {
 	return previewRootScopeId(PREVIEW_ROOT_KIND_STATIC, rootPath)
 }
 
-export function staticPreviewDefinition(rootPath) {
+export function staticPreviewDefinition(rootPath, options = {}) {
 	return {
-		name: STATIC_PREVIEW_NAME,
-		source: { kind: "static-directory", path: resolve(rootPath) },
+		name: cleanPreviewName(options.name ?? STATIC_PREVIEW_NAME),
+		...(options.description ? { description: options.description } : {}),
+		...(options.entryPath ? { entryPath: options.entryPath } : {}),
+		source: {
+			kind: "static-directory",
+			path: resolve(rootPath),
+			...(options.configPath ? { configPath: resolve(options.configPath) } : {}),
+			...(options.documentPath ? { documentPath: resolve(options.documentPath) } : {}),
+		},
 	}
 }
 
-export function staticPreviewPublicUrl({ publicUrl, rootPath, scopeId, routingSlug, path = "/" }) {
+export function staticPreviewPublicUrl({ publicUrl, rootPath, scopeId, routingSlug, name = STATIC_PREVIEW_NAME, path = "/" }) {
 	return previewPublicUrl({
 		publicUrl,
-		name: STATIC_PREVIEW_NAME,
+		name,
 		scopeId: scopeId ?? staticPreviewScopeId(rootPath),
 		routingSlug,
 		path,

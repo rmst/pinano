@@ -3,7 +3,7 @@ import { bootstrapSource, runCodeModeRunner } from "./runner-common.mjs"
 const AsyncFunction = async function () {}.constructor
 
 runCodeModeRunner((params, host) => {
-	Object.defineProperty(globalThis, "__pinanoCodeModeWake", {
+	Object.defineProperty(globalThis, "__codeModeWake", {
 		value: host.wake,
 		configurable: true,
 	})
@@ -11,8 +11,8 @@ runCodeModeRunner((params, host) => {
 	try {
 		bridge = (0, eval)(bootstrapSource(params.tools, params.storedValues, params.maxOutputChars))
 	} finally {
-		delete globalThis.__pinanoCodeModeWake
+		delete globalThis.__codeModeWake
 	}
-	const execution = new AsyncFunction(`${params.code}\n//# sourceURL=pinano-code-mode-cell.js`)()
+	const execution = new AsyncFunction(`${params.code}\n//# sourceURL=code-mode-cell.js`)()
 	return { bridge, execution }
 })

@@ -7,7 +7,7 @@ import { promptImageLabel } from "../../../../protocol/src/prompt-images.js"
 import {
 	SESSION_ATTACHMENT_KIND_IMAGE,
 	writePromptImageAttachmentFilesSync,
-} from "../session-attachments.js"
+} from "../session/attachments.js"
 import {
 	insertSessionAttachmentRows,
 	nextImageAttachmentNumber,
@@ -18,7 +18,7 @@ import {
 	LEGACY_SESSION_CUSTOM_TYPE_WEB_TREE_SWITCH,
 	SESSION_CUSTOM_TYPE_BRANCH_SWITCH,
 	SESSION_CUSTOM_TYPE_REWIND,
-} from "../session-custom-types.js"
+} from "../session/custom-types.js"
 import { recomputeAllSessionOverviewProjections } from "../../session-manager/session-overviews.js"
 
 export const SCHEMA_VERSION = 35
@@ -1316,7 +1316,7 @@ export function migrateServerDb(db, options = {}) {
 		if (version > SCHEMA_VERSION) {
 			throw new Error(
 				`Database schema version ${version} is newer than supported version ${SCHEMA_VERSION}. ` +
-				"Please upgrade pinano.",
+				"Please upgrade Cerex.",
 			)
 		}
 		while (version < SCHEMA_VERSION) {

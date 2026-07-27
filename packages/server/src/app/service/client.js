@@ -1,6 +1,6 @@
 // Client-side service lifecycle and HTTP/WebSocket access.
 //
-// This module starts, replaces, stops, and talks to the background Pinano service.
+// This module starts, replaces, stops, and talks to the background Cerex service.
 
 import { randomUUID } from "node:crypto"
 import { spawn } from "node:child_process"
@@ -9,15 +9,25 @@ import { mkdir, readFile, rm } from "node:fs/promises"
 import { createInterface } from "node:readline/promises"
 import { join, resolve } from "node:path"
 
+import { CerexClient } from "../../../../sdk/src/index.js"
 import { runtimeSourceReferencePath } from "../paths.js"
-import { configuredServiceEndpointDefaults } from "../service-config.js"
-import { withoutReexecSupervisorEnv } from "../reexec-runtime.js"
-import { bestEffortAutoInstallBundledBubblewrap } from "../bundled-bwrap.js"
-import { pathIsWithin } from "../sandbox-paths.js"
-import { createWebSocketClient } from "../websocket-client.js"
+import { configuredServiceEndpointDefaults } from "./config.js"
+import { withoutReexecSupervisorEnv } from "../runtime/reexec.js"
+import { bestEffortAutoInstallBundledBubblewrap } from "../sandbox/bwrap/bundled.js"
+import { pathIsWithin } from "../sandbox/paths.js"
+import { HOP_BY_HOP_HEADERS, proxyHttpRequest } from "../http/proxy.js"
+import { createWebSocketClient } from "../websocket/client.js"
 import { WEB_BROWSER_UI_NAME } from "../../../../protocol/src/web-branding.js"
 import { LiveResourceClient } from "../../../../protocol/src/live-resource-client.js"
-import { isServiceTimeoutError, requestBytes, requestJson, serviceWebSocketUrl } from "./transport.js"
+import { canonicalProductErrorCode, productErrorCodeMatches } from "../../../../protocol/src/product.js"
+import {
+	WORKSPACE_CONTRACT_ROUTE,
+	WORKSPACE_DIRECTORY_RESOURCE,
+	WORKSPACE_FILES_ROUTE,
+	WORKSPACE_INTERNAL_HEADER_PREFIX,
+} from "../../../../protocol/src/workspace-contract.js"
+import { createWorkspaceClient } from "../workspace/client.js"
+import { isServiceTimeoutError, requestBytes, requestJson, serviceHttpOptions, serviceWebSocketUrl } from "./transport.js"
 import {
 	SERVICE_PROTOCOL_VERSION,
 	SERVICE_LIFECYCLE_LOCK_TTL_MS,
@@ -210,7 +220,7 @@ function waitingToolNames(item) {
 function upgradeWaitLines(waiting, startedAtMs, { prompt = true } = {}) {
 	const elapsed = formatWaitElapsed(Date.now() - startedAtMs)
 	const lines = [
-		`pinano service upgrade has waited ${elapsed} for running sessions:`,
+		`cerex service upgrade has waited ${elapsed} for running sessions:`,
 		...waiting.map((item) => `  ${item.sessionId.slice(0, 8)} ${waitingToolNames(item)}`),
 	]
 	if (prompt) lines.push(`Waited ${elapsed}. Hard interrupt and replace the service? [y/N] `)
@@ -230,7 +240,7 @@ function clearRenderedLines(count) {
 }
 
 async function waitForUpgradeBlockageDecision(info, initialWaiting, startedAtMs) {
-	if (process.env.PINANO_SERVICE_HARD_INTERRUPT === "1") return { action: "hard" }
+	if (process.env.CEREX_SERVICE_HARD_INTERRUPT === "1") return { action: "hard" }
 	if (!process.stdin.isTTY || !process.stderr.isTTY) {
 		for (const line of upgradeWaitLines(initialWaiting, startedAtMs, { prompt: false })) console.error(line)
 		return { action: "busy" }
@@ -303,7 +313,7 @@ async function waitForUpgradeBlockageDecision(info, initialWaiting, startedAtMs)
 }
 
 function serviceHardInterruptForced() {
-	return process.env.PINANO_SERVICE_HARD_INTERRUPT === "1"
+	return process.env.CEREX_SERVICE_HARD_INTERRUPT === "1"
 }
 
 async function hardInterruptDecisionForTarget(target, prompt) {
@@ -365,19 +375,19 @@ async function waitForOldServiceStopped(existing, timeoutMs) {
 }
 
 function lifecycleSupersededError(message = "Service lifecycle operation was superseded") {
-	return Object.assign(new Error(message), { code: "PINANO_SERVICE_LIFECYCLE_SUPERSEDED" })
+	return Object.assign(new Error(message), { code: "CEREX_SERVICE_LIFECYCLE_SUPERSEDED" })
 }
 
 function lifecycleBlockedError(message) {
-	return Object.assign(new Error(message), { code: "PINANO_SERVICE_LIFECYCLE_BLOCKED" })
+	return Object.assign(new Error(message), { code: "CEREX_SERVICE_LIFECYCLE_BLOCKED" })
 }
 
 function isLifecycleSupersededError(err) {
-	return /** @type {any} */ (err)?.code === "PINANO_SERVICE_LIFECYCLE_SUPERSEDED"
+	return productErrorCodeMatches(err, "CEREX_SERVICE_LIFECYCLE_SUPERSEDED")
 }
 
 function isLifecycleBlockedError(err) {
-	return /** @type {any} */ (err)?.code === "PINANO_SERVICE_LIFECYCLE_BLOCKED"
+	return productErrorCodeMatches(err, "CEREX_SERVICE_LIFECYCLE_BLOCKED")
 }
 
 function createLifecycleLeaseControl(operationId) {
@@ -426,7 +436,7 @@ async function runBlockedLifecycleDecision(operation, target, leaseControl, mess
 async function claimHardInterrupt(operation, target, leaseControl, message, prompt) {
 	const result = await runBlockedLifecycleDecision(operation, target, leaseControl, message, () => hardInterruptDecisionForTarget(target, prompt))
 	if (result.action === "world-changed") return "world-changed"
-	if (result.action === "blocked") throw lifecycleBlockedError(`${message}. Run again after it exits, or set PINANO_SERVICE_HARD_INTERRUPT=1 to force replacement.`)
+	if (result.action === "blocked") throw lifecycleBlockedError(`${message}. Run again after it exits, or set CEREX_SERVICE_HARD_INTERRUPT=1 to force replacement.`)
 	if (result.decision === "stopped") return "world-changed"
 	return result.decision === true || result.decision === "hard" ? "hard" : "busy"
 }
@@ -442,7 +452,7 @@ async function hardInterruptOldServiceForOperation(operation, target) {
 	if (claimed.action !== "claimed") throw lifecycleSupersededError()
 	await interruptOldService(target, "hard", 0)
 	if (!pid || await waitForProcessExit(pid, 3000) || await oldServiceStopped(target)) return true
-	if (!await terminateProcess(pid)) throw new Error(`Existing pinano service pid ${pid} did not exit after hard interrupt`)
+	if (!await terminateProcess(pid)) throw new Error(`Existing cerex service pid ${pid} did not exit after hard interrupt`)
 	return true
 }
 
@@ -464,8 +474,8 @@ async function ensureOldServiceStoppedForOperation(operation, target, interrupte
 			operation,
 			target,
 			leaseControl,
-			`Waiting for pinano service pid ${pid} to exit after interrupt`,
-			`Pinano service pid ${pid} did not exit after interrupt. Kill it and replace it? [y/N] `,
+			`Waiting for cerex service pid ${pid} to exit after interrupt`,
+			`Cerex service pid ${pid} did not exit after interrupt. Kill it and replace it? [y/N] `,
 		)
 	}
 	await appendServiceLog("service_unreachable", { pid, serviceRunId: target.serviceRunId, transport: target.transport, host: target.host, port: target.port, error: interrupted?.error, status: interrupted?.status })
@@ -475,7 +485,7 @@ async function ensureOldServiceStoppedForOperation(operation, target, interrupte
 		target,
 		leaseControl,
 		`Existing service pid ${pid} is unreachable; waiting for hard-interrupt decision`,
-		`Pinano service pid ${pid} is alive but unreachable. Kill it and replace it? [y/N] `,
+		`Cerex service pid ${pid} is alive but unreachable. Kill it and replace it? [y/N] `,
 	)
 }
 
@@ -497,23 +507,23 @@ async function stopOldServiceForOperation(operation, target, leaseControl, runti
 		)
 		if (result.action === "world-changed") return true
 		if (result.action === "blocked") {
-			console.error("Run again after they finish, or set PINANO_SERVICE_HARD_INTERRUPT=1 to replace the service.")
-			throw lifecycleBlockedError("Existing pinano service is busy")
+			console.error("Run again after they finish, or set CEREX_SERVICE_HARD_INTERRUPT=1 to replace the service.")
+			throw lifecycleBlockedError("Existing cerex service is busy")
 		}
 		const decision = result.decision
 		if (decision.action === "cleared") {
 			console.error("Running sessions finished; continuing service replacement...")
 			if (!await ensureOldServiceStoppedForOperation(operation, target, decision.interrupted, leaseControl)) {
-				throw new Error(`Existing pinano service pid ${pid} did not exit after running sessions finished`)
+				throw new Error(`Existing cerex service pid ${pid} did not exit after running sessions finished`)
 			}
 			return true
 		}
 		if (decision.action === "hard") return hardInterruptOldServiceForOperation(operation, target)
 		if (decision.action === "error") return ensureOldServiceStoppedForOperation(operation, target, decision.interrupted, leaseControl)
-		throw lifecycleBlockedError("Existing pinano service is busy")
+		throw lifecycleBlockedError("Existing cerex service is busy")
 	}
 	if (!await ensureOldServiceStoppedForOperation(operation, target, interrupted, leaseControl)) {
-		throw new Error(`Existing pinano service pid ${pid} is alive but unreachable (${interrupted?.error || "ping failed"}). Stop it, or set PINANO_SERVICE_HARD_INTERRUPT=1 to force replacement.`)
+		throw new Error(`Existing cerex service pid ${pid} is alive but unreachable (${interrupted?.error || "ping failed"}). Stop it, or set CEREX_SERVICE_HARD_INTERRUPT=1 to force replacement.`)
 	}
 	return true
 }
@@ -560,7 +570,7 @@ async function startServiceForOperation(operation, options, runtimeIdentity) {
 		phase: "starting-new",
 		expectedInfo: null,
 		newServiceRunId: serviceRunId,
-		message: "Starting pinano service",
+		message: "Starting cerex service",
 	})
 	if (claimed.action === "world-changed") {
 		await clearLifecycleOperation(operation.operationId)
@@ -577,8 +587,8 @@ async function startServiceForOperation(operation, options, runtimeIdentity) {
 	const baseChildEnv = withoutReexecSupervisorEnv(process.env)
 	const childEnv = {
 		...baseChildEnv,
-		...(options.idleShutdown === false ? { PINANO_SERVICE_IDLE_SHUTDOWN: "0" } : {}),
-		...(Number.isFinite(options.idleShutdownDelayMs) ? { PINANO_SERVICE_IDLE_SHUTDOWN_DELAY_MS: String(Math.max(0, Number(options.idleShutdownDelayMs))) } : {}),
+		...(options.idleShutdown === false ? { CEREX_SERVICE_IDLE_SHUTDOWN: "0" } : {}),
+		...(Number.isFinite(options.idleShutdownDelayMs) ? { CEREX_SERVICE_IDLE_SHUTDOWN_DELAY_MS: String(Math.max(0, Number(options.idleShutdownDelayMs))) } : {}),
 	}
 	const child = spawn(process.execPath, argv, {
 		cwd: options.cwd,
@@ -630,11 +640,11 @@ async function startServiceForOperation(operation, options, runtimeIdentity) {
 				return info
 			}
 		}
-		if (childStartupFailure) throw new Error(`Pinano service ${childStartupFailure}. See ${logPath}`)
+		if (childStartupFailure) throw new Error(`Cerex service ${childStartupFailure}. See ${logPath}`)
 		await delay(100)
 	}
 	if (child.pid) await terminateProcess(child.pid)
-	throw new Error(`Timed out starting pinano service. See ${logPath}`)
+	throw new Error(`Timed out starting cerex service. See ${logPath}`)
 }
 
 async function performLifecycleOperation(operation, target, options, runtimeIdentity) {
@@ -678,7 +688,7 @@ export async function ensureService(options) {
 			const pid = servicePid(existing)
 			const pidAlive = processExists(pid)
 			await appendServiceLog("service_unsupported_transport", { pid, pidAlive, serviceRunId: existing.serviceRunId, transport: existing.transport })
-			if (pidAlive) throw new Error(`Existing Pinano service uses unsupported ${existing.transport || "unknown"} transport at pid ${pid}. Stop it before starting this version.`)
+			if (pidAlive) throw new Error(`Existing Cerex service uses unsupported ${existing.transport || "unknown"} transport at pid ${pid}. Stop it before starting this version.`)
 		} else if (existing) {
 			const health = await serviceHealth(existing, runtimeIdentity)
 			if (health) {
@@ -706,7 +716,7 @@ export async function ensureService(options) {
 			observedInfo: operationStartedWithInfo,
 			phase: operationStartedWithInfo ? "stopping-old" : "starting-new",
 			newServiceRunId: operationStartedWithInfo ? null : randomUUID(),
-			message: operationStartedWithInfo ? "Stopping old service" : "Starting pinano service",
+			message: operationStartedWithInfo ? "Stopping old service" : "Starting cerex service",
 		})
 		if (begin.action === "wait") {
 			const ready = await waitForLifecycleOperation(begin.operation, runtimeIdentity)
@@ -806,40 +816,6 @@ export function createServiceClient(info, options = {}) {
 	let runtimeCheckTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
 	let runtimeCheckInFlight = false
 
-	const sessionsPath = (cwd = sessionListCwd, options = {}) => {
-		const params = new URLSearchParams()
-		if (cwd) params.set("cwd", cwd)
-		if (options.includeDeleted === true) params.set("includeDeleted", "1")
-		if (options.includeHidden === true) params.set("includeHidden", "1")
-		const query = params.toString()
-		return `/sessions${query ? `?${query}` : ""}`
-	}
-	const sessionsStatusPath = (cwd = sessionListCwd, options = {}) => {
-		const params = new URLSearchParams()
-		if (cwd) params.set("cwd", cwd)
-		if (options.includeDeleted === true) params.set("includeDeleted", "1")
-		if (options.includeHidden === true) params.set("includeHidden", "1")
-		const query = params.toString()
-		return `/sessions/status${query ? `?${query}` : ""}`
-	}
-	const sessionActionPath = (id, action) => `/sessions/${encodeURIComponent(id)}/${action}${sessionListCwd ? `?cwd=${encodeURIComponent(sessionListCwd)}` : ""}`
-	const clientContextPath = (cwd = undefined) => cwd ? `/client-context?cwd=${encodeURIComponent(cwd)}` : "/client-context"
-	const projectPreviewsPath = (projectDir, options = {}) => {
-		const params = new URLSearchParams()
-		params.set("projectDir", projectDir)
-		if (options.sessionId) params.set("sessionId", options.sessionId)
-		return `/projects/previews?${params}`
-	}
-	const sessionPreviewsPath = (id) => `/sessions/${encodeURIComponent(id)}/previews`
-	const previewUrlPath = (route, url) => `/previews/${route}?url=${encodeURIComponent(url)}`
-	const previewSourceResolvePath = (request = {}) => {
-		const params = new URLSearchParams()
-		if (request.path) params.set("path", request.path)
-		if (request.projectDir) params.set("projectDir", request.projectDir)
-		if (request.sessionId) params.set("sessionId", request.sessionId)
-		const query = params.toString()
-		return `/previews/resolve-source${query ? `?${query}` : ""}`
-	}
 	const sessionMatchesDirectoryFilter = (session, cwd) => {
 		if (!cwd) return true
 		const initialWd = typeof session?.initialWd === "string" && session.initialWd ? session.initialWd : session?.cwd
@@ -857,8 +833,8 @@ export function createServiceClient(info, options = {}) {
 		startWeb: options.startWeb,
 	})
 	const isServiceTransportError = (err) => {
-		const code = /** @type {any} */ (err)?.code
-		if (["ENOENT", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "PINANO_SERVICE_TIMEOUT"].includes(code)) return true
+		const code = canonicalProductErrorCode(/** @type {any} */ (err)?.code)
+		if (["ENOENT", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EPIPE", "CEREX_SERVICE_TIMEOUT"].includes(code)) return true
 		const message = String(/** @type {any} */ (err)?.message ?? err)
 		return /\b(ENOENT|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EPIPE)\b|no such file or directory|socket hang up|timed out/i.test(message)
 	}
@@ -964,56 +940,102 @@ export function createServiceClient(info, options = {}) {
 			}
 		}
 	}
-	return {
-		get info() {
+	const subscribeLiveResource = (resource, params, handlers) => {
+		const release = retainLiveSubscription()
+		let subscription
+		try {
+			subscription = liveClient.subscribe(resource, params, handlers)
+		} catch (err) {
+			release()
+			throw err
+		}
+		let closed = false
+		return {
+			refresh: () => subscription.refresh(),
+			unsubscribe() {
+				if (closed) return
+				closed = true
+				try { subscription.unsubscribe() } finally { release() }
+			},
+		}
+	}
+	const serializeAppRequestOptions = (requestOptions = {}) => {
+		if (!Object.prototype.hasOwnProperty.call(requestOptions, "body")) return requestOptions
+		return { ...requestOptions, body: JSON.stringify(requestOptions.body) }
+	}
+	const workspace = createWorkspaceClient({
+		call: (contractRequest, callOptions = {}) => serviceRequest(WORKSPACE_CONTRACT_ROUTE, {
+			method: "POST",
+			body: JSON.stringify(contractRequest),
+			signal: callOptions.signal,
+		}),
+	}, {
+		projectWorkspace: {
+			browseAvailable: true,
+			async fetch(workspaceRequest) {
+				await verifyCurrentRuntimeDesired()
+				const url = new URL(workspaceRequest.url)
+				const method = workspaceRequest.method.toUpperCase()
+				const headers = new Headers(workspaceRequest.headers)
+				for (const name of [...headers.keys()]) {
+					if (HOP_BY_HOP_HEADERS.has(name) || name.startsWith(WORKSPACE_INTERNAL_HEADER_PREFIX)) headers.delete(name)
+				}
+				for (const name of ["authorization", "content-length", "cookie", "host"]) headers.delete(name)
+				headers.set("host", "cerex.local")
+				headers.set("connection", "close")
+				if (currentInfo.token) headers.set("authorization", `Bearer ${currentInfo.token}`)
+				const servicePath = serviceControlPath(`${WORKSPACE_FILES_ROUTE}${url.pathname}${url.search}`)
+				const perform = () => proxyHttpRequest(workspaceRequest, {
+					...serviceHttpOptions(currentInfo, servicePath),
+					headers: Object.fromEntries(headers),
+				}, {
+					responseHeaders(responseHeaders) {
+						for (const name of HOP_BY_HOP_HEADERS) responseHeaders.delete(name)
+						return responseHeaders
+					},
+				})
+				try {
+					return await perform()
+				} catch (err) {
+					if ((method !== "GET" && method !== "HEAD") || !isServiceTransportError(err) || !await reconnect()) throw err
+					return perform()
+				}
+			},
+			watchDirectory(root, path, onChange, onError) {
+				const subscription = subscribeLiveResource(WORKSPACE_DIRECTORY_RESOURCE, { root, path }, {
+					onData(value, envelope) {
+						if (envelope?.type !== "snapshot") onChange(value)
+					},
+					onError,
+				})
+				let closed = false
+				return {
+					close() {
+						if (closed) return
+						closed = true
+						subscription.unsubscribe()
+					},
+				}
+			},
+		},
+	})
+	const client = new CerexClient({
+		transport: {
+			request: (path, requestOptions = {}) => apiRequest(path, serializeAppRequestOptions(requestOptions)),
+			requestBytes: (path, requestOptions = {}) => apiRequestRaw(path, serializeAppRequestOptions(requestOptions)),
+			subscribe: subscribeLiveResource,
+		},
+		cwd: clientCwd,
+		sessionListCwd,
+	})
+	client.workspace = workspace
+	Object.defineProperty(client, "info", {
+		enumerable: true,
+		get() {
 			return currentInfo
 		},
-		async sessions(cwd = undefined, options = {}) {
-			return (await apiRequest(sessionsPath(cwd, options))).sessions
-		},
-		async sessionsStatus(cwd = undefined, options = {}) {
-			return apiRequest(sessionsStatusPath(cwd, options))
-		},
-		async clientContext(cwd = undefined) {
-			return apiRequest(clientContextPath(cwd))
-		},
-		async overviewProject(cwd = undefined) {
-			return (await apiRequest(clientContextPath(cwd))).project
-		},
-		async ensureProjectMaintenance(projectDir, options = {}) {
-			return apiRequest("/projects/maintenance", {
-				method: "POST",
-				timeoutMs: 0,
-				body: JSON.stringify({
-					projectDir,
-					runPrompt: options.runPrompt !== false,
-					onlyIfNeeded: options.onlyIfNeeded === true,
-					waitForCompletion: options.waitForCompletion === true,
-				}),
-			})
-		},
-		async projectPreviews(projectDir, options = {}) {
-			return apiRequest(projectPreviewsPath(projectDir, options))
-		},
-		async sessionPreviews(id) {
-			return apiRequest(sessionPreviewsPath(id))
-		},
-		async resolveSessionId(id) {
-			const requested = typeof id === "string" ? id.trim() : ""
-			return apiRequest(`/sessions/resolve?id=${encodeURIComponent(requested)}`)
-		},
-		async resolvePreviewUrl(url) {
-			return apiRequest(previewUrlPath("resolve", url))
-		},
-		async resolvePreviewSource(request) {
-			return apiRequest(previewSourceResolvePath(request))
-		},
-		async previewLog(url) {
-			return apiRequest(previewUrlPath("log", url))
-		},
-		async previewSource(url) {
-			return apiRequest(previewUrlPath("source", url))
-		},
+	})
+	return Object.assign(client, {
 		async webStatus() {
 			return serviceRequest("/web/status")
 		},
@@ -1028,225 +1050,6 @@ export function createServiceClient(info, options = {}) {
 		},
 		async stopWeb() {
 			return serviceRequest("/web/stop", { method: "POST", body: "{}" })
-		},
-		async getSettings() {
-			return apiRequest("/settings")
-		},
-		async models() {
-			return apiRequest("/models")
-		},
-		async createSession(options = {}) {
-			const cwd = typeof options.cwd === "string" && options.cwd ? options.cwd : clientCwd
-			return apiRequest("/sessions", {
-				method: "POST",
-				body: JSON.stringify({ prompt: options.prompt, cwd, images: options.images }),
-			})
-		},
-		async setDefaultModel(model) {
-			return apiRequest("/settings", {
-				method: "POST",
-				body: JSON.stringify({ model }),
-			})
-		},
-		async setDefaultReasoning(level) {
-			return apiRequest("/settings", {
-				method: "POST",
-				body: JSON.stringify({ thinkingLevel: level }),
-			})
-		},
-		async getUiState(key) {
-			const response = await apiRequest(`/ui-state?key=${encodeURIComponent(key)}`)
-			return response.found ? response.value : undefined
-		},
-		async setUiState(key, value) {
-			return apiRequest("/ui-state", {
-				method: "POST",
-				body: JSON.stringify({ key, value }),
-			})
-		},
-		async deleteUiState(key) {
-			return apiRequest(`/ui-state?key=${encodeURIComponent(key)}`, { method: "DELETE" })
-		},
-		async branchSession(id, options = {}) {
-			const entryId = typeof options.entryId === "string" && options.entryId ? options.entryId : undefined
-			const cwd = typeof options.cwd === "string" && options.cwd ? options.cwd : undefined
-			return apiRequest(sessionActionPath(id, "branch"), {
-				method: "POST",
-				body: JSON.stringify({
-					...(cwd ? { cwd } : {}),
-					...(entryId ? { entryId } : {}),
-					...(options.restoreDraft === false ? { restoreDraft: false } : {}),
-				}),
-			})
-		},
-		async spawnSubSession(id, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/sub-sessions`, {
-				method: "POST",
-				timeoutMs: 0,
-				body: JSON.stringify({
-					task: options.task,
-					name: options.name,
-					forkTurns: options.forkTurns,
-					origin: options.origin,
-				}),
-			})
-		},
-		async subSessions(id, options = {}) {
-			const query = options.includeClosed === true ? "?includeClosed=1" : ""
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/sub-sessions${query}`)
-		},
-		async waitSubSession(id, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/sub-sessions/wait`, {
-				method: "POST",
-				timeoutMs: 0,
-				body: JSON.stringify({ agent: options.agent, timeoutMs: options.timeoutMs }),
-			})
-		},
-		async followupSubSession(id, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/sub-sessions/followup`, {
-				method: "POST",
-				timeoutMs: 0,
-				body: JSON.stringify({ agent: options.agent, task: options.task, interrupt: options.interrupt === true }),
-			})
-		},
-		async resumeSubSession(id, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/sub-sessions/resume`, {
-				method: "POST",
-				timeoutMs: 0,
-				body: JSON.stringify({ agent: options.agent }),
-			})
-		},
-		async closeSubSession(id, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/sub-sessions/close`, {
-				method: "POST",
-				timeoutMs: 0,
-				body: JSON.stringify({ agent: options.agent, reason: options.reason }),
-			})
-		},
-		async snapshot(id, options = {}) {
-			const params = new URLSearchParams()
-			if (options.includeSessions === true) params.set("includeSessions", "1")
-			if (options.includeContextMessages === true) params.set("includeContextMessages", "1")
-			const query = params.size > 0 ? `?${params}` : ""
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/snapshot${query}`)
-		},
-		async sessionStatus(id) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/status`)
-		},
-		async contextReport(id) {
-			return (await apiRequest(`/sessions/${encodeURIComponent(id)}/context-report`)).lines ?? []
-		},
-		async systemReport(id) {
-			return (await apiRequest(`/sessions/${encodeURIComponent(id)}/system-report`)).lines ?? []
-		},
-		async worktrees(id) {
-			return (await apiRequest(`/sessions/${encodeURIComponent(id)}/worktrees`)).worktrees ?? []
-		},
-		async attachmentContent(id, attachmentId, variant = "display") {
-			const params = new URLSearchParams()
-			if (variant) params.set("variant", variant)
-			const query = params.size > 0 ? `?${params}` : ""
-			const res = await apiRequestRaw(`/sessions/${encodeURIComponent(id)}/attachments/${encodeURIComponent(attachmentId)}/content${query}`)
-			return {
-				data: res.body,
-				mimeType: String(res.headers["content-type"] ?? "application/octet-stream"),
-			}
-		},
-		async prompt(id, message, streamingBehavior, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/prompt`, {
-				method: "POST",
-				body: JSON.stringify({
-					message,
-					streamingBehavior,
-					draftClientId: options.draftClientId,
-					draftClientSeq: options.draftClientSeq,
-					images: options.images,
-				}),
-			})
-		},
-		async setPromptDraft(id, text, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/draft`, {
-				method: "POST",
-				body: JSON.stringify({ text, clientId: options.clientId, clientSeq: options.clientSeq }),
-			})
-		},
-		async continueRun(id) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/continue`, { method: "POST", body: "{}" })
-		},
-		async abort(id) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/abort`, { method: "POST", body: "{}" })
-		},
-		async cancelPrompt(id, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/cancel-prompt`, {
-				method: "POST",
-				body: JSON.stringify({ restoreCurrentPrompt: options.restoreCurrentPrompt !== false }),
-			})
-		},
-		async markCompleted(id) {
-			return apiRequest(sessionActionPath(id, "complete"), { method: "POST", body: "{}" })
-		},
-		async markDeferred(id) {
-			return apiRequest(sessionActionPath(id, "defer"), { method: "POST", body: "{}" })
-		},
-		async markReadyForReview(id) {
-			return apiRequest(sessionActionPath(id, "review"), { method: "POST", body: "{}" })
-		},
-		async deleteSession(id) {
-			return apiRequest(sessionActionPath(id, "delete"), { method: "POST", body: "{}" })
-		},
-		async restoreSession(id) {
-			return apiRequest(sessionActionPath(id, "restore"), { method: "POST", body: "{}" })
-		},
-		async setThinking(id, level) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/reasoning`, {
-				method: "POST",
-				body: JSON.stringify({ level }),
-			})
-		},
-		async sessionModels(id) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/models`)
-		},
-		async setModel(id, model) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/model`, {
-				method: "POST",
-				body: JSON.stringify({ model }),
-			})
-		},
-		async setFast(id, args) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/fast`, {
-				method: "POST",
-				body: JSON.stringify({ args }),
-			})
-		},
-		async compact(id) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/compact`, { method: "POST", body: "{}", timeoutMs: 0 })
-		},
-		async bash(id, text, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/bash`, {
-				method: "POST",
-				body: JSON.stringify({
-					text,
-					draftClientId: options.draftClientId,
-					draftClientSeq: options.draftClientSeq,
-				}),
-				timeoutMs: 0,
-			})
-		},
-		async rewindTargets(id) {
-			return (await apiRequest(`/sessions/${encodeURIComponent(id)}/rewind-targets`)).targets
-		},
-		async rewind(id, entryId, options = {}) {
-			return apiRequest(`/sessions/${encodeURIComponent(id)}/rewind`, {
-				method: "POST",
-				timeoutMs: 0,
-				body: JSON.stringify({
-					entryId,
-					targetKind: options.targetKind,
-					summary: options.summary === true,
-					restoreFiles: options.restoreFiles === true,
-					restoreConversation: options.restoreConversation !== false,
-				}),
-			})
 		},
 		async interrupt(mode = "soft", waitMs = 0) {
 			const timeoutMs = requestTimeoutMs > 0 ? Math.max(requestTimeoutMs, waitMs + SERVICE_CONNECTIVITY_TIMEOUT_MS) : 0
@@ -1274,8 +1077,7 @@ export function createServiceClient(info, options = {}) {
 			let established = false
 			let failed = false
 			let closed = false
-			const release = retainLiveSubscription()
-			const subscription = liveClient.subscribe("app", {
+			const subscription = subscribeLiveResource("app", {
 				...(sessionId ? { sessionId } : {}),
 				...(activeSessionId ? { activeSessionId } : {}),
 				...(!sessionId && subscribeOptions.includeDeleted === true ? { includeDeleted: true } : {}),
@@ -1303,19 +1105,14 @@ export function createServiceClient(info, options = {}) {
 			return async () => {
 				if (closed) return
 				closed = true
-				try {
-					subscription.unsubscribe()
-				} finally {
-					release()
-				}
+				subscription.unsubscribe()
 			}
 		},
 		subscribeSessionList(onUpdate, params = {}, handlers = {}) {
 			let closed = false
 			const cwd = typeof params.cwd === "string" && params.cwd ? params.cwd : sessionListCwd
 			const contextCwd = typeof params.contextCwd === "string" && params.contextCwd ? params.contextCwd : clientCwd
-			const release = retainLiveSubscription()
-			const subscription = liveClient.subscribe("sessions", {
+			const subscription = subscribeLiveResource("sessions", {
 				...(cwd ? { cwd } : {}),
 				...(contextCwd ? { contextCwd } : {}),
 				...(params.includeDeleted === true ? { includeDeleted: true } : {}),
@@ -1329,14 +1126,10 @@ export function createServiceClient(info, options = {}) {
 			return async () => {
 				if (closed) return
 				closed = true
-				try {
-					subscription.unsubscribe()
-				} finally {
-					release()
-				}
+				subscription.unsubscribe()
 			}
 		},
-	}
+	})
 }
 
 /**

@@ -139,7 +139,7 @@ export class Agent {
 		this.preTurnMessages = options.preTurnMessages
 		this.projectMessagesForNextAction = options.projectMessagesForNextAction
 		this.automatedFollowUp = options.automatedFollowUp
-		/** Optional app-level hook for durable context-load entries. Agent core does not emit these itself; Pinano's lazy context loader calls it after recording a context entry. @type {((entry: any) => void | Promise<void>) | undefined} */
+		/** Optional app-level hook for durable context-load entries. Agent core does not emit these itself; Cerex's lazy context loader calls it after recording a context entry. @type {((entry: any) => void | Promise<void>) | undefined} */
 		this.onContextLoad = options.onContextLoad
 
 		this.sessionId = options.sessionId
@@ -380,7 +380,7 @@ export class Agent {
 	/**
 	 * Run an agent-loop invocation against a snapshot of the current context
 	 * without appending its messages to the durable/live conversation. This is
-	 * for Pinano-owned sidecar work that should use the same model/tool
+	 * for Cerex-owned sidecar work that should use the same model/tool
 	 * execution machinery as a normal turn
 	 * but must not become part of the user-visible session tree.
 	 *

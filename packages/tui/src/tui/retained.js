@@ -29,14 +29,14 @@ export function isFocusable(component) {
 }
 
 
-const RETAINED = Symbol("pinano.tui.retained");
-const DIRTY_PARENT = Symbol("pinano.tui.dirtyParent");
-const DIRTY = Symbol("pinano.tui.dirty");
-const RENDER_CACHE = Symbol("pinano.tui.renderCache");
-const CHILDREN_CACHE = Symbol("pinano.tui.childrenCache");
-const VOLATILE_CHILDREN = Symbol("pinano.tui.volatileChildren");
-const STRUCTURE_DIRTY = Symbol("pinano.tui.structureDirty");
-const STRUCTURE_DIRTY_START = Symbol("pinano.tui.structureDirtyStart");
+const RETAINED = Symbol("tui.retained");
+const DIRTY_PARENT = Symbol("tui.dirtyParent");
+const DIRTY = Symbol("tui.dirty");
+const RENDER_CACHE = Symbol("tui.renderCache");
+const CHILDREN_CACHE = Symbol("tui.childrenCache");
+const VOLATILE_CHILDREN = Symbol("tui.volatileChildren");
+const STRUCTURE_DIRTY = Symbol("tui.structureDirty");
+const STRUCTURE_DIRTY_START = Symbol("tui.structureDirtyStart");
 
 /** @typedef {{ lines: string[], spans?: import("./render-frame.js").RenderSpan[], sourceSpans?: import("./render-frame.js").RenderSourceSpan[], regions?: import("./render-frame.js").RenderRegion[], dirtyStart: number }} IncrementalRenderResult */
 /** @typedef {{ component: Component, start: number, length: number }} ChildRenderRecord */

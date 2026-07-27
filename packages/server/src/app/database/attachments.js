@@ -2,7 +2,7 @@ import {
 	SESSION_ATTACHMENT_KIND_IMAGE,
 	SESSION_ATTACHMENT_VARIANT_DISPLAY,
 	SESSION_ATTACHMENT_VARIANT_ORIGINAL,
-} from "../session-attachments.js"
+} from "../session/attachments.js"
 
 export function nextImageAttachmentNumber(db, sessionId, minimumNumber = 1) {
 	const row = db.prepare(`

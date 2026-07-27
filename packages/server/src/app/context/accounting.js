@@ -13,8 +13,8 @@
 // tokenizer would bloat the binary considerably. Be transparent about
 // it in /context output.
 
-import { isCompactionCheckpointMessage, isCompactionSummaryMessage } from "../compaction-summary.js"
-import { isProjectContextMessage } from "../project-context-message.js"
+import { isCompactionCheckpointMessage, isCompactionSummaryMessage } from "../compaction/summary.js"
+import { isProjectContextMessage } from "../project/context-message.js"
 
 const CHARS_PER_TOKEN = 4
 const MESSAGE_OVERHEAD = 8
@@ -175,7 +175,7 @@ function entryFor(m, index) {
 	let kind = "empty"
 	if (m.compaction === true) kind = "compaction"
 	else if (isCompactionSummaryMessage(m)) kind = "compactionSummary"
-	else if (m.pinanoCompactionMemento === true) kind = "compactionMemento"
+	else if (m.compactionMemento === true) kind = "compactionMemento"
 	else if (m.branchSummary === true) kind = "branchSummary"
 	else if (role === "user" && isProjectContextMessage(m)) kind = "projectContext"
 	else if (role === "toolResult") kind = "toolResult"

@@ -16,7 +16,7 @@ import { Box, Container, Markdown, RetainedComponent, Spacer, Text, TruncatedTex
 import { isResponsesCompactionBlock } from "../../../../protocol/src/responses-compaction.js"
 import { contextLoadDisplayFiles } from "../../../../server/src/session-manager/context-display.js"
 import { getMarkdownTheme, theme } from "../theme.js"
-import { compactionMarkerBody, compactionMarkerLabel } from "../../../../server/src/app/compaction-summary.js"
+import { compactionMarkerBody, compactionMarkerLabel } from "../../../../server/src/app/compaction/summary.js"
 import { formatToolCall, formatToolPath } from "./tool-format.js"
 import { isPromptImageMarkerText } from "../../../../protocol/src/prompt-images.js"
 import { TRANSCRIPT_INDENT } from "./transcript.js"

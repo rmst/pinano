@@ -1,5 +1,5 @@
 import { createLiveResourceSession } from "./resource-server.js"
-import { acceptWebSocket, rejectWebSocketUpgrade } from "../websocket-transport.js"
+import { acceptWebSocket, rejectWebSocketUpgrade } from "../websocket/server.js"
 
 /**
  * Bind live resources to one authenticated WebSocket path. Authentication and resources stay transport-independent; this object owns connection and resource cleanup.

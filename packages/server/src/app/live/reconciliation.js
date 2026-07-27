@@ -1,3 +1,5 @@
+import { sessionCursorGenerationChanged } from "../../../../protocol/src/session-cursor.js"
+
 export const DEFAULT_BACKGROUND_RECONCILE_INTERVAL_MS = 20_000
 
 const numberCursorAdvanced = (next, current) =>
@@ -20,6 +22,7 @@ const pendingToolCallCount = (snapshot) => {
 export function sessionStatusIndicatesSnapshotStale(status, snapshot) {
 	if (!status || !snapshot) return false
 	if (status.sessionId && snapshot.sessionId && status.sessionId !== snapshot.sessionId) return false
+	if (sessionCursorGenerationChanged(status, snapshot)) return true
 	if (numberCursorAdvanced(status.seq, snapshot.seq)) return true
 	if (numberCursorAdvanced(status.viewEpoch, snapshot.viewEpoch)) return true
 	if (typeof status.isStreaming === "boolean" && status.isStreaming !== snapshot.isStreaming) return true

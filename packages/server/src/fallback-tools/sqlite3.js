@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
-const VERSION = "pinano-sqlite3 0.1 sqlite3-compatible query subset"
+const VERSION = "cerex-sqlite3 0.1 sqlite3-compatible query subset"
 
 class SqliteCliError extends Error {
 	constructor(message, exitCode = 1) {
@@ -489,7 +489,7 @@ async function main() {
 		}
 		return await run(config)
 	} catch (err) {
-		process.stderr.write(`pinano sqlite3 fallback: ${err?.message || err}\n`)
+		process.stderr.write(`cerex sqlite3 fallback: ${err?.message || err}\n`)
 		return err?.exitCode ?? 1
 	}
 }

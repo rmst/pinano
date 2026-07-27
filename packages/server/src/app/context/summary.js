@@ -1,4 +1,4 @@
-import { isCompactionCheckpointMessage } from "../compaction-summary.js"
+import { isCompactionCheckpointMessage } from "../compaction/summary.js"
 import { breakdownContext, estimateMessageTokens } from "./accounting.js"
 
 /** @param {number | undefined | null} value */
@@ -32,7 +32,7 @@ export function usageContextTokens(usage) {
  *
  * A provider-reported assistant usage describes the request that produced that
  * assistant turn, so the assistant message itself and anything after it are
- * unreported delta for the next request. A Pinano compaction checkpoint stores
+ * unreported delta for the next request. A Cerex compaction checkpoint stores
  * a post-compaction estimate that already includes the checkpoint message, so
  * its delta starts after the checkpoint.
  *

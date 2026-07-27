@@ -1,62 +1,98 @@
-# Pinano
-
-<p>
-<a href="#pinano"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/overview-attach-scripted-960w-a309f7cf.gif" alt="Pinano session overview and running agent demo" width="100%"></a>
+<p align="center">
+<img src="docs/assets/brand/cerex-logo.png" alt="Cerex logo" width="112">
 </p>
 
-Pinano is an interactive AI coding assistant for the terminal with an ergonomic agent-view UI comparable to Claude Code's [Agent View](https://code.claude.com/docs/en/agent-view). Pinano works very well with a ChatGPT/Codex subscription. Pinano exposes the same system prompt and tools like the official Codex CLI, so agent performance with the flagship GPT-5.x models should be just as good. Other APIs are also supported, including local models via `llama.cpp`.
+<h1 align="center">Cerex</h1>
 
+Cerex is an agent engine for durable, fault-tolerant AI sessions. The current open-source release focuses on coding and ships with a terminal client. The SDK is not fully stable yet; if you want to build on it, talk to us via *Issues* or email `simon@ramstedt.org`.
 
-*If you have questions or issues just ask Pinano itself! It has access (read-only) to its own source and documentation.*
+Cerex matches the Codex CLI system prompt and tool profile without requiring its source tree or binary. Any other OpenAI-compatible API is also supported, with model-specific tool profiles for Kimi K3 and others in development.
 
+Cerex is installable directly from GitHub source, with no npm dependencies and no build step.
 
-Pinano is directly installable from GitHub source, with no npm dependencies and no build step.
+## Architecture
+
+<p>
+<a href="docs/assets/cerex-architecture.png"><img src="docs/assets/cerex-architecture.png" alt="Cerex process architecture" width="100%"></a>
+</p>
+
+<details>
+<summary>Source layout</summary>
+
+```text
+cli/                         command-line composition root
+packages/
+  protocol/src/              shared transport and transcript presentation contracts
+  sdk/src/                   runtime-independent client SDK
+  server/src/
+    agent-core/              AgentLoop + Agent (streamFn-driven), JSDoc types
+    ai-apis/                 zero-dep OpenAI Chat-Completions / Responses / Codex clients
+    tools/                   built-in coding and shell tools
+    fallback-tools/          PATH fallbacks for common external commands
+    session-manager/         SQLite + in-memory session storage
+    app/                     service, workspace-host, and worker runtime
+  tui/src/
+    tui/                     reusable retained terminal UI framework
+    app/                     Cerex terminal client
+```
+
+</details>
 
 ## Install
 
 ```bash
-npm install -g github:rmst/pinano
-pinano
+npm install -g github:rmst/cerex
+cerex
 ```
 
-Requires **Node ≥ 22.6**. It's best tested on MacOS but it also runs on Linux and Windows WSL-2 where it requires bubblewrap for sandboxing (it will offer to run without a sandbox otherwise).
+Requires **Node ≥ 22.6**. Cerex is best tested on macOS and also runs on Linux and Windows through WSL 2. Linux and WSL 2 require Bubblewrap for sandboxing; Cerex can offer to continue without a sandbox when it is unavailable.
 
 <details>
 <summary>Clone and run directly</summary>
 
 ```bash
-git clone https://github.com/rmst/pinano
-./pinano/bin/pinano.js
+git clone https://github.com/rmst/cerex
+./cerex/bin/cerex.js
 ```
 
 </details>
 
-On first run, Pinano opens the model provider credentials view when no provider is configured. Pinano is currently optimized for use with a ChatGPT subscription.
+On first run, Cerex opens the model provider credentials view when no provider is configured. Cerex is currently optimized for use with a ChatGPT subscription.
+
+The `pinano` command and `PINANO_*` environment variables remain aliases. On first use, Cerex moves a lone `~/.pinano` state directory to `~/.cerex` and moves project metadata and preview definitions from `.pinano` to `.cerex`. Existing `.pinano/wt` worktrees stay in place until closed.
 
 <details>
 <summary>Install and first setup demo</summary>
 
 <p>
-<a href="#install"><img src="https://github.com/rmst/pinano/releases/download/readme-assets/install-setup-scripted-960w-1f420677.gif" alt="Pinano install and first setup demo" width="100%"></a>
+<a href="#install"><img src="https://github.com/rmst/cerex/releases/download/readme-assets/install-setup-scripted-960w-1f420677.gif" alt="Cerex install and first setup demo" width="100%"></a>
 </p>
 
 </details>
 
-API keys are also supported. Pinano can import supported API keys from the launch environment. Deployment-level API keys and other settings can also be configured declaratively; see [settings](docs/settings.md).
-
+API keys are also supported. Cerex can import supported API keys from the launch environment. Deployment-level API keys and other settings can be configured declaratively; see [settings](docs/settings.md).
 
 ## Common commands
 
 ```bash
-pinano                           # open the session overview
-pinano open /sessions/<id>       # open a session directly
-pinano service                   # show local service status
-pinano --help
+cerex                           # open the session overview
+cerex open /sessions/<id>       # open a session directly
+cerex service                   # show local service status
+cerex --help
 ```
 
-## Session overview
+## Terminal client
 
-Running `pinano` opens an overview of your sessions. Type a task and press `Enter` to start a new background session in the current directory. Use `/model` from the overview to update the global default model for newly dispatched sessions.
+Running `cerex` opens an overview of your sessions. Type a task and press `Enter` to start a background session in the current directory. Running sessions stay alive when you detach from the terminal, and the service shuts down automatically after all sessions are idle.
+
+<details>
+<summary>Terminal UI demo and reference</summary>
+
+<p>
+<a href="#terminal-client"><img src="https://github.com/rmst/cerex/releases/download/readme-assets/overview-attach-scripted-960w-a309f7cf.gif" alt="Cerex terminal session overview and running agent demo" width="100%"></a>
+</p>
+
+Use `/model` from the overview to update the global default model for newly dispatched sessions.
 
 Useful keys:
 
@@ -70,10 +106,6 @@ Useful keys:
 | `Esc` | interrupt an open running session |
 | `Ctrl+X` | stop a selected running session |
 | `Ctrl+C` | detach this terminal without stopping running sessions |
-
-Pinano keeps running sessions alive when you detach from the terminal and shuts down automatically after all sessions are idle.
-
-## In-app commands
 
 Type `/` to autocomplete. `/help` shows the full command list for the current view.
 
@@ -104,18 +136,22 @@ Press `Ctrl+V` in the session or overview editor to paste an image from the syst
 
 `/branch` creates a new session from the current conversation point. The original session remains unchanged and both sessions can continue independently.
 
-Press `Esc Esc` on an empty editor to open `/rewind`. You can return to an earlier prompt, switch to another branch tip, and optionally restore files changed through Pinano's edit tools.
+Press `Esc Esc` on an empty editor to open `/rewind`. You can return to an earlier prompt, switch to another branch tip, and optionally restore files changed through Cerex's edit tools.
+
+</details>
+
+*If you have questions or issues, ask Cerex itself. It has read-only access to its own source and documentation.*
 
 ## Tool environments
 
-By default, tools run in a native filesystem sandbox on MacOS and Linux. MacOS uses `sandbox-exec`; Linux uses Bubblewrap (`bwrap`). You can optionally configure named local or container environments for tool execution.
+By default, tools run in a native filesystem sandbox on macOS and Linux. macOS uses `sandbox-exec`; Linux uses Bubblewrap (`bwrap`). You can optionally configure named local or container environments for tool execution.
 
-Sandbox mount paths include the session's starting working directory. In the environments configuration `mountPaths` adds other static host paths, and other options are available. Changing `cwd` does not add mounts or writable paths. Native workers allow reads from mounted paths plus system, toolchain, Pinano runtime paths, and the environment's tool home, while writes stay restricted to mounted paths, temp directories, and the tool home.
+Sandbox mount paths include the session's starting working directory. In the environments configuration, `mountPaths` adds other static host paths. Changing `cwd` does not add mounts or writable paths. Native workers allow reads from mounted paths plus system, toolchain, Cerex runtime paths, and the environment's tool home, while writes stay restricted to mounted paths, temporary directories, and the tool home.
 
 <details>
 <summary>Environment configuration</summary>
 
-Create `~/.pinano/environments.json` to define explicit environments:
+Create `~/.cerex/environments.json` to define explicit environments:
 
 ```json
 {
@@ -133,15 +169,15 @@ Create `~/.pinano/environments.json` to define explicit environments:
 		}
 	}
 }
-
 ```
+
 </details>
 
 ## Project context
 
-Pinano reads project instructions from `AGENTS.md` or `CLAUDE.md`:
+Cerex reads project instructions from `AGENTS.md` or `CLAUDE.md`:
 
-1. Global instructions under `~/.pinano/`.
+1. Global instructions under `~/.cerex/`.
 2. Instructions in ancestor directories of the current working directory.
 3. Additional instructions in subdirectories when files there are read or modified.
 
@@ -153,30 +189,10 @@ Pinano reads project instructions from `AGENTS.md` or `CLAUDE.md`:
 # project rules
 See @README for project overview.
 @./conventions.md
-@~/.pinano/personal-style.md
-```
-
-Reusable task instructions can also be installed as local skills; see [skills](docs/skills.md).
-
-## Repository layout
-
-```text
-cli/                         command-line composition root
-packages/
-  protocol/src/              shared transport and transcript presentation contracts
-  server/src/
-    agent-core/              AgentLoop + Agent (streamFn-driven), JSDoc types
-    ai-apis/                 zero-dep OpenAI Chat-Completions / Responses / Codex clients
-    tools/                   built-in coding and shell tools
-    fallback-tools/          PATH fallbacks for common external commands
-    session-manager/         SQLite + in-memory session storage
-    app/                     service and worker runtime
-  tui/src/
-    tui/                     reusable retained terminal UI framework
-    app/                     Pinano terminal application
+@~/.cerex/personal-style.md
 ```
 
 ## Notes
 
-- The initial version of Pinano was based on [Pi](https://github.com/earendil-works/pi).
-- Pinano also runs on the experimental [Qn](https://github.com/rmst/qn) runtime.
+- Cerex was initially called Pinano and was based on [Pi](https://github.com/earendil-works/pi).
+- Cerex also runs on the experimental [Qn](https://github.com/rmst/qn) runtime.

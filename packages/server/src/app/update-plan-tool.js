@@ -1,4 +1,4 @@
-import { GPT_5_6_SOL_PINANO_INSTRUCTIONS_KEY } from "./model-instructions.js"
+import { GPT_5_6_SOL_INSTRUCTIONS_KEY, modelUsesInstructionsKey } from "./model/instructions/index.js"
 
 const updatePlanSchema = {
 	type: "object",
@@ -63,6 +63,6 @@ export function createUpdatePlanTool() {
 
 /** @param {any} model */
 export function updatePlanToolsForModel(model) {
-	if (model?.baseInstructionsKey !== GPT_5_6_SOL_PINANO_INSTRUCTIONS_KEY) return []
+	if (!modelUsesInstructionsKey(model, GPT_5_6_SOL_INSTRUCTIONS_KEY)) return []
 	return [createUpdatePlanTool()]
 }

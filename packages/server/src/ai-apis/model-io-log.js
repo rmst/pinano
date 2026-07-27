@@ -1,6 +1,6 @@
 // Optional model wire-log logger and model-adjacent telemetry store.
 //
-// Full model wire logging is disabled by default. Set service.modelIoLog=true in merged Pinano settings
+// Full model wire logging is disabled by default. Set service.modelIoLog=true in merged Cerex settings
 // to write every model API call to a separate SQLite database.
 // Subscription usage snapshots use the same database but are recorded independently. All writes
 // are best-effort: failures are swallowed so observability can never break model calls.
@@ -10,7 +10,7 @@ import { dirname, join } from "node:path"
 import { createHash, randomUUID } from "node:crypto"
 import { DatabaseSync } from "node:sqlite"
 
-import { configuredModelIoLogDbPath, isModelIoLogConfigured } from "../app/service-config.js"
+import { configuredModelIoLogDbPath, isModelIoLogConfigured } from "../app/service/config.js"
 import { dataRoot } from "../app/paths.js"
 
 export const MODEL_IO_LOG_SCHEMA_VERSION = 3
@@ -50,7 +50,7 @@ export function modelIoLogDbPath() {
 	try {
 		return configuredModelIoLogDbPath() || join(dataRoot(), "model-io.sqlite")
 	} catch {
-		return join(process.env.PINANO_HOME || "/tmp/pinano", "data", "model-io.sqlite")
+		return join(process.env.CEREX_HOME || "/tmp/cerex", "data", "model-io.sqlite")
 	}
 }
 
@@ -129,13 +129,13 @@ function safeOptions(options = {}) {
 }
 
 function warnOnce(err) {
-	if (warned || process.env.PINANO_TEST === "1") return
+	if (warned || process.env.CEREX_TEST === "1") return
 	warned = true
-	console.error(`pinano model I/O database unavailable after error: ${err?.message ?? err}`)
+	console.error(`Cerex model I/O database unavailable after error: ${err?.message ?? err}`)
 }
 
 function info(message) {
-	if (process.env.PINANO_TEST === "1") return
+	if (process.env.CEREX_TEST === "1") return
 	console.error(message)
 }
 
@@ -251,12 +251,12 @@ function migrate(raw) {
 		throw err
 	}
 	if (needsVacuum) {
-		info("pinano model I/O log schema changed; discarded old wire-log rows and compacting database")
+		info("Cerex model I/O log schema changed; discarded old wire-log rows and compacting database")
 		try {
 			raw.exec("VACUUM")
 			raw.exec("PRAGMA wal_checkpoint(TRUNCATE)")
 		} catch (err) {
-			info(`pinano model I/O log compaction failed; continuing with fresh schema: ${err?.message ?? err}`)
+			info(`Cerex model I/O log compaction failed; continuing with fresh schema: ${err?.message ?? err}`)
 		}
 	}
 }

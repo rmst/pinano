@@ -250,7 +250,7 @@ async function readMacClipboardFileImage(run, errors) {
 		if (file.size > MAX_PROMPT_IMAGE_RESIZE_INPUT_BYTES) {
 			throw new ClipboardImagePasteError(
 				"unsupported",
-				`Image from clipboard is ${formatSize(file.size)}, which exceeds Pinano's ${formatSize(MAX_PROMPT_IMAGE_BYTES)} prompt image limit`,
+				`Image from clipboard is ${formatSize(file.size)}, which exceeds Cerex's ${formatSize(MAX_PROMPT_IMAGE_BYTES)} prompt image limit`,
 			)
 		}
 		const buffer = await readFile(path)
@@ -274,7 +274,7 @@ async function tryClipboardCommand(run, command, args, source, errors) {
 
 async function readMacClipboardImage(options = {}) {
 	const run = options.runBuffer ?? runBuffer
-	const dir = await mkdtemp(join(tmpdir(), "pinano-clipboard-"))
+	const dir = await mkdtemp(join(tmpdir(), "clipboard-"))
 	const errors = []
 	try {
 		const info = await readMacClipboardInfo(run, errors)
@@ -357,7 +357,7 @@ async function readLinuxClipboardImage(options = {}) {
 }
 
 /**
- * Read an image from the platform clipboard and return a Pinano prompt image block.
+ * Read an image from the platform clipboard and return a Cerex prompt image block.
  * @param {{ platform?: string, runBuffer?: typeof runBuffer, commandAvailable?: typeof commandAvailable, isWsl?: boolean, env?: NodeJS.ProcessEnv, resizeImageBuffer?: import("../tools/image-prompt.js").PromptImageResizeBuffer }} [options]
  * @returns {Promise<ClipboardImageContent>}
  */

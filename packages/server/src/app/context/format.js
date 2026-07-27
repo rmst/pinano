@@ -3,7 +3,7 @@ import { dirname } from "node:path"
 
 import { contextFileIdentityPath } from "../../session-manager/context-identity.js"
 
-export { hasProjectContextMessage, isProjectContextMessage } from "../project-context-message.js"
+export { hasProjectContextMessage, isProjectContextMessage } from "../project/context-message.js"
 
 /** Heading used in the synthetic project-context user message. */
 export const PROJECT_CONTEXT_HEADING = "# AGENTS.md / CLAUDE.md context"

@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto"
 
-import { isProjectContextMessage } from "../../../../../server/src/app/project-context.js"
-import { cloneSessionSnapshot } from "../../../../../server/src/app/session-state.js"
+import { sessionCursorGeneration, sessionCursorGenerationChanged } from "../../../../../protocol/src/session-cursor.js"
+
+import { isProjectContextMessage } from "../../../../../server/src/app/project/context.js"
+import { cloneSessionSnapshot } from "../../../../../server/src/app/session/state.js"
 
 export function flattenContent(content) {
 	if (typeof content === "string") return content
@@ -14,7 +16,7 @@ export function flattenContent(content) {
 
 /** @param {any} msg */
 export function isTranscriptMessageRenderable(msg) {
-	return !!msg && !isProjectContextMessage(msg) && !msg.pinanoCompactionMemento && !msg.pinanoCompactionSummary
+	return !!msg && !isProjectContextMessage(msg) && !msg.compactionMemento && !msg.compactionSummary
 }
 
 /**
@@ -104,7 +106,7 @@ export function transcriptMessageKey(msg) {
 		msg?.stopReason ?? "",
 		msg?.errorMessage ?? "",
 		msg?.compaction ?? "",
-		msg?.pinanoCompactionSummary ?? "",
+		msg?.compactionSummary ?? "",
 		msg?.content,
 		msg?.contextLoad,
 		msg?.planUpdate,
@@ -143,17 +145,20 @@ export function transcriptStatesEqual(a, b) {
 /** @param {any} value */
 export function transcriptCursor(value) {
 	const cursor = {}
+	const cursorGeneration = sessionCursorGeneration(value)
+	if (cursorGeneration) cursor.cursorGeneration = cursorGeneration
 	if (typeof value?.seq === "number") cursor.seq = value.seq
 	if (typeof value?.viewEpoch === "number") cursor.viewEpoch = value.viewEpoch
 	return Object.keys(cursor).length > 0 ? cursor : undefined
 }
 
 /**
- * @param {{ seq?: number, viewEpoch?: number } | undefined} cursor
+ * @param {{ cursorGeneration?: string, seq?: number, viewEpoch?: number } | undefined} cursor
  * @param {any} snapshot
  */
 export function cursorIsAfterSnapshot(cursor, snapshot) {
 	if (!cursor) return true
+	if (sessionCursorGenerationChanged(cursor, snapshot)) return true
 	if (typeof cursor.viewEpoch === "number" && typeof snapshot?.viewEpoch === "number") {
 		if (cursor.viewEpoch > snapshot.viewEpoch) return true
 		if (cursor.viewEpoch < snapshot.viewEpoch) return false
@@ -165,7 +170,7 @@ export function cursorIsAfterSnapshot(cursor, snapshot) {
 /** Merge durable messages from an older same-view snapshot into the current live snapshot without rolling back newer streaming/status state. Messages known to belong to an older view epoch are pruned when the stale snapshot is the newer branch baseline.
  * @param {any} current
  * @param {any} stale
- * @param {Map<string, { seq?: number, viewEpoch?: number }>} [messageCursors]
+ * @param {Map<string, { cursorGeneration?: string, seq?: number, viewEpoch?: number }>} [messageCursors]
  */
 export function mergeStaleSnapshotMessages(current, stale, messageCursors = new Map()) {
 	const staleMessages = stale?.messages ?? []

@@ -37,7 +37,7 @@ import { theme } from "../theme.js"
 
 /**
  * Subset of session-manager's entry shape we depend on. Loose-typed because
- * pinano session entries are JSDoc-annotated JS, not TS.
+ * cerex session entries are JSDoc-annotated JS, not TS.
  *
  * @typedef {object} HistoryEntry
  * @property {"message" | "leaf"} [kind]

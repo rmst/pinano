@@ -1,4 +1,4 @@
-// SQLite database for Pinano server/web mode.
+// SQLite database for Cerex server/web mode.
 //
 // This is the canonical store for sessions, transcript/tree entries, run
 // records, service lifecycle rows, and server/client coordination. Keep schema
@@ -17,7 +17,7 @@ import {
 	SESSION_ATTACHMENT_VARIANT_DISPLAY,
 	SESSION_ATTACHMENT_VARIANT_ORIGINAL,
 	writePromptImageAttachmentFilesSync,
-} from "../session-attachments.js"
+} from "../session/attachments.js"
 import {
 	cachedPreviewRowsFromOverview,
 	previewMessageFromRow,
@@ -270,7 +270,7 @@ function previewRootCacheFromRow(row) {
 }
 
 /**
- * Open and migrate the Pinano server metadata db.
+ * Open and migrate the Cerex server metadata db.
  * @param {{ path?: string, recoverRunningRuns?: boolean }} [options]
  * @returns {ServerDb}
  */
@@ -451,7 +451,8 @@ export function openServerDb(options = {}) {
 	const upsertPreviewRootStmt = db.prepare(`
 		INSERT INTO preview_root_cache (scope_id, scope_kind, root_path, project_dir, session_id, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(scope_id) DO UPDATE SET
+		ON CONFLICT DO UPDATE SET
+			scope_id = excluded.scope_id,
 			scope_kind = excluded.scope_kind,
 			root_path = excluded.root_path,
 			project_dir = excluded.project_dir,
@@ -919,7 +920,7 @@ export function openServerDb(options = {}) {
 	`)
 	const interruptRunningStmt = db.prepare(`
 		UPDATE runs
-		SET status = 'interrupted', ended_at = ?, error = COALESCE(error, 'Pinano server stopped before this run finished.'), stop_reason = 'interrupted'
+		SET status = 'interrupted', ended_at = ?, error = COALESCE(error, 'Cerex server stopped before this run finished.'), stop_reason = 'interrupted'
 		WHERE status = 'running'
 	`)
 	const interruptRunningSessionsStmt = db.prepare(`
@@ -1338,7 +1339,7 @@ export function openServerDb(options = {}) {
 		startRun(run) {
 			const at = run.startedAt ?? nowIso()
 			if (!Number.isInteger(run.expectedMutationVersion)) {
-				throw mutationError("A session mutation version is required to start a run.", "PINANO_SESSION_MUTATION_VERSION_REQUIRED")
+				throw mutationError("A session mutation version is required to start a run.", "CEREX_SESSION_MUTATION_VERSION_REQUIRED")
 			}
 			db.exec("BEGIN IMMEDIATE")
 			try {
@@ -1351,11 +1352,11 @@ export function openServerDb(options = {}) {
 				)
 				if (Number(claimed.changes ?? 0) !== 1) {
 					const current = getSessionMutationStmt.get(run.sessionId)
-					if (!current) throw mutationError(`Session not found: ${run.sessionId}`, "PINANO_SESSION_NOT_FOUND")
+					if (!current) throw mutationError(`Session not found: ${run.sessionId}`, "CEREX_SESSION_NOT_FOUND")
 					if (current.mutationRunId) {
-						throw mutationError(`Session ${run.sessionId} is already being mutated by run ${current.mutationRunId}.`, "PINANO_SESSION_MUTATION_BUSY")
+						throw mutationError(`Session ${run.sessionId} is already being mutated by run ${current.mutationRunId}.`, "CEREX_SESSION_MUTATION_BUSY")
 					}
-					throw mutationError(`Session ${run.sessionId} changed in the database; reopen it before starting a run.`, "PINANO_SESSION_STALE")
+					throw mutationError(`Session ${run.sessionId} changed in the database; reopen it before starting a run.`, "CEREX_SESSION_STALE")
 				}
 				db.exec("COMMIT")
 			} catch (err) {
@@ -1438,7 +1439,7 @@ export function openServerDb(options = {}) {
 				id,
 			)
 		},
-		recoverServiceRuns(reason = "Pinano service started while a previous service was still marked running.", exceptId) {
+		recoverServiceRuns(reason = "Cerex service started while a previous service was still marked running.", exceptId) {
 			return Number(recoverServiceRunsStmt.run(nowIso(), reason, exceptId ?? null, exceptId ?? null).changes ?? 0)
 		},
 		listServiceRuns(limit = 20) {

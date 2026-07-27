@@ -1,6 +1,6 @@
 # Skills
 
-Pinano can load reusable task instructions from local skill folders. A skill is a directory containing a `SKILL.md` file with YAML frontmatter followed by Markdown instructions.
+Cerex can load reusable task instructions from local skill folders. A skill is a directory containing a `SKILL.md` file with YAML frontmatter followed by Markdown instructions.
 
 ```markdown
 ---
@@ -15,16 +15,16 @@ Use this workflow when reviewing a patch...
 
 ## Locations
 
-Pinano scans these roots for `SKILL.md` files:
+Cerex scans these roots for `SKILL.md` files:
 
 - `.agents/skills` under the current cwd and its ancestors
-- `$PINANO_HOME/skills`
+- `$CEREX_HOME/skills`
 - `~/.agents/skills`
 
-Skill folders may contain supporting files such as `scripts/`, `references/`, and `assets/`. Pinano does not load those files automatically; the model sees the skill path and reads or runs only what the skill asks for using the normal tools.
+Skill folders may contain supporting files such as `scripts/`, `references/`, and `assets/`. Cerex does not load those files automatically; the model sees the skill path and reads or runs only what the skill asks for using the normal tools.
 
 ## Use
 
-Mention a skill by name in the prompt, either as `$skill-name` or plain text. Pinano injects the matching `SKILL.md` body into model context for that turn. Pinano also shows the model an available-skills index so it can open and read a listed `SKILL.md` completely when the task clearly matches a skill description.
+Mention a skill by name in the prompt, either as `$skill-name` or plain text. Cerex injects the matching `SKILL.md` body into model context for that turn. Cerex also shows the model an available-skills index so it can open and read a listed `SKILL.md` completely when the task clearly matches a skill description.
 
 Skills are not tools and are not slash commands. They are model context plus ordinary file access.

@@ -20,7 +20,7 @@ export function formatTuiDiagnostic(diagnostic) {
 }
 
 /**
- * Keep product-specific environment and diagnostic policy at the app boundary rather than coupling the reusable TUI framework to Pinano or filesystem locations.
+ * Keep product-specific environment and diagnostic policy at the app boundary rather than coupling the reusable TUI framework to Cerex or filesystem locations.
  * @param {import("../../../../server/src/app/stderr-capture.js").StderrCapture | undefined} stderrCapture
  * @param {Record<string, string | undefined>} [env]
  * @returns {{ terminal: { writeLogPath: string }, tui: { showHardwareCursor: boolean, clearOnShrink: boolean, debugRedraw: boolean, onDiagnostic: (diagnostic: any) => void } }}
@@ -28,12 +28,12 @@ export function formatTuiDiagnostic(diagnostic) {
 export function tuiRuntimeOptions(stderrCapture, env = process.env) {
 	return {
 		terminal: {
-			writeLogPath: env.PINANO_TUI_WRITE_LOG ?? "",
+			writeLogPath: env.CEREX_TUI_WRITE_LOG ?? "",
 		},
 		tui: {
-			showHardwareCursor: env.PINANO_TUI_HARDWARE_CURSOR === "1",
-			clearOnShrink: env.PINANO_TUI_CLEAR_ON_SHRINK === "1",
-			debugRedraw: env.PINANO_TUI_DEBUG_REDRAW === "1",
+			showHardwareCursor: env.CEREX_TUI_HARDWARE_CURSOR === "1",
+			clearOnShrink: env.CEREX_TUI_CLEAR_ON_SHRINK === "1",
+			debugRedraw: env.CEREX_TUI_DEBUG_REDRAW === "1",
 			onDiagnostic: (diagnostic) => stderrCapture?.record(formatTuiDiagnostic(diagnostic)),
 		},
 	}

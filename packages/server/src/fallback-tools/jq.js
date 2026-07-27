@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
-const VERSION = "pinano-jq 0.1 jq-compatible JSON filter subset"
+const VERSION = "cerex-jq 0.1 jq-compatible JSON filter subset"
 
 class JqError extends Error {
 	constructor(message, exitCode = 2) {
@@ -1196,7 +1196,7 @@ async function main() {
 		return await run(config)
 	} catch (err) {
 		const code = err?.exitCode ?? 5
-		process.stderr.write(`pinano jq fallback: ${err?.message || err}\n`)
+		process.stderr.write(`cerex jq fallback: ${err?.message || err}\n`)
 		if (code === 2) process.stderr.write("This fallback only supports common jq JSON filtering. Install jq for full support.\n")
 		return code
 	}

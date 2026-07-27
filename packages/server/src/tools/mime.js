@@ -1,6 +1,6 @@
 // Magic-byte detection for the four image formats supported as inline image
 // content by OpenAI Chat Completions. Returns a MIME string or null. We don't
-// use a third-party file-type library here so pinano stays dependency-free
+// use a third-party file-type library here so the core stays dependency-free
 // and runs on qn (which has no npm install path).
 
 const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]

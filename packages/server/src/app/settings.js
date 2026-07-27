@@ -1,4 +1,4 @@
-// Settings persisted under $PINANO_HOME.
+// Settings persisted under $CEREX_HOME.
 //
 // default-settings.json is launcher/deployment-owned and never written here.
 // settings.json is the user override layer and is the only file update paths
@@ -10,8 +10,8 @@ import { dirname } from "node:path"
 
 import { normalizeReasoningLevel } from "../../../protocol/src/reasoning.js"
 import { defaultSettingsPath, settingsPath } from "./paths.js"
-import { showSubscriptionUsageStatusFromSettings } from "./subscription-usage-display.js"
-import { normalizePinanoStateMount } from "./tool-state-mounts.js"
+import { showSubscriptionUsageStatusFromSettings } from "./usage/subscription-display.js"
+import { normalizeStateMount } from "./workers/tool/state-mounts.js"
 
 /** @typedef {import("../../../protocol/src/reasoning.js").ReasoningLevel} ThinkingLevel */
 
@@ -69,7 +69,7 @@ import { normalizePinanoStateMount } from "./tool-state-mounts.js"
 
 /**
  * @typedef {object} ToolSandboxSettings
- * @property {import("./tool-state-mounts.js").PinanoStateMountMode} pinanoStateMount
+ * @property {import("./workers/tool/state-mounts.js").StateMountMode} stateMount
  */
 
 /**
@@ -95,7 +95,7 @@ export const DEFAULT_SETTINGS = {
 	defaultModel: "openai-codex/gpt-5.6-sol",
 	providers: {},
 	service: {},
-	toolSandbox: { pinanoStateMount: false },
+	toolSandbox: { stateMount: false },
 	thinkingLevel: "default",
 	web: false,
 	updateCheck: true,
@@ -396,9 +396,10 @@ function mergeServiceSettings(...sources) {
 function cleanToolSandboxSettings(value) {
 	const raw = plainObject(value)
 	const out = {}
-	if (Object.hasOwn(raw, "pinanoStateMount")) {
-		const mode = normalizePinanoStateMount(raw.pinanoStateMount)
-		if (mode !== undefined) out.pinanoStateMount = mode
+	const configured = Object.hasOwn(raw, "stateMount") ? raw.stateMount : raw.pinanoStateMount
+	if (configured !== undefined) {
+		const mode = normalizeStateMount(configured)
+		if (mode !== undefined) out.stateMount = mode
 	}
 	return Object.keys(out).length > 0 ? out : undefined
 }
@@ -410,7 +411,7 @@ function mergeToolSandboxSettings(...sources) {
 		const settings = cleanToolSandboxSettings(source)
 		if (settings) Object.assign(merged, settings)
 	}
-	return { pinanoStateMount: false, ...merged }
+	return { stateMount: false, ...merged }
 }
 
 /** @param {string} ref */
@@ -482,8 +483,8 @@ function mergeSettings(defaultSettings, userSettings) {
 }
 
 /** @param {Pick<Settings, "toolSandbox"> | undefined} settings */
-export function pinanoStateMountFromSettings(settings) {
-	return normalizePinanoStateMount(settings?.toolSandbox?.pinanoStateMount) ?? false
+export function stateMountFromSettings(settings) {
+	return normalizeStateMount(settings?.toolSandbox?.stateMount) ?? false
 }
 
 /** @returns {Settings} */

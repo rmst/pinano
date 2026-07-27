@@ -2,16 +2,18 @@ import { createWriteStream } from "node:fs"
 import { chmod, mkdir, stat } from "node:fs/promises"
 import { join } from "node:path"
 
-import { PINANO_DEBUG_REQUEST_HEADER, rejectBrowserDebugRequestParts, requireDebugRequestHeaderParts } from "./http-auth.js"
-import { HttpRouter } from "./http-router.js"
+import { DEBUG_REQUEST_HEADER, LEGACY_DEBUG_REQUEST_HEADER, rejectBrowserDebugRequestParts, requireDebugRequestHeaderParts } from "./http/auth.js"
+import { HttpRouter } from "./http/router.js"
 
-export const DEBUG_ROUTE_PREFIX = "/_pinano/debug"
+export const DEBUG_ROUTE_PREFIX = "/_cerex/debug"
+export const LEGACY_DEBUG_ROUTE_PREFIX = "/_pinano/debug"
+const DEBUG_ROUTE_PREFIXES = [DEBUG_ROUTE_PREFIX, LEGACY_DEBUG_ROUTE_PREFIX]
 
 const DEFAULT_SECTIONS = ["service", "diagnostics", "events", "runtimes", "workers"]
 const MB = 1024 * 1024
 
 export function isDebugRequestPath(pathname) {
-	return pathname === DEBUG_ROUTE_PREFIX || pathname.startsWith(`${DEBUG_ROUTE_PREFIX}/`)
+	return DEBUG_ROUTE_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`))
 }
 
 function boolFromSearch(value, fallback) {
@@ -70,17 +72,19 @@ function isLoopbackHost(host) {
 
 function guardResponse(context, config, endpoint, capability) {
 	const enabled = capability === "heapSnapshot" ? config.heapSnapshot === true : config.inspect === true
-	if (!enabled) return context.json({ error: "Pinano debug endpoint is disabled" }, 404)
+	if (!enabled) return context.json({ error: "Cerex debug endpoint is disabled" }, 404)
 	if (config.allowNonLoopback !== true && !isLoopbackHost(endpoint?.host)) {
-		return context.json({ error: "Pinano debug endpoint is only available on loopback-bound services" }, 403)
+		return context.json({ error: "Cerex debug endpoint is only available on loopback-bound services" }, 403)
 	}
 	return undefined
 }
 
 function capabilityForPath(pathname) {
-	if (pathname === `${DEBUG_ROUTE_PREFIX}/heap-snapshot`) return "heapSnapshot"
-	if (pathname === `${DEBUG_ROUTE_PREFIX}/inspect` || pathname === `${DEBUG_ROUTE_PREFIX}/inspect/workers`) return "inspect"
-	if (pathname.startsWith(`${DEBUG_ROUTE_PREFIX}/inspect/sessions/`)) return "inspect"
+	const prefix = DEBUG_ROUTE_PREFIXES.find((candidate) => pathname === candidate || pathname.startsWith(`${candidate}/`))
+	if (!prefix) return undefined
+	if (pathname === `${prefix}/heap-snapshot`) return "heapSnapshot"
+	if (pathname === `${prefix}/inspect` || pathname === `${prefix}/inspect/workers`) return "inspect"
+	if (pathname.startsWith(`${prefix}/inspect/sessions/`)) return "inspect"
 	return undefined
 }
 
@@ -100,7 +104,7 @@ function createBrowserDebugGuardMiddleware(options) {
 		})
 		if (!browserGuard.ok) return context.json({ error: browserGuard.error }, browserGuard.status)
 		if (capability === "heapSnapshot") {
-			const headerGuard = requireDebugRequestHeaderParts({ debugHeader: context.req.header(PINANO_DEBUG_REQUEST_HEADER) })
+			const headerGuard = requireDebugRequestHeaderParts({ debugHeader: context.req.header(DEBUG_REQUEST_HEADER) ?? context.req.header(LEGACY_DEBUG_REQUEST_HEADER) })
 			if (!headerGuard.ok) return context.json({ error: headerGuard.error }, headerGuard.status)
 		}
 		return next()
@@ -344,7 +348,7 @@ async function writeHeapSnapshot(dir) {
 	const { pipeline } = await import("node:stream/promises")
 	await mkdir(dir, { recursive: true })
 	const timestamp = new Date().toISOString().replace(/[^0-9A-Za-z.-]/g, "_")
-	const path = join(dir, `pinano-service-${process.pid}-${timestamp}.heapsnapshot`)
+	const path = join(dir, `service-${process.pid}-${timestamp}.heapsnapshot`)
 	await pipeline(v8.getHeapSnapshot(), createWriteStream(path, { mode: 0o600 }))
 	await chmod(path, 0o600).catch(() => {})
 	const info = await stat(path)
@@ -353,7 +357,7 @@ async function writeHeapSnapshot(dir) {
 
 export function createDebugInspectApp(options) {
 	const app = new HttpRouter()
-	app.use(`${DEBUG_ROUTE_PREFIX}/*`, createBrowserDebugGuardMiddleware(options))
+	for (const prefix of DEBUG_ROUTE_PREFIXES) app.use(`${prefix}/*`, createBrowserDebugGuardMiddleware(options))
 
 	const safe = (capability, handler) => async (context) => {
 		try {
@@ -366,34 +370,37 @@ export function createDebugInspectApp(options) {
 		}
 	}
 
-	app.get(`${DEBUG_ROUTE_PREFIX}/inspect`, safe("inspect", async (context) =>
-		context.json(await collectInspect(options, context.req.url))))
-	app.get(`${DEBUG_ROUTE_PREFIX}/inspect/workers`, safe("inspect", async (context) => {
-		const url = new URL(context.req.url)
-		const workerTimeoutMs = Number(url.searchParams.get("workerTimeoutMs"))
-		return context.json({
-			ok: true,
-			generatedAt: new Date().toISOString(),
-			workers: await inspectWorkers(options.getManager(), {
-				timeoutMs: Number.isFinite(workerTimeoutMs) && workerTimeoutMs > 0 ? workerTimeoutMs : undefined,
-			}),
-		})
-	}))
-	app.get(`${DEBUG_ROUTE_PREFIX}/inspect/sessions/:id`, safe("inspect", async (context) => {
-		const rawId = context.req.param("id") ?? ""
-		const id = options.resolveSessionId ? options.resolveSessionId(rawId) : rawId
-		const runtime = options.getManager().runtimes.get(id)
-		return context.json({
-			ok: true,
-			generatedAt: new Date().toISOString(),
-			sessionId: id,
-			loaded: Boolean(runtime),
-			runtime: runtime ? inspectRuntime(runtime) : undefined,
-		})
-	}))
-	app.post(`${DEBUG_ROUTE_PREFIX}/heap-snapshot`, safe("heapSnapshot", async (context) =>
-		context.json({ ok: true, heapSnapshot: await writeHeapSnapshot(options.heapSnapshotDir()) })))
-	app.use(`${DEBUG_ROUTE_PREFIX}/*`, (context) => context.json({ error: "Not Found" }, 404))
-	app.use(DEBUG_ROUTE_PREFIX, (context) => context.json({ error: "Not Found" }, 404))
+	const registerRoutes = (prefix) => {
+		app.get(`${prefix}/inspect`, safe("inspect", async (context) =>
+			context.json(await collectInspect(options, context.req.url))))
+		app.get(`${prefix}/inspect/workers`, safe("inspect", async (context) => {
+			const url = new URL(context.req.url)
+			const workerTimeoutMs = Number(url.searchParams.get("workerTimeoutMs"))
+			return context.json({
+				ok: true,
+				generatedAt: new Date().toISOString(),
+				workers: await inspectWorkers(options.getManager(), {
+					timeoutMs: Number.isFinite(workerTimeoutMs) && workerTimeoutMs > 0 ? workerTimeoutMs : undefined,
+				}),
+			})
+		}))
+		app.get(`${prefix}/inspect/sessions/:id`, safe("inspect", async (context) => {
+			const rawId = context.req.param("id") ?? ""
+			const id = options.resolveSessionId ? options.resolveSessionId(rawId) : rawId
+			const runtime = options.getManager().runtimes.get(id)
+			return context.json({
+				ok: true,
+				generatedAt: new Date().toISOString(),
+				sessionId: id,
+				loaded: Boolean(runtime),
+				runtime: runtime ? inspectRuntime(runtime) : undefined,
+			})
+		}))
+		app.post(`${prefix}/heap-snapshot`, safe("heapSnapshot", async (context) =>
+			context.json({ ok: true, heapSnapshot: await writeHeapSnapshot(options.heapSnapshotDir()) })))
+		app.use(`${prefix}/*`, (context) => context.json({ error: "Not Found" }, 404))
+		app.use(prefix, (context) => context.json({ error: "Not Found" }, 404))
+	}
+	for (const prefix of DEBUG_ROUTE_PREFIXES) registerRoutes(prefix)
 	return app
 }

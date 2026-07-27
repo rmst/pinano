@@ -1,0 +1,63 @@
+const BEARER_AUTH = /^\s*Bearer\s+(.+?)\s*$/i
+export const DEBUG_REQUEST_HEADER = "X-Cerex-Debug"
+export const LEGACY_DEBUG_REQUEST_HEADER = "X-Pinano-Debug"
+
+export function bearerTokenFromHeader(value) {
+	if (typeof value !== "string") return ""
+	return value.match(BEARER_AUTH)?.[1] || ""
+}
+
+export function requestTokenFromParts(url, authorization) {
+	const bearer = bearerTokenFromHeader(authorization)
+	if (bearer) return bearer
+	try {
+		return new URL(url).searchParams.get("token") || ""
+	} catch {
+		return ""
+	}
+}
+
+function normalizeOrigin(value) {
+	if (typeof value !== "string" || !value) return ""
+	try {
+		return new URL(value).origin
+	} catch {
+		return ""
+	}
+}
+
+export function sameOriginRequestParts(url, origin, allowedOrigins = []) {
+	if (!origin) return true
+	const requestOrigin = normalizeOrigin(url)
+	const browserOrigin = normalizeOrigin(origin)
+	if (!requestOrigin || !browserOrigin) return false
+	if (browserOrigin === requestOrigin) return true
+	const allowed = Array.isArray(allowedOrigins) ? allowedOrigins : [allowedOrigins]
+	return allowed.some((value) => normalizeOrigin(value) === browserOrigin)
+}
+
+export function authenticateRequestParts({ url, authorization, origin }, token, options = {}) {
+	if (token && requestTokenFromParts(url, authorization) !== token) return { ok: false, status: 401, error: "Unauthorized" }
+	if (options.checkOrigin && !sameOriginRequestParts(url, origin, options.allowedOrigins)) return { ok: false, status: 403, error: "Forbidden origin" }
+	return { ok: true }
+}
+
+export function authenticateRequest(req, token, options = {}) {
+	return authenticateRequestParts({
+		url: req.url,
+		authorization: req.headers.get("authorization"),
+		origin: req.headers.get("origin"),
+	}, token, options)
+}
+
+export function rejectBrowserDebugRequestParts({ origin, referer, secFetchSite, secFetchMode, secFetchDest, secFetchUser }) {
+	if (origin) return { ok: false, status: 403, error: "Forbidden browser origin" }
+	if (referer) return { ok: false, status: 403, error: "Forbidden browser referrer" }
+	if (secFetchSite || secFetchMode || secFetchDest || secFetchUser) return { ok: false, status: 403, error: "Forbidden browser request" }
+	return { ok: true }
+}
+
+export function requireDebugRequestHeaderParts({ debugHeader }) {
+	if (debugHeader !== "1") return { ok: false, status: 403, error: `Missing ${DEBUG_REQUEST_HEADER}: 1` }
+	return { ok: true }
+}

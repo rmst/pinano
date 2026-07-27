@@ -9,7 +9,7 @@
 //
 // Hex colors are emitted as truecolor (24-bit) only when the terminal gives a
 // reliable truecolor signal. Other terminals (including Apple Terminal) get a
-// tuned 256-color approximation. Pinano also sets an explicit base foreground
+// tuned 256-color approximation. Cerex also sets an explicit base foreground
 // so terminals with non-standard default text colors still look like the
 // intended dark theme.
 
@@ -21,7 +21,7 @@ const ESC = "\x1b["
 
 /** @returns {ColorMode} */
 function detectColorMode() {
-	const forced = process.env.PINANO_COLOR_MODE?.toLowerCase()
+	const forced = process.env.CEREX_COLOR_MODE?.toLowerCase()
 	if (forced === "truecolor" || forced === "24bit") return "truecolor"
 	if (forced === "256color" || forced === "256") return "256color"
 
@@ -154,7 +154,7 @@ const CHROME_ACCENT = "#8abeb7"
 // Subtle blue-gray in truecolor; intentionally quantizes to xterm-256 color 146 (#afafd7) so low-color terminals still show color.
 const TRANSCRIPT_ACCENT = "#9db2cc"
 
-// Foreground tokens — picked from pi's dark.json, then split where Pinano needs stronger semantic separation between app chrome and transcript prose. Syntax highlighting, thinking-level borders, and bash mode tokens stay out until we need them.
+// Foreground tokens — picked from pi's dark.json, then split where Cerex needs stronger semantic separation between app chrome and transcript prose. Syntax highlighting, thinking-level borders, and bash mode tokens stay out until we need them.
 /** @type {Record<string, string | number>} */
 const FG = {
 	chromeAccent: CHROME_ACCENT,
@@ -224,7 +224,7 @@ function fg(token, text) {
 	const ansi = fgCache.get(/** @type {string} */ (token))
 	if (!ansi) throw new Error(`Unknown fg token: ${token}`)
 	// Reset only foreground so this nests safely inside backgrounds. We reset
-	// to Pinano's base text color instead of the terminal profile default; some
+	// to Cerex's base text color instead of the terminal profile default; some
 	// terminals are configured with a non-neutral default foreground.
 	return `${ansi}${text}${baseFgAnsi}`
 }

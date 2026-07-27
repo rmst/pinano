@@ -1,11 +1,3 @@
 #!/usr/bin/env -S node --no-warnings
-import { fileURLToPath } from "node:url"
-
-import { runReexecSupervisor } from "../packages/server/src/app/reexec-runtime.js"
-
-await runReexecSupervisor({
-	command: process.execPath,
-	args: [...process.execArgv, fileURLToPath(new URL("../cli/main.js", import.meta.url)), ...process.argv.slice(2)],
-	cwd: process.cwd(),
-	env: process.env,
-})
+// Compatibility entry point. New installations and documentation use `cerex`.
+await import("./cerex.js")

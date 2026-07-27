@@ -1,4 +1,4 @@
-// Intercepts writes to `process.stderr` and stores them in a bounded ring buffer for this TUI client. Think of this as the browser DevTools console for one Pinano frontend process: scoped to this terminal window, ephemeral, and not the detached Pinano service log.
+// Intercepts writes to `process.stderr` and stores them in a bounded ring buffer for this TUI client. Think of this as the browser DevTools console for one Cerex frontend process: scoped to this terminal window, ephemeral, and not the detached Cerex service log.
 //
 // NOTE: this only captures writes made through `process.stderr` from JS land
 // (covers console.error, unhandled-rejection traces, throw-from-async output,
@@ -36,7 +36,7 @@ const DEFAULT_MAX_LINES = 500
  */
 export function installStderrCapture(maxLines = DEFAULT_MAX_LINES) {
 	const anyProc = /** @type {any} */ (process)
-	if (anyProc.__pinanoStderrCapture) return /** @type {StderrCapture} */ (anyProc.__pinanoStderrCapture)
+	if (anyProc.__stderrCapture) return /** @type {StderrCapture} */ (anyProc.__stderrCapture)
 
 	/** @type {StderrEntry[]} */
 	const ring = []
@@ -114,6 +114,6 @@ export function installStderrCapture(maxLines = DEFAULT_MAX_LINES) {
 		isForwarding: () => forwarding,
 	}
 
-	anyProc.__pinanoStderrCapture = capture
+	anyProc.__stderrCapture = capture
 	return capture
 }

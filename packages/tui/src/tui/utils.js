@@ -469,7 +469,7 @@ function renderableTerminalControl(code) {
 
 /**
  * Strip terminal controls that text rendering is not allowed to emit.
- * Pinano still represents styled text as strings containing escape sequences, but the allowed vocabulary is intentionally small: SGR styling and OSC 8 hyperlinks. Clipboard writes, title changes, cursor movement, shell-integration markers, and arbitrary APC/OSC/CSI controls must go through explicit TUI/Terminal methods instead of rendered text.
+ * Cerex still represents styled text as strings containing escape sequences, but the allowed vocabulary is intentionally small: SGR styling and OSC 8 hyperlinks. Clipboard writes, title changes, cursor movement, shell-integration markers, and arbitrary APC/OSC/CSI controls must go through explicit TUI/Terminal methods instead of rendered text.
  *
  * @param {string} text
  * @param {{ preserveLineBreaks?: boolean }} [options]

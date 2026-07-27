@@ -43,11 +43,11 @@ function openPreviewLog(logPath, preview) {
 		const stream = createWriteStream(logPath, { flags: append ? "a" : "w", mode: 0o600 })
 		stream.on("error", () => {})
 		stream.write([
-			`[pinano] --- ${append ? "restarting" : "starting"} ${new Date().toISOString()} ---`,
-			`[pinano] preview ${preview.name} ${append ? "restarting" : "starting"}`,
-			`[pinano] command: ${preview.command}`,
-			`[pinano] cwd: ${preview.cwd}`,
-			`[pinano] url: ${preview.publicUrl}`,
+			`[cerex] --- ${append ? "restarting" : "starting"} ${new Date().toISOString()} ---`,
+			`[cerex] preview ${preview.name} ${append ? "restarting" : "starting"}`,
+			`[cerex] command: ${preview.command}`,
+			`[cerex] cwd: ${preview.cwd}`,
+			`[cerex] url: ${preview.publicUrl}`,
 			"",
 		].join("\n"))
 		return stream
@@ -71,7 +71,7 @@ class PreviewProcess {
 		this.exitCode = null
 		this.exitSignal = null
 		this.output = ""
-		this.logPath = options.logPath ?? previewLogPath(process.env.PINANO_SESSION_DIR, this.name)
+		this.logPath = options.logPath ?? previewLogPath(process.env.CEREX_SESSION_DIR, this.name)
 		this.appendLog = options.appendLog === true
 		this.log = openPreviewLog(this.logPath, this)
 
@@ -80,13 +80,13 @@ class PreviewProcess {
 			detached: true,
 			env: envForToolSubprocess({
 				...process.env,
-				PINANO_PREVIEW: "1",
-				PINANO_PREVIEW_ID: this.id,
-				PINANO_PREVIEW_NAME: this.name,
-				PINANO_HOST: this.host,
-				PINANO_PORT: String(this.port),
-				PINANO_PUBLIC_URL: this.publicUrl,
-				...(this.logPath ? { PINANO_PREVIEW_LOG: this.logPath } : {}),
+				CEREX_PREVIEW: "1",
+				CEREX_PREVIEW_ID: this.id,
+				CEREX_PREVIEW_NAME: this.name,
+				CEREX_HOST: this.host,
+				CEREX_PORT: String(this.port),
+				CEREX_PUBLIC_URL: this.publicUrl,
+				...(this.logPath ? { CEREX_PREVIEW_LOG: this.logPath } : {}),
 			}, { toolCallId: `preview:${this.id}` }),
 			stdio: ["ignore", "pipe", "pipe"],
 		})
@@ -98,14 +98,14 @@ class PreviewProcess {
 			this.running = false
 			this.lastActivityAt = Date.now()
 			this.exitSignal = "error"
-			this.closeLog("[pinano] preview process failed to spawn")
+			this.closeLog("[cerex] preview process failed to spawn")
 		})
 		this.child.on("close", (code, signal) => {
 			this.running = false
 			this.lastActivityAt = Date.now()
 			this.exitCode = code
 			this.exitSignal = signal
-			this.closeLog(`[pinano] preview process exited with ${signal ? `signal ${signal}` : `code ${code ?? 0}`}`)
+			this.closeLog(`[cerex] preview process exited with ${signal ? `signal ${signal}` : `code ${code ?? 0}`}`)
 		})
 	}
 

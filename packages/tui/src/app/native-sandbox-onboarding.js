@@ -6,10 +6,10 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "../tui/index.js"
-import { defaultNativeSandboxEnvironment, disableEnvironmentSandbox, loadEnvironmentRegistry } from "../../../server/src/app/environments.js"
+import { defaultNativeSandboxEnvironment, disableEnvironmentSandbox, loadEnvironmentRegistry } from "../../../server/src/app/environment/registry.js"
 import { theme } from "./theme.js"
-import { probeNativeSandbox } from "../../../server/src/app/worker-launchers.js"
-import { bestEffortAutoInstallBundledBubblewrap } from "../../../server/src/app/bundled-bwrap.js"
+import { probeNativeSandbox } from "../../../server/src/app/workers/launchers.js"
+import { bestEffortAutoInstallBundledBubblewrap } from "../../../server/src/app/sandbox/bwrap/bundled.js"
 
 export const nativeSandboxOnboardingPollMs = 5000
 
@@ -52,27 +52,27 @@ function canDownloadBundledBubblewrapFromProbe(probe) {
 function bodyForPlatform(platform, probe) {
 	if (platform === "linux") {
 		const base = [
-			"Pinano uses bubblewrap (bwrap) for Linux native tool sandboxing. The default local environment is configured for native sandboxing, but the sandbox probe failed.",
+			"Cerex uses bubblewrap (bwrap) for Linux native tool sandboxing. The default local environment is configured for native sandboxing, but the sandbox probe failed.",
 		]
 		if (canDownloadBundledBubblewrapFromProbe(probe)) {
 			return [
 				...base,
-				"System bwrap was not found. Pinano normally prepares a verified bundled Bubblewrap binary automatically. Install bubblewrap or check network access, and keep this page open; Pinano checks again automatically.",
+				"System bwrap was not found. Cerex normally prepares a verified bundled Bubblewrap binary automatically. Install bubblewrap or check network access, and keep this page open; Cerex checks again automatically.",
 			]
 		}
 		return [
 			...base,
-			"Install bubblewrap, or enable unprivileged user namespaces if your distro requires it, and keep this page open; Pinano checks again automatically.",
+			"Install bubblewrap, or enable unprivileged user namespaces if your distro requires it, and keep this page open; Cerex checks again automatically.",
 		]
 	}
 	if (platform === "darwin") {
 		return [
-			"Pinano uses sandbox-exec for macOS native tool sandboxing. The default local environment is configured for native sandboxing, but the sandbox probe failed.",
-			"This can happen when Pinano itself is already running inside sandbox-exec, because sandbox-exec does not nest. Keep this page open to retry automatically.",
+			"Cerex uses sandbox-exec for macOS native tool sandboxing. The default local environment is configured for native sandboxing, but the sandbox probe failed.",
+			"This can happen when Cerex itself is already running inside sandbox-exec, because sandbox-exec does not nest. Keep this page open to retry automatically.",
 		]
 	}
 	return [
-		"Pinano could not start the configured native tool sandbox.",
+		"Cerex could not start the configured native tool sandbox.",
 		"Keep this page open to retry automatically.",
 	]
 }
@@ -212,7 +212,7 @@ export class NativeSandboxStartupPage extends RetainedComponent {
 			...(command ? [line(theme.dim(`Probe command: ${command}`))] : []),
 			...(probeDetail ? [line(), ...wrap(theme.fg("warning", `Last probe: ${probeDetail}`))] : []),
 			line(),
-			...wrap(`Press ${theme.cyan("Enter")} or ${theme.cyan("Esc")} to continue without native sandboxing. Pinano will save sandbox.type "none" for this environment.`),
+			...wrap(`Press ${theme.cyan("Enter")} or ${theme.cyan("Esc")} to continue without native sandboxing. Cerex will save sandbox.type "none" for this environment.`),
 			line(`${theme.cyan("Ctrl+C")} exit`),
 			line(),
 			...wrap(theme.dim(this.status)),

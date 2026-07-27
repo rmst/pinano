@@ -1,5 +1,5 @@
 // Service-backed agent view TUI: one screen for dispatching, monitoring,
-// peeking, and opening Pinano sessions.
+// peeking, and opening Cerex sessions.
 
 import { homedir } from "node:os"
 import { resolve } from "node:path"
@@ -20,12 +20,13 @@ import {
 import { reasoningLevelLabel } from "../../../../protocol/src/reasoning.js"
 import { pickModel, rowsForModels } from "../components/model-selector.js"
 import { showTextModal } from "../components/text-modal.js"
-import { hasConfiguredProviderCredentials } from "../../../../server/src/app/auth.js"
-import { availableModelEntries } from "../../../../server/src/app/models.js"
-import { overviewModelLabel, overviewModelStatusText } from "../../../../server/src/app/overview-model-status.js"
+import { hasConfiguredProviderCredentials } from "../../../../server/src/app/auth/credentials.js"
+import { availableModelEntries } from "../../../../server/src/app/model/registry.js"
+import { overviewModelLabel, overviewModelStatusText } from "../../../../server/src/app/overview/model-status.js"
 import { loadSettings, messageRenderOptionsFromSettings, updateSetting } from "../../../../server/src/app/settings.js"
-import { showSubscriptionUsageStatusFromSettings } from "../../../../server/src/app/subscription-usage-display.js"
+import { showSubscriptionUsageStatusFromSettings } from "../../../../server/src/app/usage/subscription-display.js"
 import { WEB_BROWSER_UI_NAME } from "../../../../protocol/src/web-branding.js"
+import { sessionCursorGenerationChanged } from "../../../../protocol/src/session-cursor.js"
 import { clipboardImagePasteNotice, readClipboardImage } from "../../../../server/src/app/clipboard-image.js"
 import {
 	codexUsageBaseUrlForModel,
@@ -35,19 +36,19 @@ import {
 	fetchCodexUsage,
 	formatCodexUsageInlineSummary,
 	formatCodexUsageLowStatus,
-} from "../../../../server/src/app/codex-usage.js"
+} from "../../../../server/src/app/usage/codex.js"
 import { editorTheme, theme } from "../theme.js"
-import { eventInvalidatesSessionSnapshot, eventNeedsSessionListRefresh } from "../../../../server/src/app/session-state.js"
-import { overviewRouteForCwd, routeCwd, routeSelectedSessionId, routeToArg, routeToCliArgs, sessionRoute, settingsCredentialsRoute } from "../../../../server/src/app/routes.js"
-import { RouteHistory } from "../../../../server/src/app/navigation-history.js"
-import { reexecRuntime, staleRuntimeReexecEnvPatch } from "../../../../server/src/app/reexec-runtime.js"
+import { eventInvalidatesSessionSnapshot, eventNeedsSessionListRefresh } from "../../../../server/src/app/session/state.js"
+import { overviewRouteForCwd, routeCwd, routeSelectedSessionId, routeToArg, routeToCliArgs, sessionRoute, settingsCredentialsRoute } from "../../../../server/src/app/navigation/routes.js"
+import { RouteHistory } from "../../../../server/src/app/navigation/history.js"
+import { reexecRuntime, staleRuntimeReexecEnvPatch } from "../../../../server/src/app/runtime/reexec.js"
 import { NativeSandboxStartupPage, nativeSandboxStartupIssue } from "../native-sandbox-onboarding.js"
 import { UPDATE_CHECK_NOTICE_MS, checkForUpdateNotice } from "../../../../server/src/app/update-check.js"
 import { overviewDirectoryFilterEnabled, setOverviewDirectoryFilterEnabled } from "../../../../server/src/app/ui-state.js"
-import { projectInfoForCwd } from "../../../../server/src/app/project-labels.js"
-import { createPresenceUpdateGate } from "../../../../server/src/app/presence-updates.js"
+import { projectInfoForCwd } from "../../../../server/src/app/project/labels.js"
+import { createPresenceUpdateGate } from "../../../../server/src/app/live/presence.js"
 import { createBackgroundReconciler, DEFAULT_BACKGROUND_RECONCILE_INTERVAL_MS, sessionStatusIndicatesSnapshotStale, sessionsStatusIndicatesListStale } from "../../../../server/src/app/live/reconciliation.js"
-import { OVERVIEW_WORKTREE_STATUS_CONCURRENCY, OVERVIEW_WORKTREE_STATUS_REFRESH_INTERVAL_MS, overviewWorktreeRefreshCandidates } from "../../../../server/src/app/overview-worktree-refresh.js"
+import { OVERVIEW_WORKTREE_STATUS_CONCURRENCY, OVERVIEW_WORKTREE_STATUS_REFRESH_INTERVAL_MS, overviewWorktreeRefreshCandidates } from "../../../../server/src/app/overview/worktree-refresh.js"
 import { terminalFocusPresence } from "../../tui/terminal-presence.js"
 
 
@@ -72,7 +73,7 @@ export { AgentTable, isRunningAgentStateActionRejection, overviewSessionContextM
 export { overviewCommandLine, rewindPromptActionItems, serviceChatCommandLine, sessionOpenCommand, webUrlForRoute } from "./slash-commands.js"
 export { CredentialsSettingsModal } from "./settings/credentials-modal.js"
 /** @typedef {import("../../../../server/src/app/stderr-capture.js").StderrCapture} StderrCapture */
-/** @typedef {import("../../../../server/src/app/routes.js").PinanoRoute} PinanoRoute */
+/** @typedef {import("../../../../server/src/app/navigation/routes.js").AppRoute} AppRoute */
 
 const OVERVIEW_AGE_WIDTH = 3
 const TRANSIENT_RUNNING_ACTIVITY_RE = /^(Thinking|Generating|Running)/
@@ -95,7 +96,7 @@ function overviewModelStatusLine(settings, usageStatus) {
 }
 
 
-export { nextStaleRuntimeReexecDepth } from "../../../../server/src/app/reexec-runtime.js"
+export { nextStaleRuntimeReexecDepth } from "../../../../server/src/app/runtime/reexec.js"
 
 const STALE_RUNTIME_RETRY_INITIAL_MS = 1000
 const STALE_RUNTIME_RETRY_MAX_MS = 15000
@@ -157,7 +158,7 @@ function createCoalescedRunner(run, onError, delayMs = 120) {
  * @param {any} options.client
  * @param {string} options.cwd
  * @param {boolean} [options.noContextFiles]
- * @param {PinanoRoute} [options.initialRoute]
+ * @param {AppRoute} [options.initialRoute]
  * @param {StderrCapture} [options.stderrCapture]
  */
 export async function runServiceTuiMode(options) {
@@ -307,7 +308,7 @@ export async function runServiceTuiMode(options) {
 		syncOverviewSpinner()
 		tui.requestRender(force)
 	}
-	/** @type {import("../tui/tui.js").OverlayHandle | undefined} */
+	/** @type {import("../../tui/tui.js").OverlayHandle | undefined} */
 	let overviewContextMenuHandle = undefined
 	const closeOverviewContextMenu = () => {
 		const handle = overviewContextMenuHandle
@@ -374,7 +375,7 @@ export async function runServiceTuiMode(options) {
 	let currentRoute = routeHistory.current
 	const routeLoadingShell = new RouteLoadingShell()
 	let subscriptionProviders = new Set()
-	let latestCodexUsage = /** @type {import("../../../../server/src/app/codex-usage.js").CodexUsagePayload | undefined} */ (undefined)
+	let latestCodexUsage = /** @type {import("../../../../server/src/app/usage/codex.js").CodexUsagePayload | undefined} */ (undefined)
 	const codexUsageWarningsSeen = new Set()
 	let overviewUnsubscribe = /** @type {undefined | (() => void | Promise<void>)} */ (undefined)
 	let activeSessionUnsubscribe = /** @type {undefined | (() => void | Promise<void>)} */ (undefined)
@@ -483,7 +484,7 @@ export async function runServiceTuiMode(options) {
 			})
 		} catch (err) {
 			if (tuiStopped) {
-				console.error(`pinano update failed: ${err?.message ?? err}`)
+				console.error(`Cerex update failed: ${err?.message ?? err}`)
 				process.exit(1)
 			}
 			staleRuntimeRetryable = staleRuntimeReexecErrorIsRetryable(err)
@@ -1442,6 +1443,7 @@ export async function runServiceTuiMode(options) {
 				}
 				if (currentChat?.sessionId === event.sessionId) {
 					if (event.type === "snapshot" && event.snapshot) currentChat.updateFromEventSnapshot(event.snapshot)
+					else if (sessionCursorGenerationChanged(currentChat.snapshot, event)) refreshCurrentChatSnapshot(event.sessionId)
 					else if (event.type === "session_activity") {}
 					else {
 						if (!eventInvalidatesSessionSnapshot(event, currentChat.sessionId)) currentChat.handleEvent(event)

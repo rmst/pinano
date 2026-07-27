@@ -6,9 +6,9 @@
 import { SegmentedText } from "../../tui/index.js"
 import { summarizeContext, summarizeMessageBilling } from "../../../../server/src/app/context/summary.js"
 import { reasoningLevelLabel } from "../../../../protocol/src/reasoning.js"
-import { findModelEntry } from "../../../../server/src/app/models.js"
-import { modelDisplayLabel } from "../../../../server/src/app/model-display.js"
-import { buildModelMessagesForSession, contextFilesDisabledForAgent } from "../../../../server/src/app/session-context.js"
+import { findModelEntry } from "../../../../server/src/app/model/registry.js"
+import { modelDisplayLabel } from "../../../../server/src/app/model/display.js"
+import { buildModelMessagesForSession, contextFilesDisabledForAgent } from "../../../../server/src/app/session/context.js"
 import { theme } from "../theme.js"
 
 /** @typedef {import("../../../../server/src/agent-core/agent.js").Agent} Agent */

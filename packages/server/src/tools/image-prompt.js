@@ -153,7 +153,7 @@ export function getImageDimensions(buffer, mimeType) {
  */
 function promptImageByteLimitError(buffer, path) {
 	return new Error(
-		`Image${path} is ${formatSize(buffer.byteLength)}, which exceeds Pinano's ${formatSize(MAX_PROMPT_IMAGE_BYTES)} prompt image limit`,
+		`Image${path} is ${formatSize(buffer.byteLength)}, which exceeds Cerex's ${formatSize(MAX_PROMPT_IMAGE_BYTES)} prompt image limit`,
 	)
 }
 
@@ -164,7 +164,7 @@ function promptImageByteLimitError(buffer, path) {
  */
 function promptImageHighDetailDimensionError(dimensions, path) {
 	return new Error(
-		`Image${path} is ${dimensions.widthPx}×${dimensions.heightPx}px, which exceeds the ${MAX_HIGH_DETAIL_IMAGE_DIMENSION}px high-detail prompt limit. Pinano does not resize images yet; resize it first or request detail="original" if supported by the target model.`,
+		`Image${path} is ${dimensions.widthPx}×${dimensions.heightPx}px, which exceeds the ${MAX_HIGH_DETAIL_IMAGE_DIMENSION}px high-detail prompt limit. Cerex does not resize images yet; resize it first or request detail="original" if supported by the target model.`,
 	)
 }
 

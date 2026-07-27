@@ -65,7 +65,7 @@ export function formatServiceStatus(status) {
 	const health = status.health
 	const state = status.alive ? "alive" : info ? (status.pidAlive ? "unhealthy" : "stopped") : "not running"
 	const lines = [
-		`pinano service: ${state}`,
+		`cerex service: ${state}`,
 		...lifecycleStatusLines(status.lifecycle),
 		`pid: ${valueOrDash(info?.pid)}${status.pidAlive ? " (alive)" : info ? " (not running)" : ""}`,
 		`run: ${shortId(info?.serviceRunId ?? health?.serviceRunId)}`,

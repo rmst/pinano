@@ -1,7 +1,7 @@
 // Session entry types. Entries form a tree via `parentId` adjacency and are
 // stored canonically in normalized SQLite tables.
 //
-// Pinano uses a small subset of pi-mono's session entries:
+// Cerex uses a small subset of pi-mono's session entries:
 //   - "message"      a transcript message (user, assistant, toolResult, …)
 //   - "label"        attach a human label to another entry (for branch picking)
 //   - "custom"       app-defined extension hook; app code gives selected

@@ -91,18 +91,20 @@ function splitTrailingPunctuation(token, fromDir) {
  * @param {string} abs
  * @param {number} depth
  * @param {Set<string>} visited
+ * @param {(path: string) => boolean} [allowPath]
  * @returns {string}
  */
-function expandResolvedImport(rawPath, abs, depth, visited) {
-	if (visited.has(abs)) return `<!-- pinano: skipped @import ${rawPath} (cycle) -->`
-	if (!existsSync(abs)) return `<!-- pinano: missing @import ${rawPath} (${abs}) -->`
+function expandResolvedImport(rawPath, abs, depth, visited, allowPath) {
+	if (allowPath && !allowPath(abs)) return `<!-- cerex: blocked @import ${rawPath} -->`
+	if (visited.has(abs)) return `<!-- cerex: skipped @import ${rawPath} (cycle) -->`
+	if (!existsSync(abs)) return `<!-- cerex: missing @import ${rawPath} (${abs}) -->`
 	try {
 		const imported = readFileSync(abs, "utf-8")
 		const nextVisited = new Set(visited)
 		nextVisited.add(abs)
-		return expandImports(imported, abs, depth + 1, nextVisited)
+		return expandImports(imported, abs, depth + 1, nextVisited, allowPath)
 	} catch {
-		return `<!-- pinano: unreadable @import ${rawPath} -->`
+		return `<!-- cerex: unreadable @import ${rawPath} -->`
 	}
 }
 
@@ -112,13 +114,14 @@ function expandResolvedImport(rawPath, abs, depth, visited) {
  * @param {number} depth
  * @param {Set<string>} visited
  * @param {boolean} required
+ * @param {(path: string) => boolean} [allowPath]
  * @returns {string | null}
  */
-function expandImportToken(token, fromDir, depth, visited, required) {
+function expandImportToken(token, fromDir, depth, visited, required, allowPath) {
 	const { rawPath, suffix, abs, exists } = splitTrailingPunctuation(token, fromDir)
 	if (!rawPath) return null
 	if (!required && !exists && !isExplicitImportPath(rawPath)) return null
-	return expandResolvedImport(rawPath, abs, depth, visited) + suffix
+	return expandResolvedImport(rawPath, abs, depth, visited, allowPath) + suffix
 }
 
 /**
@@ -162,9 +165,10 @@ function scanInlineCodeEnd(line, start) {
  * @param {string} fromDir
  * @param {number} depth
  * @param {Set<string>} visited
+ * @param {(path: string) => boolean} [allowPath]
  * @returns {string}
  */
-function expandInlineImports(line, fromDir, depth, visited) {
+function expandInlineImports(line, fromDir, depth, visited, allowPath) {
 	let out = ""
 	let i = 0
 	while (i < line.length) {
@@ -178,7 +182,7 @@ function expandInlineImports(line, fromDir, depth, visited) {
 			let end = i + 2
 			while (isImportPathChar(line[end])) end++
 			const token = line.slice(i + 1, end)
-			const expanded = expandImportToken(token, fromDir, depth, visited, false)
+			const expanded = expandImportToken(token, fromDir, depth, visited, false, allowPath)
 			if (expanded !== null) {
 				out += expanded
 				i = end
@@ -200,11 +204,12 @@ function expandInlineImports(line, fromDir, depth, visited) {
  * @param {string} fromFile
  * @param {number} [depth]
  * @param {Set<string>} [visited]
+ * @param {(path: string) => boolean} [allowPath]
  * @returns {string}
  */
-export function expandImports(content, fromFile, depth = 0, visited = new Set()) {
+export function expandImports(content, fromFile, depth = 0, visited = new Set(), allowPath = undefined) {
 	if (depth > MAX_IMPORT_DEPTH) {
-		return `${content}\n\n<!-- pinano: @import depth limit (${MAX_IMPORT_DEPTH}) reached -->`
+		return `${content}\n\n<!-- cerex: @import depth limit (${MAX_IMPORT_DEPTH}) reached -->`
 	}
 	const fromDir = dirname(fromFile)
 	let inFence = false
@@ -217,8 +222,8 @@ export function expandImports(content, fromFile, depth = 0, visited = new Set())
 			}
 			if (inFence) return line
 			const m = IMPORT_LINE.exec(line)
-			if (m) return expandImportToken(m[1], fromDir, depth, visited, true) ?? line
-			return expandInlineImports(line, fromDir, depth, visited)
+			if (m) return expandImportToken(m[1], fromDir, depth, visited, true, allowPath) ?? line
+			return expandInlineImports(line, fromDir, depth, visited, allowPath)
 		})
 		.join("\n")
 }

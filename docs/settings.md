@@ -1,12 +1,12 @@
 # Settings
 
-Pinano reads settings from three layers, in order:
+Cerex reads settings from three layers, in order:
 
 1. Built-in defaults.
-2. `$PINANO_HOME/default-settings.json`, owned by the launcher or deployment.
-3. `$PINANO_HOME/settings.json`, owned by the user and written by Pinano settings flows.
+2. `$CEREX_HOME/default-settings.json`, owned by the launcher or deployment.
+3. `$CEREX_HOME/settings.json`, owned by the user and written by Cerex settings flows.
 
-`default-settings.json` and `settings.json` have the same schema. Pinano never writes `default-settings.json`; it only writes `settings.json`. Put declarative install, launcher, or deployment defaults in `default-settings.json`, and let user choices accumulate in `settings.json`.
+`default-settings.json` and `settings.json` have the same schema. Cerex never writes `default-settings.json`; it only writes `settings.json`. Put declarative install, launcher, or deployment defaults in `default-settings.json`, and let user choices accumulate in `settings.json`.
 
 ## Shape
 
@@ -40,7 +40,7 @@ Model refs are `provider/model-id`. The first slash separates the provider from 
 Provider-level fields apply to all models under that provider:
 
 - `baseUrl`: API base URL.
-- `apiKey`: fallback API key when no credential exists under `$PINANO_HOME/auth/<provider>.json`.
+- `apiKey`: fallback API key when no credential exists under `$CEREX_HOME/auth/<provider>.json`.
 - `headers`: extra HTTP headers.
 - `compat`: OpenAI-compatible transport feature flags.
 - `transport`: `chat` or `responses`.
@@ -74,20 +74,22 @@ The `service` object configures the local background service:
 - `modelIoLog`: enable model I/O diagnostics.
 - `modelIoLogDb`: custom diagnostics SQLite path.
 - `diagnostics`: service trace/probe options.
-- `token`: fixed local service capability token. When unset, Pinano creates and reuses a generated token at `$PINANO_HOME/data/service-token`.
-- `workspaceRoot`: optional absolute directory root for service-managed sessions. When set, the service starts only from inside this root and user-supplied session cwd values must resolve inside it.
+- `token`: fixed local service capability token. When unset, Cerex creates and reuses a generated token at `$CEREX_HOME/data/service-token`.
+- `workspaceRoot`: optional absolute directory root for service-managed sessions. When set, the service starts only from inside this root, user-supplied session cwd values must resolve inside it, and out-of-root session list filters are rejected. Cerex still uses its own service-owned session workspaces for scratch state.
+
+`cerex service start --foreground` runs the configured service in the current process. `cerex service start` starts it in the background, and `cerex service stop` asks it to shut down cleanly.
 
 ## Update Check
 
-`updateCheck` controls the notice-only GitHub release check shown in the session overview. It defaults to `true` for ordinary installs. When enabled, Pinano checks the public package metadata at most once per local Pinano day, where the day starts at 04:00, and briefly shows a yellow overview notice if a newer version is available. Set it to `false` in `default-settings.json` for managed deployments or in `settings.json` for a user preference.
+`updateCheck` controls the notice-only GitHub release check shown in the session overview. It defaults to `true` for ordinary installs. When enabled, Cerex checks the public package metadata at most once per local Cerex day, where the day starts at 04:00, and briefly shows a yellow overview notice if a newer version is available. Set it to `false` in `default-settings.json` for managed deployments or in `settings.json` for a user preference.
 
 ## Deleted Sessions
 
-`showDeletedSessions` controls whether the TUI session overview requests and shows soft-deleted sessions. It defaults to `false`. When set to `true`, deleted sessions appear in a separate overview section and can be restored with `Ctrl+X`.
+`showDeletedSessions` controls whether the terminal session overview requests and shows soft-deleted sessions. It defaults to `false`. When set to `true`, deleted sessions appear in a separate overview section and can be restored with `Ctrl+X`.
 
 ## Credentials
 
-Pinano resolves provider credentials from `$PINANO_HOME/auth/<provider>.json` first, then from `providers.<provider>.apiKey`. API keys in settings are useful for declarative deployments and local launcher defaults.
+Cerex resolves provider credentials from `$CEREX_HOME/auth/<provider>.json` first, then from `providers.<provider>.apiKey`. API keys in settings are useful for declarative deployments and local launcher defaults.
 
 ## llama.cpp
 
@@ -108,4 +110,4 @@ Start a llama.cpp OpenAI-compatible server, then declare it:
 }
 ```
 
-Pinano detects llama.cpp's served context window when the server exposes it. Set `contextWindow` on the model entry only when you need to override the detected value. Use the actual model id exposed by the server if it requires one. For a remote OpenAI-compatible endpoint, change `baseUrl` and `apiKey`.
+Cerex detects llama.cpp's served context window when the server exposes it. Set `contextWindow` on the model entry only when you need to override the detected value. Use the actual model id exposed by the server if it requires one. For a remote OpenAI-compatible endpoint, change `baseUrl` and `apiKey`.
