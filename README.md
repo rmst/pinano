@@ -66,8 +66,6 @@ git clone https://github.com/rmst/cerex
 
 On first run, Cerex opens the model provider credentials view when no provider is configured. Cerex is currently optimized for use with a ChatGPT subscription.
 
-The `pinano` command and `PINANO_*` environment variables remain aliases. On first use, Cerex moves a lone `~/.pinano` state directory to `~/.cerex` and moves project metadata and preview definitions from `.pinano` to `.cerex`. Existing `.pinano/wt` worktrees stay in place until closed.
-
 <details>
 <summary>Install and first setup demo</summary>
 
