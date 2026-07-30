@@ -56,6 +56,7 @@ export function overviewStateFor(session, options = {}) {
 	const lifecycleState = options.lifecycleState ?? overviewLifecycleStateFor(session)
 	if (lifecycleState === "deleted") return "deleted"
 	if (lifecycleState === "queued") return "queued"
+	if (session?.runtimeNeedsInput === true) return "needs_input"
 	if (lifecycleState === "running") return "working"
 	if (runNeedsAcknowledgement(session)) return "needs_input"
 	if (lifecycleState === "not_started" && !session?.agentView) return "not_started"

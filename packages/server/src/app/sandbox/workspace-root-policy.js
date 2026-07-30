@@ -1,11 +1,36 @@
-import { realpath, stat } from "node:fs/promises"
-import { isAbsolute, resolve } from "node:path"
+import { lstat, realpath, stat } from "node:fs/promises"
+import { basename, dirname, isAbsolute, resolve } from "node:path"
 
 import { optionalSessionWorkspacesRoot } from "../paths.js"
 import { pathIsWithin } from "./paths.js"
 
 function policyError(message, status = 400) {
 	return Object.assign(new Error(message), { status })
+}
+
+async function realPathThroughExistingAncestor(value, label) {
+	const requested = cleanAbsolutePath(value, label)
+	let existing = requested
+	const suffix = []
+	for (;;) {
+		try {
+			return resolve(await realpath(existing), ...suffix)
+		} catch (err) {
+			if (err?.code !== "ENOENT") throw err
+			let info
+			try {
+				info = await lstat(existing)
+			} catch (lstatError) {
+				if (lstatError?.code !== "ENOENT") throw lstatError
+			}
+			if (info?.isSymbolicLink()) throw Object.assign(policyError(`${label} resolves through a dangling symbolic link: ${requested}`), { code: "ENOENT" })
+			if (info) throw err
+			const parent = dirname(existing)
+			if (parent === existing) throw err
+			suffix.unshift(basename(existing))
+			existing = parent
+		}
+	}
 }
 
 function cleanAbsolutePath(value, label) {
@@ -81,6 +106,7 @@ export async function createWorkspaceRootPolicy(workspaceRoot) {
 	if (!configuredRoot) return undefined
 	const root = await realDirectoryPath(configuredRoot, "service.workspaceRoot")
 	let serviceOwnedRoot
+	let historicalServiceOwnedRoot
 
 	const normalizeUserCwd = async (cwd, label = "cwd") => {
 		const real = await realDirectoryPath(cwd, label)
@@ -118,7 +144,25 @@ export async function createWorkspaceRootPolicy(workspaceRoot) {
 
 	const allowsServiceOwnedCwd = async (cwd) => !!await normalizeServiceOwnedCwd(cwd, "session cwd").catch(() => undefined)
 
-	const allowsStoredCwd = async (cwd) => !!await normalizeStoredCwd(cwd).catch(() => undefined)
+	// Stored cwd is historical session metadata, so authorization must survive a project move that removed the old directory. Existing ancestors are still resolved before the containment check so symlinks cannot turn a missing in-root path into an escape.
+	const allowsStoredCwd = async (cwd) => {
+		try {
+			await normalizeStoredCwd(cwd)
+			return true
+		} catch (err) {
+			if (err?.code !== "ENOENT") return false
+			try {
+				const historicalPath = await realPathThroughExistingAncestor(cwd, "session cwd")
+				if (pathIsWithin(root, historicalPath)) return true
+				const configuredServiceOwnedRoot = optionalSessionWorkspacesRoot()
+				if (!configuredServiceOwnedRoot) return false
+				historicalServiceOwnedRoot ??= await realPathThroughExistingAncestor(configuredServiceOwnedRoot, "Cerex session workspace root")
+				return pathIsWithin(historicalServiceOwnedRoot, historicalPath)
+			} catch {
+				return false
+			}
+		}
+	}
 
 	return {
 		root,

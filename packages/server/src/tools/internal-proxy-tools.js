@@ -2,13 +2,16 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { delimiter, isAbsolute, join, resolve } from "node:path"
 
 import { INTERNAL_API_BASE_URL_ENV, INTERNAL_API_TOKEN_ENV } from "../../../protocol/src/internal-api-env.js"
-import { DOCKER_PROXY_ROUTE } from "../../../protocol/src/internal-proxy-routes.js"
+import {
+	AVAILABLE_PROXY_TOOLS_ENV,
+	LEGACY_AVAILABLE_PROXY_TOOLS_ENV,
+	LEGACY_PROXY_TOOLS_BIN_ENV,
+	PROXY_TOOLS_BIN_ENV,
+	knownProxyToolNames,
+	proxyToolSpecs,
+} from "../proxy-tools/registry.js"
 
-export const PROXY_TOOLS_BIN_ENV = "CEREX_PROXY_TOOLS_BIN"
-
-const DEFAULT_PROXY_TOOLS = [
-	{ name: "docker", route: DOCKER_PROXY_ROUTE },
-]
+export { AVAILABLE_PROXY_TOOLS_ENV, LEGACY_AVAILABLE_PROXY_TOOLS_ENV, LEGACY_PROXY_TOOLS_BIN_ENV, PROXY_TOOLS_BIN_ENV }
 
 let proxyToolsBinDir
 let proxyToolsBinDirKey
@@ -99,7 +102,29 @@ exec ${shellQuote(runtimePath)} ${shellQuote(proxyPath)} "$@"
 `
 }
 
-function ensureInternalProxyTools(baseEnv = process.env, tools = DEFAULT_PROXY_TOOLS) {
+function proxyToolsEnabledByHost(baseEnv) {
+	const names = String(baseEnv[AVAILABLE_PROXY_TOOLS_ENV] ?? "").split(",").filter(Boolean)
+	const available = new Set(knownProxyToolNames(names))
+	return proxyToolSpecs.filter((tool) => available.has(tool.name))
+}
+
+function envWithoutProxyToolInternals(baseEnv) {
+	const env = { ...baseEnv }
+	const previousBins = new Set([env[PROXY_TOOLS_BIN_ENV], env[LEGACY_PROXY_TOOLS_BIN_ENV]]
+		.filter((value) => typeof value === "string" && value)
+		.map((value) => resolve(value)))
+	delete env[PROXY_TOOLS_BIN_ENV]
+	delete env[LEGACY_PROXY_TOOLS_BIN_ENV]
+	delete env[AVAILABLE_PROXY_TOOLS_ENV]
+	delete env[LEGACY_AVAILABLE_PROXY_TOOLS_ENV]
+	if (previousBins.size > 0 && env.PATH) {
+		env.PATH = env.PATH.split(delimiter).filter((entry) => !previousBins.has(resolve(entry || "."))).join(delimiter)
+	}
+	return env
+}
+
+function ensureInternalProxyTools(baseEnv, tools) {
+	if (tools.length === 0) return undefined
 	if (!baseEnv[INTERNAL_API_BASE_URL_ENV] || !baseEnv[INTERNAL_API_TOKEN_ENV]) return undefined
 	const parent = toolTmpdir(baseEnv)
 	if (!parent) return undefined
@@ -138,12 +163,21 @@ function ensureInternalProxyTools(baseEnv = process.env, tools = DEFAULT_PROXY_T
 }
 
 export function envWithInternalProxyTools(baseEnv = process.env) {
-	const tools = ensureInternalProxyTools(baseEnv)
-	if (!tools) return { ...baseEnv }
-	const path = baseEnv.PATH ? `${tools.bin}${delimiter}${baseEnv.PATH}` : tools.bin
+	const enabledTools = proxyToolsEnabledByHost(baseEnv)
+	const env = envWithoutProxyToolInternals(baseEnv)
+	const tools = ensureInternalProxyTools(env, enabledTools)
+	if (!tools) return env
+	const path = env.PATH ? `${tools.bin}${delimiter}${env.PATH}` : tools.bin
 	return {
-		...baseEnv,
+		...env,
 		[PROXY_TOOLS_BIN_ENV]: tools.bin,
 		PATH: path,
 	}
+}
+
+export function configureInternalProxyTools(names, env = process.env) {
+	const available = knownProxyToolNames(names)
+	delete env[AVAILABLE_PROXY_TOOLS_ENV]
+	delete env[LEGACY_AVAILABLE_PROXY_TOOLS_ENV]
+	if (available.length > 0) env[AVAILABLE_PROXY_TOOLS_ENV] = available.join(",")
 }

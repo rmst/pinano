@@ -1,0 +1,100 @@
+// Database-independent async persistence contract used by the service runtime. SQLite implements it through a dedicated worker; a network database can implement the same methods with its native async pool.
+
+/**
+ * @template T
+ * @typedef {{ [K in keyof T]: T[K] extends (...args: infer A) => infer R ? (...args: A) => Promise<Awaited<R>> : T[K] }} AsyncMethods
+ */
+
+/**
+ * Semantic persistence API consumed by the service runtime. Implementations may use a local worker, a network connection pool, or another asynchronous backend.
+ * @typedef {AsyncMethods<Omit<import("../app/database/index.js").ServerDb, "raw" | "close">> & {
+ *   kind: string,
+ *   createSessionStorage: (options: any) => Promise<any>,
+ *   branchSessionStorage: (sourceSessionId: string, options: any) => Promise<any>,
+ *   openSessionStorage: (sessionId: string) => Promise<any>,
+ *   openSessionManifestStorage: (sessionId: string) => Promise<any>,
+ *   appendSessionEntry: (request: any) => Promise<any>,
+ *   setSessionLeaf: (request: any) => Promise<any>,
+ *   loadTranscriptMessages: (sessionId: string, entryIds: string[]) => Promise<any[]>,
+ *   status: () => any,
+ *   close: () => Promise<void>
+ * }} ServerPersistence
+ */
+
+export const SERVER_RECORD_OPERATIONS = Object.freeze([
+	"upsertSession",
+	"touchSession",
+	"markSessionDeleted",
+	"restoreSession",
+	"setSessionHidden",
+	"setSessionRuntimeState",
+	"setAgentViewMetadata",
+	"setSessionTranscriptProjection",
+	"setSessionProject",
+	"insertProject",
+	"getProject",
+	"getProjectByRoot",
+	"listSessionsForProject",
+	"moveProject",
+	"retireProject",
+	"rollbackProjectRetirement",
+	"getAgentViewMetadata",
+	"getSessionMutation",
+	"getPromptDraft",
+	"setPromptDraft",
+	"getUiState",
+	"setUiState",
+	"deleteUiState",
+	"reservePromptImageAttachments",
+	"finalizePromptImageAttachments",
+	"cancelPromptImageAttachmentReservations",
+	"listPendingPromptImageAttachmentReservations",
+	"getImageAttachment",
+	"getImageAttachmentByNumber",
+	"getAttachmentVariantMetadata",
+	"markProjectMaintenanceSession",
+	"getProjectMaintenanceSession",
+	"getProjectMaintenanceSessionBySessionId",
+	"listProjectMaintenanceSessions",
+	"upsertPreviewRoot",
+	"getPreviewRoot",
+	"listPreviewRoots",
+	"upsertSubSession",
+	"closeSubSession",
+	"reopenSubSession",
+	"getSubSession",
+	"listSubSessions",
+	"listSubSessionsForRoot",
+	"getSession",
+	"getSessionListEntry",
+	"listSessions",
+	"listSessionsForDirectory",
+	"listSessionStatuses",
+	"loadSessionCustomEntries",
+	"loadSessionPreviewMessages",
+	"loadSessionPreviewMessagesForSessions",
+	"loadSessionOverviewPreviewMessagesForSessions",
+	"refreshSessionOverviewsForSessions",
+	"latestSessionForCwd",
+	"findSessionIdsByPrefix",
+	"replaceSessions",
+	"sessionCount",
+	"startRun",
+	"finishRun",
+	"finishLatestInterruptedRunForSession",
+	"interruptRunningRuns",
+	"startServiceRun",
+	"finishServiceRun",
+	"recoverServiceRuns",
+	"listServiceRuns",
+])
+
+export const SESSION_PERSISTENCE_OPERATIONS = Object.freeze([
+	"createSessionStorage",
+	"branchSessionStorage",
+	"openSessionStorage",
+	"openSessionManifestStorage",
+	"appendSessionEntry",
+	"setSessionLeaf",
+	"loadTranscriptMessages",
+])

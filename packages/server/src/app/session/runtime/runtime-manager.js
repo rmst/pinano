@@ -1,20 +1,22 @@
 // Manager for live Cerex session runtimes.
 
 import { readFile, realpath, stat } from "node:fs/promises"
-import { isAbsolute, join, relative, resolve } from "node:path"
+import { basename, isAbsolute, join, relative, resolve } from "node:path"
 
 import { normalizeReasoningLevel } from "../../../../../protocol/src/reasoning.js"
 import { pathIsPageDocument } from "../../../../../protocol/src/product.js"
 import { ensureProjectContextMessage, isProjectContextMessage } from "../../project/context.js"
 import { systemPromptFor } from "../../agent/factory.js"
+import { isModelIoLogEnabled } from "../../../ai-apis/model-io-log.js"
 import { resolveModelWithProviderMetadata } from "../../model/registry.js"
-import { assertNoSessionWorkspaceNameCollisions, branchSessionInDb, createSessionIdInDb, createSessionInDb, loadSessionPreviewInDb, openSessionInDb, restoreSessionInDb, sessionPreviewFromMessages } from "../store.js"
+import { assertNoSessionWorkspaceNameCollisions, branchSessionInDb, createSessionIdInDb, createSessionInDb, loadSessionPreviewInDb, loadTranscriptMessagesInDb, openSessionInDb, openSessionManifestInDb, restoreSessionInDb, sessionPreviewFromMessages } from "../store.js"
 import { sessionActivityAt } from "../activity.js"
 import { initialSessionEnvironment } from "../../environment/registry.js"
-import { PREVIEW_FILE_SUFFIX, PREVIEW_LOG_DIRNAME, PREVIEW_ROOT_KIND_PROJECT, PREVIEW_ROOT_KIND_SOURCE, PREVIEW_ROOT_KIND_STATIC, STATIC_PREVIEW_FILE_SUFFIX, matchPreviewHost, previewFileDefinitionFromPath, previewLogPath, previewPublicUrlFromSettings, previewRoutingSlugFromSettings, projectPreviewDirectory, projectPreviewLogPath, projectPreviewScopeId, readSessionPreviewDefinitions, sessionPreviewScopeId, sourcePreviewScopeId, staticPreviewScopeId } from "../../preview/manifest.js"
+import { PREVIEW_DIRECTORY_NAME, PREVIEW_FILE_SUFFIX, PREVIEW_ROOT_KIND_PROJECT, PREVIEW_ROOT_KIND_SOURCE, PREVIEW_ROOT_KIND_STATIC, matchPreviewHost, previewFileDefinitionFromPath, previewLogPath, previewPublicUrlFromSettings, previewRoutingSlugFromSettings, projectPreviewDirectory, projectPreviewLogPath, projectPreviewScopeId, readSessionPreviewDefinitions, sessionPreviewScopeId, sourcePreviewScopeId, staticPreviewScopeId } from "../../preview/manifest.js"
 import { isStaticPreviewDefinition, processPreviewDefinitions, projectStaticPreviewDefinitions, staticPreviewDefinitionForRecord, staticPreviewDefinitions } from "../../preview/static-definitions.js"
+import { previewDefinitionForSource, previewEntryPathForSource } from "../../preview/source-mapping.js"
 import { sessionWorkspacePath } from "../../paths.js"
-import { sessionSandboxBaseWd, sessionSandboxMounts } from "../config.js"
+import { sessionSandboxMounts } from "../config.js"
 import { branchNoticeMessage, branchSessionWorkspace } from "../workspaces.js"
 import { pathIsWithin } from "../../sandbox/paths.js"
 import { createLocalWorkspaceHost } from "../../workspace/local-host.js"
@@ -31,19 +33,23 @@ import {
 	subSessionOpenCommand,
 	subSessionStatus,
 } from "../sub-sessions.js"
-import { GIT_WORKTREE_CUSTOM_TYPE, cleanupSessionGitWorktrees, gitWorktreeRecordsFromEntries, resetInheritedSessionGitWorktrees, sessionGitWorktreeStatuses } from "../../source-control/worktree-events.js"
+import { GIT_WORKTREE_CUSTOM_TYPE, cleanupSessionGitWorktrees, gitWorktreeRecordsFromEntries, resetInheritedSessionGitWorktrees, sessionGitWorktreeStatuses, sessionOpenGitWorktreeRecords } from "../../source-control/worktree-events.js"
 import {
 	SESSION_COMPLETED_STATE,
 	SESSION_DEFERRED_STATE,
 	SESSION_DISCUSSING_STATE,
 	getEffectiveSessionProperties,
+	hasSessionPropertyEntries,
 	isHumanUserEntry,
 	sessionPropertiesToAgentView,
 } from "../properties.js"
+import { applyProjectLocationToProperties, projectLocationChangeForSession } from "../../../session-manager/project-location-entry.js"
 import {
 	filterSessionCollectionRows,
 	formatSessionCollectionRows,
 	formatTranscriptEntries,
+	projectVisibleEntries,
+	projectVisibleMessage,
 } from "./transcript-projection.js"
 import { promptDraftFromMessages } from "./prompt-drafts.js"
 import {
@@ -60,10 +66,14 @@ import {
 import {
 	MAX_PREVIEW_UI_FILE_BYTES,
 	longestContainingRoot,
+	mappedPreviewTargetSource,
 	previewItemFromDefinition,
 	previewItemFromTarget,
 	previewSourcePath,
+	readPreviewTargetSource,
 	readTextFileTail,
+	resolvedPreviewItemFromTarget,
+	resolvedPreviewTarget,
 	urlPort,
 } from "./preview-resolution.js"
 export {
@@ -81,7 +91,7 @@ export {
 export { buildBranchTipItems, buildRewindTargets, entryMessageText } from "./branch-navigation.js"
 /** @typedef {import("../../agent/runtime.js").AgentRuntime} Agent */
 /** @typedef {import("../../../session-manager/index.js").Session} Session */
-/** @typedef {import("../../database/index.js").ServerDb} ServerDb */
+/** @typedef {import("../../../persistence/server-contract.js").ServerPersistence} ServerPersistence */
 
 import { SessionRuntime } from "./session-runtime.js"
 import {
@@ -107,7 +117,6 @@ import {
 	hasVisibleUserPrompt,
 	lifecycleStateForSession,
 	fallbackAgentViewState,
-	sessionMatchesDirectoryFilter,
 	autoResumeCandidate,
 	completedLegacyMetadata,
 	sessionInfoFromEntry,
@@ -118,7 +127,6 @@ import {
 	initialProjectDirForCwd,
 	sessionConfigForAgent,
 	sessionModelConfigForAgent,
-	sessionConfigAt,
 	remapSandboxMounts,
 	remapProjectDir,
 	sessionWorkspacePathMappingsForEnvironment,
@@ -126,6 +134,7 @@ import {
 	applySessionConfig,
 	applySessionProviderMetadata,
 } from "./runtime-helpers.js"
+import { sessionMatchesDirectoryFilter } from "../directory-filter.js"
 
 const STATIC_PREVIEW_NOT_CONFIGURED = "CEREX_STATIC_PREVIEW_NOT_CONFIGURED"
 
@@ -151,7 +160,7 @@ export class RuntimeManager {
 	 * @param {import("../../workspace/client.js").WorkspaceClient} [opts.workspace]
 	 * @param {{ root: string | null, configuredRoot: string | null }} [opts.workspaceDescription]
 	 * @param {{ span?: (name: string, args?: Record<string, any>) => (extraArgs?: Record<string, any>) => void }} [opts.diagnostics]
-	 * @param {ServerDb} db
+	 * @param {ServerPersistence} db
 	 * @param {{ send: (event: any) => void, cursor?: () => { epoch?: string } }} hub
 	 */
 	constructor(opts, db, hub) {
@@ -188,6 +197,13 @@ export class RuntimeManager {
 		this.completedWorktreeCleanupTasks = new Map()
 		/** @type {Map<string, Promise<void>>} */
 		this.projectMaintenanceCompletionTasks = new Map()
+		this.projectIdentityQueue = Promise.resolve()
+		/** @type {Set<string>} */
+		this.projectMovingSessionIds = new Set()
+		/** @type {Map<string, number>} */
+		this.projectMoveVersions = new Map()
+		this.sessionLocationSetups = 0
+		this.projectLocationMutationInProgress = false
 		/** @type {Map<string, number>} */
 		this.eventSeqs = new Map()
 		/** @type {Map<string, number>} */
@@ -197,18 +213,34 @@ export class RuntimeManager {
 		})
 	}
 
+	async withSessionLocationSetup(operation) {
+		if (this.projectLocationMutationInProgress) {
+			throw Object.assign(new Error("A project's folder is being changed. Retry the session request after it finishes."), {
+				status: 409,
+				code: "projectMoveInProgress",
+			})
+		}
+		this.sessionLocationSetups++
+		try {
+			return await operation()
+		} finally {
+			this.sessionLocationSetups--
+		}
+	}
+
 	static async create(opts, db, hub) {
 		const workspaceHost = opts.workspace ? undefined : await createLocalWorkspaceHost({
 			workspaceRoot: opts.workspaceRoot,
 			workspacePolicy: opts.workspacePolicy,
+			getSettings: opts.getSettings,
 		})
 		const workspace = opts.workspace ?? workspaceHost.client
 		const workspaceDescription = await workspace.describe()
 		const cwd = await workspace.paths.normalizeUserCwd(opts.cwd, "service startup cwd")
-		assertNoSessionWorkspaceNameCollisions(db)
+		await assertNoSessionWorkspaceNameCollisions(db)
 		const manager = new RuntimeManager({ ...opts, cwd, workspace, workspaceDescription }, db, hub)
 		if (opts.session && opts.sessionId) {
-			manager.upsertSession(opts.session, opts.sessionId)
+			await manager.upsertSession(opts.session, opts.sessionId)
 			await manager.createRuntime(opts.session, opts.sessionId)
 		}
 		manager.applyLegacyAgentViewFallbacks().catch(() => {})
@@ -219,10 +251,24 @@ export class RuntimeManager {
 		return this.workspace.project.info(cwd)
 	}
 
-	upsertSession(session, id) {
+	async projectInfoForSessionEntry(entry, cwd = projectCwdForSessionEntry(entry)) {
+		if (!entry?.projectRetiredAt) return this.projectInfo(cwd)
+		const root = entry.projectDir ?? cwd
+		const label = basename(root) || root
+		return {
+			id: entry.projectId,
+			root,
+			label,
+			name: label,
+			source: "retired",
+			retiredAt: entry.projectRetiredAt,
+		}
+	}
+
+	async upsertSession(session, id) {
 		const meta = session.getMetadata()
 		const initialWd = session.getSessionConfig?.().initialWd
-		this.db.upsertSession({
+		await this.db.upsertSession({
 			id,
 			cwd: meta.cwd ?? this.cwd,
 			...(typeof initialWd === "string" && initialWd ? { initialWd } : {}),
@@ -243,17 +289,21 @@ export class RuntimeManager {
 		return branchSessionInDb(this.db, sourceId, options, { diagnostics: this.diagnostics })
 	}
 
-	loadSessionPreview(id) {
-		return loadSessionPreviewInDb(this.db, id)
+	async loadSessionPreview(id) {
+		return await loadSessionPreviewInDb(this.db, id)
 	}
 
-	openStoredSession(id) {
-		return openSessionInDb(this.db, id, { diagnostics: this.diagnostics })
+	async openStoredSession(id) {
+		return await openSessionInDb(this.db, id, { diagnostics: this.diagnostics })
 	}
 
-	rethrowSessionNotFound(id, err, options = {}) {
+	async openStoredSessionManifest(id) {
+		return await openSessionManifestInDb(this.db, id, { diagnostics: this.diagnostics })
+	}
+
+	async rethrowSessionNotFound(id, err, options = {}) {
 		if (!isSessionNotFoundError(err)) throw err
-		this.db.markSessionDeleted(id)
+		await this.db.markSessionDeleted(id)
 		if (options.clearWorktreeStatus === true) this.worktreeStatusCache.delete(id)
 		this.hub.send({ type: "session_list_changed", sessionId: id })
 		throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
@@ -287,19 +337,29 @@ export class RuntimeManager {
 		await this.assertStoredCwdAllowed(projectCwdForSessionEntry(entry), "session project cwd")
 	}
 
-	async assertOpenedSessionAllowed(session, fallbackCwd) {
-		const metaCwd = session?.getMetadata?.()?.cwd ?? fallbackCwd
+	sessionPropertiesForEntry(entry, session, fromId = undefined) {
+		const properties = getEffectiveSessionProperties(session, fromId)
+		const change = projectLocationChangeForSession(entry, properties)
+		return applyProjectLocationToProperties(properties, change)
+	}
+
+	async sessionPropertiesAtCurrentProjectLocation(id, session, fromId = undefined) {
+		return this.sessionPropertiesForEntry(await this.db.getSession(id), session, fromId)
+	}
+
+	async assertOpenedSessionAllowed(session, fallbackCwd, properties = undefined) {
+		properties ??= getEffectiveSessionProperties(session)
+		const metaCwd = properties.cwd ?? session?.getMetadata?.()?.cwd ?? fallbackCwd
 		await this.assertStoredCwdAllowed(metaCwd, "session cwd")
-		const properties = getEffectiveSessionProperties(session)
 		await this.assertStoredCwdAllowed(projectCwdForSnapshot(session, properties, metaCwd), "session project cwd")
 		await this.assertStoredCwdAllowed(properties.cwd, "session cwd")
 	}
 
 	async workspaceAllowedSessionEntries(entries) {
-		const checks = await Promise.all(entries.map(async (entry) =>
-			await this.storedCwdAllowed(entry?.cwd)
-			&& await this.storedCwdAllowed(projectCwdForSessionEntry(entry))
-		))
+		const checks = await Promise.all(entries.map(async (entry) => {
+			return await this.storedCwdAllowed(entry?.cwd)
+				&& await this.storedCwdAllowed(projectCwdForSessionEntry(entry))
+		}))
 		return entries.filter((_, index) => checks[index])
 	}
 
@@ -324,6 +384,8 @@ export class RuntimeManager {
 	}
 
 	async createRuntime(session, id) {
+		const projectMoveVersion = this.projectMoveVersions.get(id) ?? 0
+		this.assertSessionProjectLocationCurrent(id, projectMoveVersion)
 		const existing = this.runtimes.get(id)
 		if (existing) {
 			if (existing.agent.isDead) {
@@ -334,10 +396,17 @@ export class RuntimeManager {
 				return existing
 			}
 		}
-		const cwd = session.getMetadata().cwd ?? this.cwd
-		await this.assertOpenedSessionAllowed(session, cwd)
+		const sessionEntry = await this.db.getSession(id)
+		const properties = this.sessionPropertiesForEntry(sessionEntry, session)
+		const cwd = properties.cwd ?? session.getMetadata().cwd ?? this.cwd
+		await this.assertOpenedSessionAllowed(session, cwd, properties)
+		this.assertSessionProjectLocationCurrent(id, projectMoveVersion)
 		const agent = this.createAgent({ sessionId: id, session, cwd, getSettings: this.opts.getSettings, workspace: this.workspace })
 		applySessionConfig(agent, session, cwd)
+		const [legacySessionProperties, projectMaintenanceRecord] = await Promise.all([
+			hasSessionPropertyEntries(session) ? undefined : this.db.getAgentViewMetadata(id),
+			this.db.getProjectMaintenanceSessionBySessionId(id),
+		])
 		const runtime = new SessionRuntime({
 			sessionId: id,
 			cwd,
@@ -358,6 +427,9 @@ export class RuntimeManager {
 			getPreviewPublicUrl: this.opts.getPreviewPublicUrl,
 			workspace: this.workspace,
 			workspaceRoot: this.workspaceRoot,
+			projectLocationChange: (properties) => projectLocationChangeForSession(sessionEntry, properties),
+			legacySessionProperties,
+			projectMaintenanceSession: Boolean(projectMaintenanceRecord),
 			subSessions: {
 				spawn: (parentSessionId, request) => this.spawnSubSession(parentSessionId, request),
 				list: (parentSessionId, request) => this.listSubSessions(parentSessionId, request),
@@ -377,9 +449,15 @@ export class RuntimeManager {
 			},
 			diagnostics: this.diagnostics,
 		})
-		await applySessionProviderMetadata(agent, session, cwd, this.opts.getSettings?.())
+		try {
+			await applySessionProviderMetadata(agent, session, cwd, this.opts.getSettings?.())
+			this.assertSessionProjectLocationCurrent(id, projectMoveVersion)
+		} catch (err) {
+			runtime.dispose()
+			throw err
+		}
 		this.runtimes.set(id, runtime)
-		runtime.refreshSessionPropertyCache({ source: { kind: "runtime_create" } })
+		await runtime.refreshSessionPropertyCache({ source: { kind: "runtime_create" } })
 		this.pruneIdleRuntimes()
 		return runtime
 	}
@@ -423,7 +501,7 @@ export class RuntimeManager {
 	async launchManagedSession(plan) {
 		const opened = await this.openManagedSession(plan)
 		if (plan.contextMessageCwd && this.opts.noContextFiles !== true) await ensureProjectContextMessage(opened.session, plan.contextMessageCwd, this.workspace)
-		this.upsertSession(opened.session, opened.id)
+		await this.upsertSession(opened.session, opened.id)
 
 		let registration = await plan.beforeRuntime?.({ opened })
 		const runtime = await this.createRuntime(opened.session, opened.id)
@@ -472,19 +550,19 @@ export class RuntimeManager {
 			const properties = runtime.effectiveSessionProperties()
 			return { ...info, project: await this.projectInfo(projectCwdForSnapshot(runtime.session, properties, runtime.cwd)) }
 		}
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		const info = sessionInfoFromEntry(entry)
 		let properties
 		let project
 		try {
-			const opened = this.openStoredSession(id)
+			const opened = await this.openStoredSession(id)
 			opened.session.legacySessionProperties = entry.agentView
-			await this.assertOpenedSessionAllowed(opened.session, entry.cwd)
-			properties = getEffectiveSessionProperties(opened.session)
-			project = await this.projectInfo(projectCwdForSnapshot(opened.session, properties, entry.cwd))
+			properties = await this.sessionPropertiesAtCurrentProjectLocation(id, opened.session)
+			await this.assertOpenedSessionAllowed(opened.session, entry.cwd, properties)
+			project = await this.projectInfoForSessionEntry(entry, projectCwdForSnapshot(opened.session, properties, entry.cwd))
 		} catch (err) {
-			this.rethrowSessionNotFound(id, err)
+			await this.rethrowSessionNotFound(id, err)
 		}
 		return { ...info, project, properties }
 	}
@@ -502,29 +580,30 @@ export class RuntimeManager {
 	async bridgeSessionCat(id, options = {}) {
 		const runtime = this.runtimes.get(id)
 		if (runtime && !runtime.agent.isDead) return formatTranscriptEntries(id, runtime.session.getDisplayEntries(), runtime.visibleProjectionOptions(options))
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		await this.assertSessionEntryAllowed(entry)
 		try {
-			const opened = this.openStoredSession(id)
+			const opened = await this.openStoredSession(id)
 			opened.session.legacySessionProperties = entry.agentView
 			await this.assertOpenedSessionAllowed(opened.session, entry.cwd)
 			return formatTranscriptEntries(id, opened.session.getDisplayEntries(), {
 				...options,
-				showAutomatedMaintenanceUsers: Boolean(this.db.getProjectMaintenanceSessionBySessionId(id)),
+				showAutomatedMaintenanceUsers: Boolean(await this.db.getProjectMaintenanceSessionBySessionId(id)),
 			})
 		} catch (err) {
-			this.rethrowSessionNotFound(id, err)
+			await this.rethrowSessionNotFound(id, err)
 		}
 	}
 
 	async bridgeSessionCollection(filters = {}) {
-		const entries = await this.workspaceAllowedSessionEntries(this.db.listSessionStatuses())
+		const entries = await this.workspaceAllowedSessionEntries(await this.db.listSessionStatuses())
 		const rows = filterSessionCollectionRows(entries.map((entry) => {
 			const runtime = this.runtimes.get(entry.id)
 			const liveRunning = runtime?.isStreaming() === true
 			return {
 				...entry,
+				runtimeNeedsInput: runtime?.needsInput() === true,
 				runStatus: liveRunning ? "running" : entry.runStatus,
 				runtimeState: liveRunning ? "running" : entry.runtimeState,
 				lifecycleState: liveRunning || entry.runStatus === "running" || entry.runtimeState === "running" ? "running" : "stopped",
@@ -532,7 +611,7 @@ export class RuntimeManager {
 		}), filters)
 		return Promise.all(rows.map(async (entry) => ({
 			...entry,
-			project: await this.projectInfo(projectCwdForSessionEntry(entry)).catch(() => undefined),
+			project: await this.projectInfoForSessionEntry(entry).catch(() => undefined),
 		})))
 	}
 
@@ -543,16 +622,16 @@ export class RuntimeManager {
 	async bridgeProjectInfo(id) {
 		const runtime = this.runtimes.get(id)
 		if (runtime && !runtime.agent.isDead) return runtime.bridgeProjectInfo()
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		try {
-			const opened = this.openStoredSession(id)
+			const opened = await this.openStoredSession(id)
 			opened.session.legacySessionProperties = entry.agentView
-			await this.assertOpenedSessionAllowed(opened.session, entry.cwd)
-			const properties = getEffectiveSessionProperties(opened.session)
-			return this.projectInfo(projectCwdForSnapshot(opened.session, properties, entry.cwd))
+			const properties = await this.sessionPropertiesAtCurrentProjectLocation(id, opened.session)
+			await this.assertOpenedSessionAllowed(opened.session, entry.cwd, properties)
+			return this.projectInfoForSessionEntry(entry, projectCwdForSnapshot(opened.session, properties, entry.cwd))
 		} catch (err) {
-			this.rethrowSessionNotFound(id, err)
+			await this.rethrowSessionNotFound(id, err)
 		}
 	}
 
@@ -565,41 +644,236 @@ export class RuntimeManager {
 		return result
 	}
 
-	ensurePreviewRoot(record) {
-		const existing = this.db.getPreviewRoot(record.scopeId)
+	assertSessionProjectLocationCurrent(id, version = this.projectMoveVersions.get(id) ?? 0) {
+		const moving = this.projectMovingSessionIds.has(id)
+		if (!moving && (this.projectMoveVersions.get(id) ?? 0) === version) return
+		throw Object.assign(new Error(moving
+			? "This project's folder is being renamed. Retry the session request after the rename finishes."
+			: "This project's folder changed while the session was opening. Retry the session request."), {
+			status: 409,
+			code: moving ? "projectMoveInProgress" : "projectLocationChanged",
+			sessionId: id,
+		})
+	}
+
+	async ensurePreviewRoot(record) {
+		const existing = await this.db.getPreviewRoot(record.scopeId)
 		if (existing
 			&& existing.scopeKind === record.scopeKind
 			&& existing.rootPath === record.rootPath
 			&& existing.projectDir === (record.projectDir ?? undefined)
 			&& existing.sessionId === (record.sessionId ?? undefined)) return existing
-		return this.db.upsertPreviewRoot(record)
+		return await this.db.upsertPreviewRoot(record)
+	}
+
+	withProjectIdentityLock(task) {
+		const result = this.projectIdentityQueue.then(task, task)
+		this.projectIdentityQueue = result.then(() => undefined, () => undefined)
+		return result
+	}
+
+	async projectRootOwnsIdentity(project) {
+		try {
+			return (await this.workspace.project.readIdentity(project.root))?.id === project.id
+		} catch (err) {
+			if (err?.code === "ENOENT" || err?.code === "ENOTDIR" || (err?.status === 400 && /does not exist/.test(err?.message ?? ""))) return false
+			throw err
+		}
+	}
+
+	async associateProjectSessions(projectId, root) {
+		const sessions = await this.db.listSessionsForProject(projectId, root)
+		for (const session of sessions) {
+			if (!session.projectId) await this.db.setSessionProject(session.id, projectId, session.projectRootAtLeaf ?? root)
+		}
+		return sessions
+	}
+
+	assertProjectSessionsStopped(project, sessions, action = "renaming its folder") {
+		const running = sessions.filter((entry) => {
+			const runtime = this.runtimes.get(entry.id)
+			return runtime?.isStreaming() || runtime?.hasBackgroundWork?.() || entry.runStatus === "running" || entry.runtimeState === "running"
+		})
+		if (running.length === 0) return
+		const count = running.length
+		throw Object.assign(new Error(`Stop ${count === 1 ? "the running session" : `the ${count} running sessions`} for this project before ${action}.`), {
+			status: 409,
+			code: "projectSessionsRunning",
+			projectId: project.id,
+			sessionIds: running.map((entry) => entry.id),
+		})
+	}
+
+	disposeProjectRuntimes(sessions) {
+		for (const entry of sessions) {
+			const runtime = this.runtimes.get(entry.id)
+			if (!runtime) continue
+			runtime.dispose()
+			this.runtimes.delete(entry.id)
+		}
+	}
+
+	async withProjectSessionsBlocked(project, sessions, operation, action = undefined) {
+		for (const entry of sessions) this.projectMovingSessionIds.add(entry.id)
+		try {
+			this.assertProjectSessionsStopped(project, sessions, action)
+			for (const entry of sessions) this.projectMoveVersions.set(entry.id, (this.projectMoveVersions.get(entry.id) ?? 0) + 1)
+			this.disposeProjectRuntimes(sessions)
+			return await operation()
+		} finally {
+			for (const entry of sessions) this.projectMovingSessionIds.delete(entry.id)
+		}
+	}
+
+	async updateRegisteredProjectRoot(project, root) {
+		const moved = await this.db.moveProject(project.id, root, project.root)
+		this.hub.send({ type: "session_list_changed" })
+		return moved
+	}
+
+	async moveRegisteredProject(project, root, sessions = undefined) {
+		if (project.root === root) return project
+		const associated = sessions ?? await this.db.listSessionsForProject(project.id, project.root)
+		return this.withProjectSessionsBlocked(project, associated, () => this.updateRegisteredProjectRoot(project, root))
+	}
+
+	async claimProjectRootUnlocked(root) {
+		let identity = await this.workspace.project.ensureIdentity(root)
+		const registeredRoot = await this.db.getProjectByRoot(root)
+		if (registeredRoot && registeredRoot.id !== identity.id) {
+			identity = await this.workspace.project.ensureIdentity(root, { id: registeredRoot.id, replace: true })
+		}
+
+		let project = await this.db.getProject(identity.id)
+		if (project?.retiredAt) {
+			identity = await this.workspace.project.ensureIdentity(root, { replace: true })
+			project = undefined
+		}
+		if (project && project.root !== root) {
+			if (await this.projectRootOwnsIdentity(project)) {
+				identity = await this.workspace.project.ensureIdentity(root, { replace: true })
+				project = undefined
+			} else {
+				project = await this.moveRegisteredProject(project, root)
+			}
+		}
+		project ??= await this.db.getProject(identity.id)
+		if (!project) project = await this.db.insertProject({ id: identity.id, root })
+		await this.associateProjectSessions(project.id, root)
+		return { projectId: project.id, root, project, info: identity.project }
+	}
+
+	claimProjectRoot(root) {
+		return this.withProjectIdentityLock(() => this.claimProjectRootUnlocked(root))
+	}
+
+	async canonicalProjectRoot(projectDir) {
+		const normalizedRoot = await this.normalizeUserCwd(projectDir, "project directory")
+		const checkoutRoot = await this.workspace.paths.resolveDirectory(normalizedRoot, "project directory")
+		const location = await this.workspace.worktrees.location(checkoutRoot)
+		// projectDir is project identity, not checkout state. A linked worktree can be a session cwd, but its main checkout remains the canonical project root.
+		const root = location?.linked
+			? await this.workspace.paths.resolveDirectory(location.repositoryRoot, "canonical project directory")
+			: checkoutRoot
+		await this.assertStoredCwdAllowed(root, "project directory")
+		return root
+	}
+
+	async renameProject(discoveryRoot, input = {}) {
+		if (this.projectLocationMutationInProgress) {
+			throw Object.assign(new Error("A project's folder is already being changed."), { status: 409, code: "projectMoveInProgress" })
+		}
+		if (this.sessionLocationSetups > 0) {
+			throw Object.assign(new Error("Wait for session setup to finish before renaming a project folder."), {
+				status: 409,
+				code: "projectSessionSetupInProgress",
+			})
+		}
+		this.projectLocationMutationInProgress = true
+		try {
+			return await this.withProjectIdentityLock(async () => {
+				const root = await this.workspace.paths.resolveDirectory(discoveryRoot, "project discovery root")
+				const path = await this.workspace.paths.resolveDirectory(input.path, "project directory")
+				const identity = await this.claimProjectRootUnlocked(path)
+				const sessions = await this.db.listSessionsForProject(identity.projectId, path)
+				return this.withProjectSessionsBlocked(identity.project, sessions, async () => {
+					const result = await this.workspace.project.rename(root, { path, name: input.name })
+					await this.updateRegisteredProjectRoot(identity.project, result.path)
+					return result
+				})
+			})
+		} finally {
+			this.projectLocationMutationInProgress = false
+		}
+	}
+
+	async deleteProject(discoveryRoot, input = {}, options = {}) {
+		if (this.projectLocationMutationInProgress) {
+			throw Object.assign(new Error("A project's folder is already being changed."), { status: 409, code: "projectMoveInProgress" })
+		}
+		if (this.sessionLocationSetups > 0) {
+			throw Object.assign(new Error("Wait for session setup to finish before deleting a project."), {
+				status: 409,
+				code: "projectSessionSetupInProgress",
+			})
+		}
+		this.projectLocationMutationInProgress = true
+		try {
+			return await this.withProjectIdentityLock(async () => {
+				const root = await this.workspace.paths.resolveDirectory(discoveryRoot, "project discovery root")
+				const validated = await this.workspace.project.delete(root, { ...input, validateOnly: true })
+				const identity = await this.claimProjectRootUnlocked(validated.path)
+				const sessions = await this.db.listSessionsForProject(identity.projectId, validated.path)
+				return this.withProjectSessionsBlocked(identity.project, sessions, async () => {
+					const retirement = await this.db.retireProject(identity.projectId, validated.path)
+					this.hub.send({ type: "session_list_changed" })
+					try {
+						await options.beforeRemove?.({ path: validated.path, projectId: identity.projectId })
+						const result = await this.workspace.project.delete(root, { ...input, path: validated.path, validateOnly: false })
+						return {
+							...result,
+							projectId: identity.projectId,
+							retiredAt: retirement.project.retiredAt,
+						}
+					} catch (err) {
+						await this.db.rollbackProjectRetirement(retirement)
+						this.hub.send({ type: "session_list_changed" })
+						throw err
+					}
+				}, "deleting it")
+			})
+		} finally {
+			this.projectLocationMutationInProgress = false
+		}
 	}
 
 	async registerProjectRoot(projectDir, options = {}) {
-		const normalizedRoot = await this.normalizeUserCwd(projectDir, "project directory")
-		const root = await this.workspace.paths.resolveDirectory(normalizedRoot, "project directory")
-		await this.assertStoredCwdAllowed(root, "project directory")
-		const setup = await projectMaintenanceSetupStatus(root, this.workspace)
-		const project = setup.project
+		const root = await this.canonicalProjectRoot(projectDir)
+		let setup = await projectMaintenanceSetupStatus(root, this.workspace)
+		let project = setup.project
 		if (options.force !== true && !await shouldAutoRegisterProjectRoot(root, project, this.workspace)) return undefined
+		const identity = await this.claimProjectRoot(root)
+		project = identity.info
+		setup = { ...setup, project }
 		const projectScopeId = projectPreviewScopeId(root)
 		const documentsRoot = projectDocumentsDirectory(root)
 		const staticScopeId = staticPreviewScopeId(documentsRoot)
 		const projectRoot = projectMaintenanceEligible(setup)
-			? this.ensurePreviewRoot({
+			? await this.ensurePreviewRoot({
 				scopeId: projectScopeId,
 				scopeKind: PREVIEW_ROOT_KIND_PROJECT,
 				rootPath: projectPreviewDirectory(root),
 				projectDir: root,
 			})
 			: undefined
-		const staticRoot = this.ensurePreviewRoot({
+		const staticRoot = await this.ensurePreviewRoot({
 			scopeId: staticScopeId,
 			scopeKind: PREVIEW_ROOT_KIND_STATIC,
 			rootPath: documentsRoot,
 			projectDir: root,
 		})
 		return {
+			projectId: identity.projectId,
 			projectDir: root,
 			project,
 			setup,
@@ -634,7 +908,7 @@ export class RuntimeManager {
 		if (!context.eligible) return context
 		const record = options.create === true
 			? await this.ensureProjectMaintenanceSession(context.projectDir, options.ensureOptions ?? { runPrompt: false })
-			: this.db.getProjectMaintenanceSession(context.projectDir)
+			: await this.db.getProjectMaintenanceSession(context.projectDir)
 		return {
 			...context,
 			record: record?.sessionId ? record : undefined,
@@ -645,45 +919,10 @@ export class RuntimeManager {
 		return await this.projectMaintenanceRecordFromContext(await this.projectMaintenanceContext(projectDir), options)
 	}
 
-	async worktreePreviewSession(projectDir, sessionId) {
-		const id = typeof sessionId === "string" ? sessionId.trim() : ""
-		if (!id) return undefined
-		const entry = this.findSessionEntry(id)
-		if (!entry) return undefined
-		await this.assertSessionEntryAllowed(entry)
-		let root
-		let sessionCwd
-		try {
-			root = await this.workspace.paths.resolveDirectory(projectDir, "preview project cwd")
-			sessionCwd = await this.workspace.paths.resolveDirectory(entry.cwd, "preview session cwd")
-		} catch (err) {
-			if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return undefined
-			throw err
-		}
-		if (sessionCwd !== root) return undefined
-		return { sessionId: id, entry }
-	}
-
-	async projectPreviewRunner(context, options = {}) {
-		// Linked worktrees keep project maintenance disabled; their checked-out preview definitions run in the explicitly associated worktree session instead.
-		if (context.setup?.linkedGitWorktree) {
-			return await this.worktreePreviewSession(context.projectDir, options.sessionId)
-		}
-		if (!context.eligible) return undefined
-		const owner = await this.projectMaintenanceRecordFromContext(context, {
-			create: options.createMaintenance === true,
-			ensureOptions: {
-				runPrompt: false,
-				...(options.ensureSetupFiles === false ? { ensureSetupFiles: false } : {}),
-			},
-		})
-		return owner.record ? { sessionId: owner.record.sessionId, maintenance: owner } : undefined
-	}
-
-	registerStaticPreviewDefinition(projectDir, definition) {
+	async registerStaticPreviewDefinition(projectDir, definition) {
 		const rootPath = resolve(definition.source.path)
 		const scopeId = staticPreviewScopeId(rootPath)
-		const record = this.ensurePreviewRoot({
+		const record = await this.ensurePreviewRoot({
 			scopeId,
 			scopeKind: PREVIEW_ROOT_KIND_STATIC,
 			rootPath,
@@ -696,7 +935,7 @@ export class RuntimeManager {
 		const root = await this.normalizeUserCwd(projectDir, "project directory")
 		await this.assertStoredCwdAllowed(root, "project directory")
 		const definitions = projectStaticPreviewDefinitions(await this.workspace.previews.projectManifest(root))
-		return definitions.map((definition) => this.registerStaticPreviewDefinition(root, definition)).filter(Boolean)
+		return (await Promise.all(definitions.map((definition) => this.registerStaticPreviewDefinition(root, definition)))).filter(Boolean)
 	}
 
 	async resolveStaticPreviewRequest(request = {}) {
@@ -715,8 +954,8 @@ export class RuntimeManager {
 		if (request.projectDir) await this.registerConfiguredStaticPreviews(request.projectDir)
 		const candidates = []
 		const records = [
-			...this.db.listPreviewRoots(PREVIEW_ROOT_KIND_STATIC),
-			...this.db.listPreviewRoots(PREVIEW_ROOT_KIND_SOURCE),
+			...await this.db.listPreviewRoots(PREVIEW_ROOT_KIND_STATIC),
+			...await this.db.listPreviewRoots(PREVIEW_ROOT_KIND_SOURCE),
 		]
 		for (const record of records) {
 			if (record.projectDir && !pathIsWithin(record.projectDir, filePath)) continue
@@ -766,24 +1005,71 @@ export class RuntimeManager {
 			throw err
 		}
 		if (!pathIsWithin(sessionDir, sourcePath)) throw Object.assign(new Error("Preview source is outside the session file directory"), { status: 403 })
-		if (!sourcePath.endsWith(PREVIEW_FILE_SUFFIX) && !sourcePath.endsWith(STATIC_PREVIEW_FILE_SUFFIX) && !pathIsPageDocument(sourcePath)) {
-			throw Object.assign(new Error(`preview source file must end with ${PREVIEW_FILE_SUFFIX} or ${STATIC_PREVIEW_FILE_SUFFIX}, or be an HTML or Markdown file`), { status: 400 })
-		}
 		const info = await stat(sourcePath)
 		if (!info.isFile()) throw Object.assign(new Error("Preview source is not a file"), { status: 400 })
 		return sourcePath
 	}
 
-	async sessionPreviewDefinitionForSourcePath(sourcePath) {
+	async sessionPreviewSourceRoot(entry, options = {}) {
 		try {
-			return await previewFileDefinitionFromPath(sourcePath)
+			if (!entry?.cwd) throw Object.assign(new Error("Session preview source mappings require a session working directory"), { status: 404 })
+			return await this.workspace.paths.resolveDirectory(entry.cwd, "preview session cwd")
+		} catch (err) {
+			if (options.bestEffort === true) return undefined
+			throw err
+		}
+	}
+
+	async sessionPreviewDefinitionForSourcePath(sourcePath, sessionDir) {
+		try {
+			return await previewFileDefinitionFromPath(sourcePath, { baseDir: sessionDir })
 		} catch (err) {
 			if (err?.code === "ENOENT" || err?.code === "ENOTDIR") throw Object.assign(new Error("Preview source file not found"), { status: 404 })
-			if (sourcePath.endsWith(STATIC_PREVIEW_FILE_SUFFIX)) throw Object.assign(new Error(err?.message ?? String(err)), { status: 400 })
+			if (sourcePath.endsWith(PREVIEW_FILE_SUFFIX)) throw Object.assign(new Error(err?.message ?? String(err)), { status: 400 })
 			if (/preview source (?:file must end with|is not a file)/.test(String(err?.message ?? ""))) {
 				throw Object.assign(new Error(err.message), { status: 400 })
 			}
 			throw err
+		}
+	}
+
+	async sessionPreviewSource(sessionId, value) {
+		const sessionDir = resolve(sessionWorkspacePath(sessionId))
+		const entry = await this.findSessionEntry(sessionId)
+		if (!entry) throw Object.assign(new Error(`Session not found: ${sessionId}`), { status: 404 })
+		await this.assertSessionEntryAllowed(entry)
+		const requested = typeof value === "string" && isAbsolute(value) ? resolve(value) : undefined
+		if (!requested) throw Object.assign(new Error("preview source path must be absolute"), { status: 400 })
+		const definitions = Object.values((await readSessionPreviewDefinitions(sessionDir)).previews)
+		let definition
+		let configured = true
+		let sourcePath
+		let sourceFile
+		let sourceRoot
+		if (requested.endsWith(PREVIEW_FILE_SUFFIX) && pathIsWithin(sessionDir, requested)) {
+			sourcePath = await this.resolveSessionPreviewSourcePath(sessionId, requested)
+			definition = definitions.find((candidate) => candidate.configPath && resolve(candidate.configPath) === sourcePath)
+			if (!definition) {
+				definition = await this.sessionPreviewDefinitionForSourcePath(sourcePath, sessionDir)
+				configured = false
+			}
+		} else {
+			sourceRoot = await this.sessionPreviewSourceRoot(entry)
+			const source = await readPreviewTargetSource(this.workspace, { sessionDir, sessionId, sourceRoot }, requested)
+			if (!source) throw Object.assign(new Error("Preview source is outside the session working directory"), { status: 404 })
+			sourcePath = source.path
+			sourceFile = source.sourceFile
+			definition = previewDefinitionForSource(definitions, sourcePath, sourceRoot)
+		}
+		if (!definition) throw Object.assign(new Error("No preview is associated with this source file"), { status: 404 })
+		return {
+			path: definition.configPath ?? definition.source.configPath ?? sourcePath,
+			sourcePath,
+			...(sourceFile ? { sourceFile } : {}),
+			...(sourceRoot ? { sourceRoot } : {}),
+			entryPath: previewEntryPathForSource(definition, sourcePath, sourceRoot ?? definition.projectDir),
+			configured,
+			definition,
 		}
 	}
 
@@ -793,7 +1079,18 @@ export class RuntimeManager {
 		if (!pathIsWithin(root, sourcePath)) return undefined
 		if (isStaticPreviewDefinition(definition)) {
 			await this.assertStoredCwdAllowed(definition.source.path, "static preview root directory")
-			this.ensurePreviewRoot({
+			if (options.configured === true) {
+				const registered = await this.registerStaticPreviewDefinition(root, definition)
+				if (!registered) return undefined
+				return {
+					scopeKind: "static",
+					scopeId: registered.scopeId,
+					rootPath: definition.source.path,
+					projectDir: root,
+					definition,
+				}
+			}
+			await this.ensurePreviewRoot({
 				scopeId,
 				scopeKind: PREVIEW_ROOT_KIND_SOURCE,
 				rootPath: sourcePath,
@@ -807,56 +1104,54 @@ export class RuntimeManager {
 				definition,
 			}
 		}
-		const context = await this.projectMaintenanceContext(root)
-		const runner = await this.projectPreviewRunner(context, {
-			sessionId: options.sessionId,
-			createMaintenance: true,
-			ensureSetupFiles: false,
-		})
-		if (!runner) return undefined
-		this.ensurePreviewRoot({
+		const configured = options.configured === true
+		await this.ensurePreviewRoot({
 			scopeId,
-			scopeKind: PREVIEW_ROOT_KIND_SOURCE,
-			rootPath: sourcePath,
-			projectDir: context.projectDir,
-			sessionId: runner.sessionId,
+			scopeKind: configured ? PREVIEW_ROOT_KIND_PROJECT : PREVIEW_ROOT_KIND_SOURCE,
+			rootPath: configured ? projectPreviewDirectory(root) : sourcePath,
+			projectDir: root,
 		})
 		return {
 			scopeKind: "project",
 			scopeId,
-			sessionId: runner.sessionId,
-			projectDir: context.projectDir,
+			projectDir: root,
+			executionRoot: root,
 			definition,
-			logPath: projectPreviewLogPath(context.projectDir, definition.name),
+			logPath: projectPreviewLogPath(root, definition.name),
 		}
 	}
 
-	async sourcePreviewTargetForSession(sessionId, sourcePath, definition, scopeId) {
+	async sourcePreviewTargetForSession(sessionId, sourcePath, definition, scopeId, options = {}) {
 		const id = typeof sessionId === "string" && sessionId ? sessionId : undefined
 		if (!id) return undefined
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		await this.assertSessionEntryAllowed(entry)
 		const sessionDir = sessionWorkspacePath(id)
 		if (!pathIsWithin(sessionDir, sourcePath)) return undefined
-		this.ensurePreviewRoot({
-			scopeId,
-			scopeKind: PREVIEW_ROOT_KIND_SOURCE,
-			rootPath: sourcePath,
-			sessionId: id,
-		})
+		if (options.configured !== true) {
+			await this.ensurePreviewRoot({
+				scopeId,
+				scopeKind: PREVIEW_ROOT_KIND_SOURCE,
+				rootPath: sourcePath,
+				sessionId: id,
+			})
+		}
 		return {
 			scopeKind: "session",
 			scopeId,
 			sessionId: id,
 			sessionDir,
+			executionRoot: sessionDir,
 			definition,
 			logPath: previewLogPath(sessionDir, definition.name),
 			entry,
+			sourceRoot: options.sourceRoot ?? await this.sessionPreviewSourceRoot(entry, { bestEffort: true }),
 		}
 	}
 
 	async resolvePreviewSource(request = {}) {
+		let staticUnavailable = false
 		if (pathIsPageDocument(request.path)) {
 			let resolved
 			try {
@@ -865,19 +1160,21 @@ export class RuntimeManager {
 					projectDir: request.projectDir,
 				})
 			} catch (err) {
-				if (err?.code === STATIC_PREVIEW_NOT_CONFIGURED) return { preview: null }
-				throw err
+				if (err?.code === STATIC_PREVIEW_NOT_CONFIGURED) staticUnavailable = true
+				else throw err
 			}
-			const publicUrl = this.opts.getPreviewPublicUrl?.() ?? previewPublicUrlFromSettings(this.opts.getSettings?.())
-			const routingSlug = previewRoutingSlugFromSettings(this.opts.getSettings?.())
-			return {
-				preview: previewItemFromTarget({
-					scopeKind: "static",
-					scopeId: resolved.scopeId ?? staticPreviewScopeId(resolved.rootPath),
-					rootPath: resolved.rootPath,
-					projectDir: resolved.projectDir,
-					definition: resolved.definition,
-				}, publicUrl, routingSlug),
+			if (!staticUnavailable) {
+				const publicUrl = this.opts.getPreviewPublicUrl?.() ?? previewPublicUrlFromSettings(this.opts.getSettings?.())
+				const routingSlug = previewRoutingSlugFromSettings(this.opts.getSettings?.())
+				return {
+					preview: previewItemFromTarget({
+						scopeKind: "static",
+						scopeId: resolved.scopeId ?? staticPreviewScopeId(resolved.rootPath),
+						rootPath: resolved.rootPath,
+						projectDir: resolved.projectDir,
+						definition: resolved.definition,
+					}, publicUrl, routingSlug),
+				}
 			}
 		}
 		let target
@@ -885,7 +1182,22 @@ export class RuntimeManager {
 		if (request.projectDir) {
 			try {
 				const source = await this.workspace.previews.resolveSource(request.path, { projectDir: request.projectDir })
-				target = await this.sourcePreviewTargetForProject(request.projectDir, source.path, source.definition, sourcePreviewScopeId(source.path), { sessionId: request.sessionId })
+				const scopeId = source.configured
+					? isStaticPreviewDefinition(source.definition)
+						? staticPreviewScopeId(source.definition.source.path)
+						: projectPreviewScopeId(source.definition.projectDir ?? request.projectDir)
+					: sourcePreviewScopeId(source.path)
+				target = await this.sourcePreviewTargetForProject(request.projectDir, source.path, source.definition, scopeId, {
+					sessionId: request.sessionId,
+					configured: source.configured,
+				})
+				if (target) {
+					target.entryPath = source.entryPath
+					target.sourcePath = source.sourcePath
+					if (source.sourcePath && target.projectDir) {
+						target.sourceFile = { path: source.sourcePath, root: target.projectDir, scope: "project" }
+					}
+				}
 			} catch (err) {
 				projectError = err
 			}
@@ -893,34 +1205,46 @@ export class RuntimeManager {
 		let fallbackTarget = target
 		const sessionId = typeof request.sessionId === "string" && request.sessionId ? request.sessionId : undefined
 		const sessionDir = sessionId ? sessionWorkspacePath(sessionId) : undefined
-		const isSessionSource = sessionDir
-			&& typeof request.path === "string"
-			&& isAbsolute(request.path)
-			&& pathIsWithin(sessionDir, resolve(request.path))
-		if (!fallbackTarget && isSessionSource) {
+		let sessionError
+		if (!fallbackTarget && sessionId) {
 			try {
-				const sourcePath = await this.resolveSessionPreviewSourcePath(sessionId, request.path)
-				const definition = await this.sessionPreviewDefinitionForSourcePath(sourcePath)
-				fallbackTarget = await this.sourcePreviewTargetForSession(sessionId, sourcePath, definition, sourcePreviewScopeId(sourcePath))
+				const source = await this.sessionPreviewSource(sessionId, request.path)
+				const scopeId = source.configured ? sessionPreviewScopeId(sessionDir) : sourcePreviewScopeId(source.path)
+				fallbackTarget = await this.sourcePreviewTargetForSession(sessionId, source.path, source.definition, scopeId, {
+					configured: source.configured,
+					sourceRoot: source.sourceRoot,
+				})
+				if (fallbackTarget) {
+					fallbackTarget.entryPath = source.entryPath
+					fallbackTarget.sourcePath = source.sourcePath
+					fallbackTarget.sourceFile = source.sourceFile
+				}
 			} catch (err) {
-				throw err
+				sessionError = err
 			}
 		}
+		if (!fallbackTarget && staticUnavailable) {
+			if (sessionError && sessionError?.status !== 404) throw sessionError
+			if (projectError && projectError?.status !== 404) throw projectError
+			return { preview: null }
+		}
+		if (!fallbackTarget && sessionError) throw sessionError
 		if (!fallbackTarget && projectError) throw projectError
 		if (!fallbackTarget) throw Object.assign(new Error("Preview source is outside the current project or session workspace"), { status: 404 })
 		const publicUrl = this.opts.getPreviewPublicUrl?.() ?? previewPublicUrlFromSettings(this.opts.getSettings?.())
 		const routingSlug = previewRoutingSlugFromSettings(this.opts.getSettings?.())
 		return {
-			preview: previewItemFromTarget(fallbackTarget, publicUrl, routingSlug),
+			preview: await resolvedPreviewItemFromTarget(this.workspace, fallbackTarget, publicUrl, routingSlug),
 		}
 	}
 
 	async sourcePreviewTargetFromRootRecord(rootRecord, match) {
+		const sessionDir = rootRecord.sessionId ? sessionWorkspacePath(rootRecord.sessionId) : undefined
 		const source = rootRecord.projectDir
 			? await this.workspace.previews.resolveSource(rootRecord.rootPath, { projectDir: rootRecord.projectDir })
 			: {
 				path: await this.resolveSessionPreviewSourcePath(rootRecord.sessionId, rootRecord.rootPath),
-				definition: await this.sessionPreviewDefinitionForSourcePath(rootRecord.rootPath),
+				definition: await this.sessionPreviewDefinitionForSourcePath(rootRecord.rootPath, sessionDir),
 			}
 		const sourcePath = source.path
 		const definition = source.definition
@@ -937,31 +1261,24 @@ export class RuntimeManager {
 			}
 		}
 		if (rootRecord.projectDir) {
-			const context = await this.projectMaintenanceContext(rootRecord.projectDir)
-			const runner = await this.projectPreviewRunner(context, {
-				sessionId: rootRecord.sessionId,
-				createMaintenance: true,
-				ensureSetupFiles: false,
-			})
-			if (!runner) throw Object.assign(new Error(`Preview scope not found: ${rootRecord.scopeId}`), { status: 404 })
-			this.ensurePreviewRoot({
+			await this.assertStoredCwdAllowed(rootRecord.projectDir, "project preview directory")
+			await this.ensurePreviewRoot({
 				scopeId: rootRecord.scopeId,
 				scopeKind: PREVIEW_ROOT_KIND_SOURCE,
 				rootPath: sourcePath,
-				projectDir: context.projectDir,
-				sessionId: runner.sessionId,
+				projectDir: rootRecord.projectDir,
 			})
 			return {
 				scopeKind: "project",
 				scopeId: rootRecord.scopeId,
-				sessionId: runner.sessionId,
-				projectDir: context.projectDir,
+				projectDir: rootRecord.projectDir,
+				executionRoot: rootRecord.projectDir,
 				definition,
-				logPath: projectPreviewLogPath(context.projectDir, definition.name),
+				logPath: projectPreviewLogPath(rootRecord.projectDir, definition.name),
 			}
 		}
 		if (rootRecord.sessionId) {
-			const entry = this.findSessionEntry(rootRecord.sessionId)
+			const entry = await this.findSessionEntry(rootRecord.sessionId)
 			if (!entry) throw Object.assign(new Error(`Session not found: ${rootRecord.sessionId}`), { status: 404 })
 			await this.assertSessionEntryAllowed(entry)
 			const sessionDir = sessionWorkspacePath(rootRecord.sessionId)
@@ -970,21 +1287,27 @@ export class RuntimeManager {
 				scopeId: rootRecord.scopeId,
 				sessionId: rootRecord.sessionId,
 				sessionDir,
+				executionRoot: sessionDir,
 				definition,
 				logPath: previewLogPath(sessionDir, definition.name),
 				entry,
+				sourceRoot: await this.sessionPreviewSourceRoot(entry, { bestEffort: true }),
 			}
 		}
 		throw Object.assign(new Error(`Preview scope not found: ${rootRecord.scopeId}`), { status: 404 })
 	}
 
-	async ensureProjectMaintenanceSession(projectDir, options = {}) {
+	ensureProjectMaintenanceSession(projectDir, options = {}) {
+		return this.withSessionLocationSetup(() => this.ensureProjectMaintenanceSessionAtStableLocation(projectDir, options))
+	}
+
+	async ensureProjectMaintenanceSessionAtStableLocation(projectDir, options) {
 		const context = await this.projectMaintenanceContext(projectDir)
 		const root = context.projectDir
 		const setup = context.setup
 		if (!context.eligible) return this.projectMaintenanceSkippedResult(context)
 		await this.registerProjectRoot(root, { force: true })
-		const existing = this.db.getProjectMaintenanceSession(root)
+		const existing = await this.db.getProjectMaintenanceSession(root)
 		if (options.onlyIfNeeded === true && !setup.needed) {
 			if (existing) await this.ensureProjectMaintenanceSessionProperties(existing.sessionId, root, { state: false })
 			return {
@@ -997,16 +1320,15 @@ export class RuntimeManager {
 		}
 		if (setup.needed && options.ensureSetupFiles !== false) await ensureProjectPreviewsDirectory(root, this.workspace)
 		if (existing) {
-			const entry = this.findSessionEntry(existing.sessionId)
+			const entry = await this.findSessionEntry(existing.sessionId)
 			if (entry) {
 				await this.assertSessionEntryAllowed(entry)
-				const record = entry.hidden === true ? existing : this.db.markProjectMaintenanceSession({ projectDir: root, sessionId: existing.sessionId }) ?? existing
 				const project = setup.project ?? await this.projectInfo(root).catch(() => undefined)
-				await this.ensureProjectMaintenanceSessionProperties(record.sessionId, root)
+				await this.ensureProjectMaintenanceSessionProperties(existing.sessionId, root)
 				let promptError
 				let promptSkipped
 				if (setup.needed && options.runPrompt !== false) {
-					const runtime = await this.getRuntime(record.sessionId)
+					const runtime = await this.getRuntime(existing.sessionId)
 					if (projectSetupMaintenanceActive(runtime.agent.state.messages)) {
 						promptSkipped = "active"
 					} else {
@@ -1028,7 +1350,7 @@ export class RuntimeManager {
 					}
 				}
 				return {
-					...record,
+					...existing,
 					created: false,
 					setup,
 					project,
@@ -1044,15 +1366,14 @@ export class RuntimeManager {
 		const launch = await this.launchManagedSession({
 			open: { kind: "create", cwd: initial.cwd },
 			contextMessageCwd: initial.cwd,
-			beforeRuntime: ({ opened }) => {
-				const record = this.db.markProjectMaintenanceSession({ projectDir: root, sessionId: opened.id })
+			beforeRuntime: async ({ opened }) => {
+				const record = await this.db.markProjectMaintenanceSession({ projectDir: root, sessionId: opened.id })
 				if (!record) throw new Error(`Could not mark project maintenance session ${opened.id}`)
 				return record
 			},
 			config: ({ runtime }) => sessionConfigForAgent(runtime.agent, {
 				initialWd: initial.cwd,
 				projectDir: root,
-				sandboxMounts: [root],
 				environmentId: initial.environmentId,
 				noContextFiles: this.opts.noContextFiles === true,
 			}),
@@ -1142,7 +1463,7 @@ export class RuntimeManager {
 	async resolvePreviewTarget(match) {
 		const value = String(match?.scopeId ?? "").trim().toLowerCase()
 		if (!/^[a-z0-9]{16}$/.test(value)) throw Object.assign(new Error("preview scope id must be a 16-character lowercase hash"), { status: 400 })
-		const rootRecord = this.db.getPreviewRoot(value)
+		const rootRecord = await this.db.getPreviewRoot(value)
 		if (rootRecord?.scopeKind === PREVIEW_ROOT_KIND_STATIC) {
 			const definition = await staticPreviewDefinitionForRecord(this.workspace, rootRecord, match?.name)
 			if (definition) {
@@ -1160,7 +1481,7 @@ export class RuntimeManager {
 		if (rootRecord?.scopeKind === PREVIEW_ROOT_KIND_SOURCE) {
 			return await this.sourcePreviewTargetFromRootRecord(rootRecord, match)
 		}
-		const sessionMatches = await Promise.all(this.db.listSessionStatuses({ includeHidden: true }).map(async (entry) => {
+		const sessionMatches = await Promise.all((await this.db.listSessionStatuses({ includeHidden: true })).map(async (entry) => {
 			const sessionDir = sessionWorkspacePath(entry.id)
 			if (sessionPreviewScopeId(sessionDir) !== value) return undefined
 			const manifest = await readSessionPreviewDefinitions(sessionDir)
@@ -1171,32 +1492,27 @@ export class RuntimeManager {
 				scopeId: value,
 				sessionId: entry.id,
 				sessionDir,
+				executionRoot: sessionDir,
 				definition,
 				logPath: previewLogPath(sessionDir, definition.name),
 				entry,
+				sourceRoot: await this.sessionPreviewSourceRoot(entry, { bestEffort: true }),
 			}
 		}))
 		const projectMatches = []
 		if (rootRecord?.scopeKind === PREVIEW_ROOT_KIND_PROJECT && rootRecord.projectDir) {
 			await this.assertStoredCwdAllowed(rootRecord.projectDir, "project preview directory")
-			const context = await this.projectMaintenanceContext(rootRecord.projectDir)
-			const runner = await this.projectPreviewRunner(context, {
-				sessionId: rootRecord.sessionId,
-				createMaintenance: true,
-			})
-			if (runner) {
-				const manifest = await this.workspace.previews.projectManifest(rootRecord.projectDir)
-				const definition = manifest.previews[match.name]
-				if (definition && !isStaticPreviewDefinition(definition)) {
-					projectMatches.push({
-						scopeKind: "project",
-						scopeId: value,
-						sessionId: runner.sessionId,
-						projectDir: context.projectDir,
-						definition,
-						logPath: projectPreviewLogPath(context.projectDir, definition.name),
-					})
-				}
+			const manifest = await this.workspace.previews.projectManifest(rootRecord.projectDir)
+			const definition = manifest.previews[match.name]
+			if (definition && !isStaticPreviewDefinition(definition)) {
+				projectMatches.push({
+					scopeKind: "project",
+					scopeId: value,
+					projectDir: rootRecord.projectDir,
+					executionRoot: rootRecord.projectDir,
+					definition,
+					logPath: projectPreviewLogPath(rootRecord.projectDir, definition.name),
+				})
 			}
 		}
 		const matches = [...sessionMatches, ...projectMatches].filter(Boolean)
@@ -1226,14 +1542,14 @@ export class RuntimeManager {
 		if (url.protocol !== publicBase.protocol || urlPort(url) !== urlPort(publicBase)) throw Object.assign(new Error("URL is not a Cerex preview URL"), { status: 404 })
 		const match = matchPreviewHost(url.host, publicUrl)
 		if (!match) throw Object.assign(new Error("URL is not a Cerex preview URL"), { status: 404 })
-		const target = await this.resolvePreviewTarget(match)
+		const target = await resolvedPreviewTarget(this.workspace, await this.resolvePreviewTarget(match))
 		return { match, publicUrl, target, url }
 	}
 
 	async resolvePreviewUrl(value) {
 		const { match, publicUrl, target, url } = await this.previewTargetForUrl(value)
 		return {
-			preview: previewItemFromTarget(target, publicUrl, match.routingSlug, url.href),
+			preview: await resolvedPreviewItemFromTarget(this.workspace, target, publicUrl, match.routingSlug, url.href),
 		}
 	}
 
@@ -1250,8 +1566,17 @@ export class RuntimeManager {
 	async previewSourceForUrl(value) {
 		const { match, publicUrl, target, url } = await this.previewTargetForUrl(value)
 		const source = target.definition.source
+		const mapped = await mappedPreviewTargetSource(this.workspace, target, url.href, MAX_PREVIEW_UI_FILE_BYTES)
+		const preview = previewItemFromTarget({
+			...target,
+			sourcePath: mapped?.path,
+			sourceFile: mapped?.sourceFile,
+		}, publicUrl, match.routingSlug, url.href)
+		if (mapped) {
+			if (mapped.tooLarge) return { preview, source, path: mapped.path, text: "", tooLarge: true, size: mapped.size }
+			return { preview, source, path: mapped.path, text: mapped.text, size: mapped.size }
+		}
 		const path = previewSourcePath(source)
-		const preview = previewItemFromTarget(target, publicUrl, match.routingSlug, url.href)
 		if (!path) return { preview, source, path: "", text: "", unavailable: true }
 		if (target.scopeKind !== "session") {
 			try {
@@ -1283,19 +1608,32 @@ export class RuntimeManager {
 		const routingSlug = previewRoutingSlugFromSettings(this.opts.getSettings?.())
 		const sessionScope = { kind: "session", scopeId: sessionPreviewScopeId(sessionDir), sessionId: id, logPath: undefined }
 		const sessionManifest = await readSessionPreviewDefinitions(sessionDir)
-		const sessionPreviews = Object.values(sessionManifest.previews).map((definition) => previewItemFromDefinition({
-			...sessionScope,
+		const entry = await this.findSessionEntry(id)
+		const sourceRoot = await this.sessionPreviewSourceRoot(entry, { bestEffort: true })
+		const sessionPreviews = await Promise.all(Object.values(sessionManifest.previews).map((definition) => resolvedPreviewItemFromTarget(this.workspace, {
+			scopeKind: "session",
+			scopeId: sessionScope.scopeId,
+			sessionId: id,
+			sessionDir,
+			executionRoot: sessionDir,
+			definition,
+			entry,
 			logPath: previewLogPath(sessionDir, definition.name),
-		}, definition, publicUrl, routingSlug))
+			sourceRoot,
+		}, publicUrl, routingSlug)))
 		const project = info.project ?? await this.bridgeProjectInfo(id).catch(() => undefined)
-		const entry = this.findSessionEntry(id)
-		const sessionCwdContext = entry?.cwd ? await this.projectMaintenanceContext(entry.cwd).catch(() => undefined) : undefined
-		let projectPreviews = []
-		if (sessionCwdContext?.setup?.linkedGitWorktree) {
-			projectPreviews = (await this.projectPreviewList(sessionCwdContext.projectDir, { sessionId: id })).previews
-		} else if (project?.root) {
-			projectPreviews = (await this.projectPreviewList(project.root, { sessionId: id, createMaintenance: false })).previews
+		let previewProjectRoot = entry?.cwd ?? project?.root
+		if (entry?.cwd) {
+			try {
+				const checkout = await this.workspace.worktrees.location(entry.cwd)
+				previewProjectRoot = checkout?.checkoutRoot ?? entry.cwd
+			} catch {
+				// Keep the session cwd: the main project directory may be a different checkout.
+			}
 		}
+		const projectPreviews = previewProjectRoot
+			? (await this.projectPreviewList(previewProjectRoot)).previews
+			: []
 		return {
 			previews: [...projectPreviews, ...sessionPreviews],
 			project,
@@ -1304,13 +1642,13 @@ export class RuntimeManager {
 	}
 
 	async sessionPreviewList(id) {
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		await this.assertSessionEntryAllowed(entry)
 		const publicUrl = this.opts.getPreviewPublicUrl?.() ?? previewPublicUrlFromSettings(this.opts.getSettings?.())
 		const routingSlug = previewRoutingSlugFromSettings(this.opts.getSettings?.())
 		const sessionDir = sessionWorkspacePath(id)
-		const previewsDirectory = join(sessionDir, PREVIEW_LOG_DIRNAME)
+		const previewsDirectory = join(sessionDir, PREVIEW_DIRECTORY_NAME)
 		const previewsDirectoryExists = await sessionPreviewsDirectoryExists(sessionDir)
 		let previewsError
 		let sessionDefinitions = []
@@ -1322,27 +1660,35 @@ export class RuntimeManager {
 			}
 		}
 		const sessionScope = { kind: "session", scopeId: sessionPreviewScopeId(sessionDir), sessionId: id, logPath: undefined }
+		const sourceRoot = await this.sessionPreviewSourceRoot(entry, { bestEffort: true })
 		return {
 			sessionId: id,
 			sessionDirectory: sessionDir,
 			previewsDirectory,
 			previewsDirectoryExists,
 			...(previewsError ? { previewsError } : {}),
-			previews: sessionDefinitions.map((definition) => previewItemFromDefinition({
-				...sessionScope,
+			previews: await Promise.all(sessionDefinitions.map((definition) => resolvedPreviewItemFromTarget(this.workspace, {
+				scopeKind: "session",
+				scopeId: sessionScope.scopeId,
+				sessionId: id,
+				sessionDir,
+				executionRoot: sessionDir,
+				definition,
+				entry,
 				logPath: previewLogPath(sessionDir, definition.name),
-			}, definition, publicUrl, routingSlug)),
+				sourceRoot,
+			}, publicUrl, routingSlug))),
 		}
 	}
 
-	projectDocumentPreview(projectDir, definition, publicUrl, routingSlug) {
+	async projectDocumentPreview(projectDir, definition, publicUrl, routingSlug) {
 		if (!definition) return undefined
-		const registered = this.registerStaticPreviewDefinition(projectDir, definition)
+		const registered = await this.registerStaticPreviewDefinition(projectDir, definition)
 		if (!registered) return undefined
 		return previewItemFromDefinition({ kind: "project", scopeId: registered.scopeId }, registered.definition, publicUrl, routingSlug)
 	}
 
-	async projectPreviewList(projectDir, options = {}) {
+	async projectPreviewList(projectDir) {
 		const root = await this.normalizeUserCwd(projectDir, "project directory")
 		await this.assertStoredCwdAllowed(root, "project directory")
 		const publicUrl = this.opts.getPreviewPublicUrl?.() ?? previewPublicUrlFromSettings(this.opts.getSettings?.())
@@ -1357,38 +1703,26 @@ export class RuntimeManager {
 		}
 		const previewsDirectory = projectManifest.directory
 		const previewsDirectoryExists = projectManifest.exists
-		const documentPreview = this.projectDocumentPreview(root, projectManifest.documentPreview, publicUrl, routingSlug)
-		const context = await this.projectMaintenanceContext(root)
-		const project = context.project
+		const documentPreview = await this.projectDocumentPreview(root, projectManifest.documentPreview, publicUrl, routingSlug)
+		const project = await this.projectInfo(root).catch(() => undefined)
 		const projectDefinitions = Object.values(projectManifest.previews)
 		const staticDefinitions = staticPreviewDefinitions(projectDefinitions)
 		const processDefinitions = processPreviewDefinitions(projectDefinitions)
-		await this.registerProjectRoot(root, { force: projectDefinitions.length > 0 })
-		const staticPreviews = staticDefinitions
-			.map((definition) => this.registerStaticPreviewDefinition(root, definition))
+		const staticPreviews = (await Promise.all(staticDefinitions
+			.map((definition) => this.registerStaticPreviewDefinition(root, definition))))
 			.filter(Boolean)
 			.map((registered) => previewItemFromDefinition({
 				kind: "project",
 				scopeId: registered.scopeId,
 			}, registered.definition, publicUrl, routingSlug))
 		const projectScopeId = projectPreviewScopeId(root)
-		let runner
 		if (processDefinitions.length > 0) {
-			runner = await this.projectPreviewRunner(context, {
-				sessionId: options.sessionId,
-				createMaintenance: options.createMaintenance !== false,
+			await this.ensurePreviewRoot({
+				scopeId: projectScopeId,
+				scopeKind: PREVIEW_ROOT_KIND_PROJECT,
+				rootPath: previewsDirectory,
+				projectDir: root,
 			})
-			if (runner) {
-				this.ensurePreviewRoot({
-					scopeId: projectScopeId,
-					scopeKind: PREVIEW_ROOT_KIND_PROJECT,
-					rootPath: previewsDirectory,
-					projectDir: root,
-					...(context.setup.linkedGitWorktree ? { sessionId: runner.sessionId } : {}),
-				})
-			}
-		} else {
-			runner = await this.projectPreviewRunner(context)
 		}
 		return {
 			projectDir: root,
@@ -1396,16 +1730,17 @@ export class RuntimeManager {
 			previewsDirectory,
 			previewsDirectoryExists,
 			...(previewsError ? { previewsError } : {}),
-			maintenanceSessionId: runner?.maintenance?.record?.sessionId,
 			previews: [
 				...(documentPreview ? [documentPreview] : []),
 				...staticPreviews,
-				...(runner || (context.eligible && !context.setup.linkedGitWorktree) ? processDefinitions.map((definition) => previewItemFromDefinition({
-					kind: "project",
+				...await Promise.all(processDefinitions.map((definition) => resolvedPreviewItemFromTarget(this.workspace, {
+					scopeKind: "project",
 					scopeId: projectScopeId,
-					sessionId: runner?.sessionId,
+					projectDir: root,
+					executionRoot: root,
+					definition,
 					logPath: projectPreviewLogPath(root, definition.name),
-				}, definition, publicUrl, routingSlug)) : []),
+				}, publicUrl, routingSlug))),
 			],
 		}
 	}
@@ -1419,6 +1754,16 @@ export class RuntimeManager {
 			end?.(args)
 		}
 		try {
+			const entry = await this.findSessionEntry(id)
+			if (entry?.projectRetiredAt) {
+				throw Object.assign(new Error("This project's files were deleted. Its transcript is available read-only."), {
+					status: 409,
+					code: "projectRetired",
+					projectId: entry.projectId,
+				})
+			}
+			const projectMoveVersion = this.projectMoveVersions.get(id) ?? 0
+			this.assertSessionProjectLocationCurrent(id, projectMoveVersion)
 			const existing = this.runtimes.get(id)
 			if (existing) {
 				if (existing.agent.isDead) {
@@ -1430,23 +1775,30 @@ export class RuntimeManager {
 					return existing
 				}
 			}
+			if (entry?.projectDir && !entry.projectId) {
+				const registration = await this.registerProjectRoot(entry.projectDir, { force: true })
+				this.assertSessionProjectLocationCurrent(id, projectMoveVersion)
+				if (registration?.projectId) await this.db.setSessionProject(id, registration.projectId, registration.projectDir)
+			}
 			let opened
 			try {
 				const endOpen = this.diagnostics?.span?.("RuntimeManager.openSession", { sessionId: id })
 				try {
-					opened = this.openStoredSession(id)
+					opened = await this.openStoredSession(id)
 				} finally {
 					endOpen?.()
 				}
 			} catch (/** @type {any} */ err) {
-				this.rethrowSessionNotFound(id, err)
+				await this.rethrowSessionNotFound(id, err)
 			}
-			const cwd = opened.session.getMetadata().cwd ?? this.cwd
-			const entry = this.findSessionEntry(id)
+			const properties = this.sessionPropertiesForEntry(entry, opened.session)
+			const cwd = properties.cwd ?? opened.session.getMetadata().cwd ?? this.cwd
 			if (entry) opened.session.legacySessionProperties = entry.agentView
-			await this.assertOpenedSessionAllowed(opened.session, cwd)
+			await this.assertOpenedSessionAllowed(opened.session, cwd, properties)
+			this.assertSessionProjectLocationCurrent(id, projectMoveVersion)
 			if (this.opts.noContextFiles !== true && opened.session.getSessionConfig?.().noContextFiles !== true) await ensureProjectContextMessage(opened.session, cwd, this.workspace)
-			this.upsertSession(opened.session, opened.id)
+			this.assertSessionProjectLocationCurrent(id, projectMoveVersion)
+			await this.upsertSession(opened.session, opened.id)
 			const runtime = await this.createRuntime(opened.session, opened.id)
 			endGetRuntime({ cache: "miss" })
 			return runtime
@@ -1455,13 +1807,20 @@ export class RuntimeManager {
 		}
 	}
 
-	async createSession(cwd = this.cwd) {
+	createSession(cwd = this.cwd) {
+		return this.withSessionLocationSetup(() => this.createSessionAtStableLocation(cwd))
+	}
+
+	async createSessionAtStableLocation(cwd) {
 		const requestedCwd = await this.normalizeUserCwd(cwd, "session cwd")
 		let initial = initialSessionEnvironment(requestedCwd)
 		initial = { ...initial, cwd: await this.normalizeUserCwd(initial.cwd, "session initial cwd") }
 		const opened = await this.createStoredSession(initial.cwd)
 		if (this.opts.noContextFiles !== true) await ensureProjectContextMessage(opened.session, initial.cwd, this.workspace)
-		this.upsertSession(opened.session, opened.id)
+		await this.upsertSession(opened.session, opened.id)
+		const projectDir = await initialProjectDirForCwd(initial.cwd, this.workspace)
+		const registration = projectDir ? await this.registerProjectRoot(projectDir) : undefined
+		if (registration?.projectId) await this.db.setSessionProject(opened.id, registration.projectId, registration.projectDir)
 		const runtime = await this.createRuntime(opened.session, opened.id)
 		const settings = this.opts.getSettings?.()
 		if (settings?.defaultModel) {
@@ -1472,20 +1831,21 @@ export class RuntimeManager {
 		}
 		const thinkingLevel = normalizeReasoningLevel(settings?.thinkingLevel)
 		if (thinkingLevel) runtime.agent.state.thinkingLevel = /** @type {any} */ (thinkingLevel)
-		const projectDir = await initialProjectDirForCwd(initial.cwd, this.workspace)
-		if (projectDir) await this.registerProjectRoot(projectDir)
 		await opened.session.appendConfigPatch(sessionConfigForAgent(runtime.agent, {
 			initialWd: initial.cwd,
 			...(projectDir ? { projectDir } : {}),
-			sandboxMounts: [initial.cwd],
 			environmentId: initial.environmentId,
 			noContextFiles: this.opts.noContextFiles === true,
 		}))
-		runtime.refreshSessionPropertyCache({ source: { kind: "session_create" } })
+		await runtime.refreshSessionPropertyCache({ source: { kind: "session_create" } })
 		return runtime
 	}
 
-	async branchSession(sourceId, options = {}) {
+	branchSession(sourceId, options = {}) {
+		return this.withSessionLocationSetup(() => this.branchSessionAtStableLocation(sourceId, options))
+	}
+
+	async branchSessionAtStableLocation(sourceId, options) {
 		const sourceRuntime = await this.getRuntime(sourceId)
 		const requestedEntryId = typeof options.entryId === "string" && options.entryId ? options.entryId : undefined
 		const targetEntry = requestedEntryId ? sourceRuntime.session.getEntry(requestedEntryId) : undefined
@@ -1499,10 +1859,8 @@ export class RuntimeManager {
 		sourceRuntime.session.legacySessionProperties = sourceRuntime.legacySessionProperties
 		const sourceProps = sourceEntryId === undefined
 			? sourceRuntime.effectiveSessionProperties()
-			: getEffectiveSessionProperties(sourceRuntime.session, sourceEntryId)
-		const sourceConfig = sourceEntryId === undefined
-			? sourceRuntime.session.getSessionConfig?.() ?? {}
-			: sessionConfigAt(sourceRuntime.session, sourceEntryId)
+			: await this.sessionPropertiesAtCurrentProjectLocation(sourceId, sourceRuntime.session, sourceEntryId)
+		const sourceConfig = sourceRuntime.effectiveSessionConfig(sourceEntryId)
 		const targetId = await this.createSessionId()
 		const sourceCwd = await this.normalizeOptionalUserCwd(options.cwd, "branch cwd") ?? sourceProps.cwd ?? sourceRuntime.cwd ?? this.cwd
 		const workspaceBranch = await branchSessionWorkspace({
@@ -1518,7 +1876,7 @@ export class RuntimeManager {
 			sessionId: targetId,
 			...(sourceEntryId !== undefined ? { sourceEntryId } : {}),
 		})
-		this.upsertSession(opened.session, opened.id)
+		await this.upsertSession(opened.session, opened.id)
 		const runtime = await this.createRuntime(opened.session, opened.id)
 		applyAgentModel(runtime.agent, cwd, sourceRuntime.agent.state.model)
 		const sourceDescription = cleanText(sourceProps.descriptionInUi || fallbackDescription || "Session branch", 148)
@@ -1544,8 +1902,8 @@ export class RuntimeManager {
 		return runtime
 	}
 
-	subSessionItem(row) {
-		const sessionEntry = this.findSessionEntry(row.childSessionId)
+	async subSessionItem(row) {
+		const sessionEntry = await this.findSessionEntry(row.childSessionId)
 		const runtime = this.runtimes.get(row.childSessionId)
 		return {
 			...row,
@@ -1557,14 +1915,14 @@ export class RuntimeManager {
 		}
 	}
 
-	parentSubSessionRecord(parentSessionId) {
-		return this.db.getSubSession(parentSessionId)
+	async parentSubSessionRecord(parentSessionId) {
+		return await this.db.getSubSession(parentSessionId)
 	}
 
-	resolveSubSession(parentSessionId, selector, options = {}) {
+	async resolveSubSession(parentSessionId, selector, options = {}) {
 		const value = String(selector ?? "").trim()
 		if (!value) throw Object.assign(new Error("sub-agent name or session id is required"), { status: 400 })
-		const rows = this.db.listSubSessions(parentSessionId, { includeClosed: true })
+		const rows = await this.db.listSubSessions(parentSessionId, { includeClosed: true })
 		const matches = rows.filter((row) => row.name === value || row.childSessionId === value || row.childSessionId.startsWith(value))
 		if (matches.length === 0) throw Object.assign(new Error(`Sub-agent not found: ${value}`), { status: 404 })
 		if (matches.length > 1) throw Object.assign(new Error(`Ambiguous sub-agent selector: ${value}`), { status: 400 })
@@ -1573,27 +1931,31 @@ export class RuntimeManager {
 		return row
 	}
 
-	async spawnSubSession(parentSessionId, request = {}) {
+	spawnSubSession(parentSessionId, request = {}) {
+		return this.withSessionLocationSetup(() => this.spawnSubSessionAtStableLocation(parentSessionId, request))
+	}
+
+	async spawnSubSessionAtStableLocation(parentSessionId, request) {
 		const task = cleanPromptText(request.task)
 		if (!task) throw Object.assign(new Error("sub-agent task is required"), { status: 400 })
 		const forkTurns = normalizeSubSessionForkTurns(request.forkTurns)
-		const existing = this.db.listSubSessions(parentSessionId, { includeClosed: true })
+		const existing = await this.db.listSubSessions(parentSessionId, { includeClosed: true })
 		const requestedName = normalizeSubSessionName(request.name)
 		const existingNames = new Set(existing.map((row) => row.name))
 		const name = requestedName ?? defaultSubSessionName(existingNames)
 		if (existingNames.has(name)) throw Object.assign(new Error(`Sub-agent name already exists: ${name}`), { status: 409 })
 
-		const parentRecord = this.parentSubSessionRecord(parentSessionId)
+		const parentRecord = await this.parentSubSessionRecord(parentSessionId)
 		const rootSessionId = parentRecord?.rootSessionId ?? parentSessionId
 		const depth = (parentRecord?.depth ?? 0) + 1
 		if (depth > SUB_SESSION_MAX_DEPTH) throw Object.assign(new Error(`Sub-agent nesting is limited to depth ${SUB_SESSION_MAX_DEPTH}`), { status: 409 })
-		const openForRoot = this.db.listSubSessionsForRoot(rootSessionId).length
+		const openForRoot = (await this.db.listSubSessionsForRoot(rootSessionId)).length
 		if (openForRoot >= SUB_SESSION_MAX_OPEN_PER_ROOT) throw Object.assign(new Error(`Sub-agent limit reached for this session tree (${SUB_SESSION_MAX_OPEN_PER_ROOT})`), { status: 409 })
 
 		const sourceRuntime = await this.getRuntime(parentSessionId)
 		sourceRuntime.session.legacySessionProperties = sourceRuntime.legacySessionProperties
 		const sourceProps = sourceRuntime.effectiveSessionProperties()
-		const sourceConfig = sourceRuntime.session.getSessionConfig?.() ?? {}
+		const sourceConfig = sourceRuntime.effectiveSessionConfig()
 		const targetId = await this.createSessionId()
 		const sourceCwd = await this.normalizeOptionalUserCwd(request.cwd, "sub-session cwd") ?? sourceProps.cwd ?? sourceRuntime.cwd ?? this.cwd
 		const workspaceBranch = await branchSessionWorkspace({
@@ -1614,8 +1976,8 @@ export class RuntimeManager {
 				sessionId: targetId,
 				sourceEntryId: branchEntryId,
 			},
-			beforeRuntime: ({ opened }) => {
-				this.db.setSessionHidden(opened.id, true)
+			beforeRuntime: async ({ opened }) => {
+				await this.db.setSessionHidden(opened.id, true)
 			},
 			beforeConfig: ({ opened }) => {
 				return this.db.upsertSubSession({
@@ -1663,17 +2025,17 @@ export class RuntimeManager {
 			invalidateSessionIds: ({ opened }) => [parentSessionId, opened.id],
 			emitSessionListChange: true,
 		})
-		return this.subSessionItem(launch.registration)
+		return await this.subSessionItem(launch.registration)
 	}
 
 	async listSubSessions(parentSessionId, request = {}) {
-		return this.db
-			.listSubSessions(parentSessionId, { includeClosed: request.includeClosed === true })
-			.map((row) => this.subSessionItem(row))
+		return await Promise.all((await this.db
+			.listSubSessions(parentSessionId, { includeClosed: request.includeClosed === true }))
+			.map((row) => this.subSessionItem(row)))
 	}
 
 	async waitSubSession(parentSessionId, request = {}) {
-		const row = this.resolveSubSession(parentSessionId, request.agent, { allowClosed: true })
+		const row = await this.resolveSubSession(parentSessionId, request.agent, { allowClosed: true })
 		const runtime = await this.getRuntime(row.childSessionId)
 		const timeoutMs = Number(request.timeoutMs)
 		if (!row.closedAt) {
@@ -1690,13 +2052,13 @@ export class RuntimeManager {
 		}
 		const snapshot = await runtime.snapshot()
 		return {
-			...this.subSessionItem(row),
+			...await this.subSessionItem(row),
 			latestAssistantText: latestAssistantText(snapshot.messages),
 		}
 	}
 
 	async followupSubSession(parentSessionId, request = {}) {
-		const row = this.resolveSubSession(parentSessionId, request.agent)
+		const row = await this.resolveSubSession(parentSessionId, request.agent)
 		const task = cleanPromptText(request.task)
 		if (!task) throw Object.assign(new Error("follow-up task is required"), { status: 400 })
 		const runtime = await this.getRuntime(row.childSessionId)
@@ -1706,32 +2068,32 @@ export class RuntimeManager {
 		else await runtime.waitForPromptAccepted(submission)
 		await this.invalidateSnapshot(parentSessionId)
 		await this.invalidateSnapshot(row.childSessionId)
-		return this.subSessionItem(row)
+		return await this.subSessionItem(row)
 	}
 
 	async resumeSubSession(parentSessionId, request = {}) {
-		const row = this.resolveSubSession(parentSessionId, request.agent, { allowClosed: true })
-		if (!this.findSessionEntry(row.childSessionId)) throw Object.assign(new Error(`Sub-agent session not found: ${row.name}`), { status: 404 })
-		const reopened = row.closedAt ? this.db.reopenSubSession(row.childSessionId) ?? row : row
+		const row = await this.resolveSubSession(parentSessionId, request.agent, { allowClosed: true })
+		if (!await this.findSessionEntry(row.childSessionId)) throw Object.assign(new Error(`Sub-agent session not found: ${row.name}`), { status: 404 })
+		const reopened = row.closedAt ? await this.db.reopenSubSession(row.childSessionId) ?? row : row
 		await this.invalidateSnapshot(parentSessionId)
 		await this.invalidateSnapshot(row.childSessionId)
 		this.hub.send({ type: "session_list_changed", sessionId: row.childSessionId })
-		return this.subSessionItem(reopened)
+		return await this.subSessionItem(reopened)
 	}
 
 	async closeSubSession(parentSessionId, request = {}) {
-		const row = this.resolveSubSession(parentSessionId, request.agent, { allowClosed: true })
+		const row = await this.resolveSubSession(parentSessionId, request.agent, { allowClosed: true })
 		const runtime = this.runtimes.get(row.childSessionId)
 		if (runtime?.isStreaming()) await runtime.abort()
-		const closed = this.db.closeSubSession(row.childSessionId, cleanText(request.reason, 240) || undefined) ?? row
+		const closed = await this.db.closeSubSession(row.childSessionId, cleanText(request.reason, 240) || undefined) ?? row
 		await this.invalidateSnapshot(parentSessionId)
 		await this.invalidateSnapshot(row.childSessionId)
 		this.hub.send({ type: "session_list_changed", sessionId: row.childSessionId })
-		return this.subSessionItem(closed)
+		return await this.subSessionItem(closed)
 	}
 
 	async resumeRunnableInterruptedRuns() {
-		const candidates = (await this.workspaceAllowedSessionEntries(this.db.listSessionStatuses({ includeHidden: true }))).filter(autoResumeCandidate)
+		const candidates = (await this.workspaceAllowedSessionEntries(await this.db.listSessionStatuses({ includeHidden: true }))).filter(autoResumeCandidate)
 		const resumed = []
 		const reconciled = []
 		const blocked = []
@@ -1740,7 +2102,7 @@ export class RuntimeManager {
 				const runtime = await this.getRuntime(entry.id)
 				const state = await runtime.prepareContinuationState()
 				if (state.type === "idle" && state.reason === "assistant_complete") {
-					if (this.db.finishLatestInterruptedRunForSession(entry.id, { status: "completed", stopReason: "stop" })) {
+					if (await this.db.finishLatestInterruptedRunForSession(entry.id, { status: "completed", stopReason: "stop" })) {
 						reconciled.push(entry.id)
 						this.hub.send({ type: "session_list_changed", sessionId: entry.id })
 						continue
@@ -1762,32 +2124,32 @@ export class RuntimeManager {
 
 	async applyLegacyAgentViewFallbacks() {
 		const now = Date.now()
-		for (const entry of await this.workspaceAllowedSessionEntries(this.db.listSessionStatuses({ includeHidden: true }))) {
+		for (const entry of await this.workspaceAllowedSessionEntries(await this.db.listSessionStatuses({ includeHidden: true }))) {
 			if (entry.agentView?.state === "legacy") {
-				const preview = this.loadSessionPreview(entry.id)
+				const preview = await this.loadSessionPreview(entry.id)
 				const metadata = completedLegacyMetadata(entry, preview)
-				this.db.setAgentViewMetadata(entry.id, metadata)
+				await this.db.setAgentViewMetadata(entry.id, metadata)
 				this.hub.send({ type: "agent_view_metadata", sessionId: entry.id, metadata })
 				continue
 			}
 			if (!needsLegacyAgentViewFallback(entry.agentView)) continue
-			const preview = this.loadSessionPreview(entry.id)
+			const preview = await this.loadSessionPreview(entry.id)
 			if (!hasVisibleUserPrompt(preview)) continue
 			if (olderThanLegacyCompletionWindow(entry.updatedAt, now)) {
 				const metadata = completedLegacyMetadata(entry, preview)
-				this.db.setAgentViewMetadata(entry.id, metadata)
+				await this.db.setAgentViewMetadata(entry.id, metadata)
 				this.hub.send({ type: "agent_view_metadata", sessionId: entry.id, metadata })
 				continue
 			}
 		}
 	}
 
-	findSessionEntry(id) {
-		return this.db.getSession(id)
+	async findSessionEntry(id) {
+		return await this.db.getSession(id)
 	}
 
-	findSessionEntryIncludingDeleted(id) {
-		return this.db.getSession(id, { includeDeleted: true })
+	async findSessionEntryIncludingDeleted(id) {
+		return await this.db.getSession(id, { includeDeleted: true })
 	}
 
 	sessionStatusForEntry(entry) {
@@ -1808,6 +2170,7 @@ export class RuntimeManager {
 			isStreaming: live ? live.isStreaming : storedRunning,
 			...(live?.currentModelRequest ? { currentModelRequest: live.currentModelRequest } : {}),
 			pendingToolCallCount: live?.pendingToolCallCount ?? 0,
+			runtimeNeedsInput: live?.runtimeNeedsInput === true,
 			cwd: entry.cwd,
 			initialWd: entry.initialWd,
 			hidden: entry.hidden === true,
@@ -1832,12 +2195,16 @@ export class RuntimeManager {
 				if (this.completedWorktreeCleanupTasks.get(id) !== task) return
 				const end = this.diagnostics?.span?.("RuntimeManager.cleanupCompletedWorktrees", { sessionId: id })
 				try {
+					const cwd = runtime.effectiveSessionProperties().cwd ?? runtime.cwd
+					if (sessionOpenGitWorktreeRecords(runtime.session).some((record) => cwd && pathIsWithin(record.path, cwd))) {
+						end?.({ removed: 0, skipped: "session_cwd" })
+						return
+					}
 					const removed = await cleanupSessionGitWorktrees(runtime.session, { workspace: this.workspace })
 					if (removed.length === 0) {
 						end?.({ removed: 0 })
 						return
 					}
-					for (const event of removed) await runtime.remapClosedWorktreePaths(event)
 					this.worktreeStatusCache.delete(id)
 					this.worktreeStatusLoads.delete(id)
 					await this.invalidateSnapshot(id)
@@ -1856,7 +2223,7 @@ export class RuntimeManager {
 	}
 
 	async markAgentViewState(id, state, _result, runningMessage, options = {}) {
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		if (this.runtimes.get(id)?.isStreaming() || entry.runStatus === "running") throw Object.assign(new Error(runningMessage), { status: 409 })
 		const runtime = await this.getRuntime(id)
@@ -1871,10 +2238,10 @@ export class RuntimeManager {
 	}
 
 	async setPromptDraft(id, text, options = {}) {
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		await this.assertSessionEntryAllowed(entry)
-		const draft = this.db.setPromptDraft(id, text, options)
+		const draft = await this.db.setPromptDraft(id, text, options)
 		if (draft.applied !== false) this.hub.send({ type: "prompt_draft_update", sessionId: id, draft })
 		return draft
 	}
@@ -1888,7 +2255,7 @@ export class RuntimeManager {
 	}
 
 	async deleteStoppedSession(id) {
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		await this.assertSessionEntryAllowed(entry)
 		const runtime = this.runtimes.get(id)
@@ -1897,18 +2264,18 @@ export class RuntimeManager {
 		this.runtimes.delete(id)
 		this.worktreeStatusCache.delete(id)
 		this.worktreeStatusLoads.delete(id)
-		this.db.closeSubSession(id, "session deleted")
-		this.db.markSessionDeleted(id)
+		await this.db.closeSubSession(id, "session deleted")
+		await this.db.markSessionDeleted(id)
 		this.hub.send({ type: "session_list_changed", sessionId: id })
 		return { ok: true }
 	}
 
 	async restoreDeletedSession(id) {
-		const entry = this.findSessionEntryIncludingDeleted(id)
+		const entry = await this.findSessionEntryIncludingDeleted(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		if (!entry.deletedAt) return { ok: true }
 		await this.assertSessionEntryAllowed(entry)
-		if (!restoreSessionInDb(this.db, id)) throw Object.assign(new Error(`Session is not deleted: ${id}`), { status: 409 })
+		if (!await restoreSessionInDb(this.db, id)) throw Object.assign(new Error(`Session is not deleted: ${id}`), { status: 409 })
 		this.hub.send({ type: "session_list_changed", sessionId: id })
 		return { ok: true }
 	}
@@ -1917,7 +2284,7 @@ export class RuntimeManager {
 		const previewRowsBySessionId = new Map()
 		const endPreviews = this.diagnostics?.span?.("RuntimeManager.loadSessionPreviews", { count: entries.length })
 		try {
-			for (const row of this.db.loadSessionOverviewPreviewMessagesForSessions(entries.map((entry) => entry.id))) {
+			for (const row of await this.db.loadSessionOverviewPreviewMessagesForSessions(entries.map((entry) => entry.id))) {
 				const rows = previewRowsBySessionId.get(row.sessionId) ?? []
 				rows.push(row)
 				previewRowsBySessionId.set(row.sessionId, rows)
@@ -1926,34 +2293,43 @@ export class RuntimeManager {
 			endPreviews?.({ count: previewRowsBySessionId.size })
 		}
 
-		const projectCwds = [...new Set(entries.map(projectCwdForSessionEntry))]
-		const projectsByCwd = new Map(await Promise.all(projectCwds.map(async (cwd) => [cwd, await this.projectInfo(cwd)])))
-		return entries.map((entry) => {
-			const liveRunning = this.runtimes.get(entry.id)?.isStreaming() === true
+		const projectKeys = new Map(entries.map((entry) => [
+			`${entry.projectId ?? ""}\0${entry.projectRetiredAt ?? ""}\0${projectCwdForSessionEntry(entry)}`,
+			entry,
+		]))
+		const projectsByKey = new Map(await Promise.all([...projectKeys].map(async ([key, entry]) => [
+			key,
+			await this.projectInfoForSessionEntry(entry),
+		])))
+		return await Promise.all(entries.map(async (entry) => {
+			const runtime = this.runtimes.get(entry.id)
+			const liveRunning = runtime?.isStreaming() === true
 			const preview = sessionPreviewFromMessages(previewRowsBySessionId.get(entry.id) ?? [])
 			let agentView = entry.agentView
 			const lifecycleState = lifecycleStateForSession(entry, preview, liveRunning)
 			const fallbackState = entry.deletedAt ? undefined : fallbackAgentViewState(entry, preview, now)
 			if (!entry.deletedAt && agentView?.state === "legacy") {
 				agentView = completedLegacyMetadata(entry, preview)
-				this.db.setAgentViewMetadata(entry.id, agentView)
+				await this.db.setAgentViewMetadata(entry.id, agentView)
 			}
 			if (!entry.deletedAt && fallbackState === "completed" && needsLegacyAgentViewFallback(agentView)) {
 				agentView = completedLegacyMetadata({ ...entry, agentView }, preview)
-				this.db.setAgentViewMetadata(entry.id, agentView)
+				await this.db.setAgentViewMetadata(entry.id, agentView)
 			}
 			return {
 				id: entry.id,
 				cwd: entry.cwd,
 				initialWd: entry.initialWd,
 				projectDir: entry.projectDir,
-				project: projectsByCwd.get(projectCwdForSessionEntry(entry)),
+				projectId: entry.projectId,
+				project: projectsByKey.get(`${entry.projectId ?? ""}\0${entry.projectRetiredAt ?? ""}\0${projectCwdForSessionEntry(entry)}`),
 				sessionKind: entry.sessionKind,
 				createdAt: entry.createdAt,
 				updatedAt: entry.updatedAt,
 				deletedAt: entry.deletedAt,
 				hidden: entry.hidden === true,
 				hasWorktrees: entry.hasWorktrees === true,
+				runtimeNeedsInput: runtime?.needsInput() === true,
 				latestRunStartedAt: entry.latestRunStartedAt,
 				latestRunEndedAt: entry.latestRunEndedAt,
 				runStatus: liveRunning ? "running" : entry.runStatus,
@@ -1963,13 +2339,13 @@ export class RuntimeManager {
 				agentView,
 				agentViewFallbackState: fallbackState,
 			}
-		})
+		}))
 	}
 
 	async sessionListEntry(id, cwd = undefined, options = {}) {
 		const filterCwd = await this.normalizeOptionalUserCwd(cwd, "session list cwd filter")
 		this.pruneIdleRuntimes()
-		const entry = this.db.getSessionListEntry(id, {
+		const entry = await this.db.getSessionListEntry(id, {
 			includeDeleted: options.includeDeleted === true,
 			includeHidden: options.includeHidden === true,
 		})
@@ -1987,7 +2363,7 @@ export class RuntimeManager {
 			this.pruneIdleRuntimes()
 			const endList = this.diagnostics?.span?.("RuntimeManager.db.listSessions", { cwd: filterCwd })
 			try {
-				const listed = filterCwd
+				const listed = await (filterCwd
 					? this.db.listSessionsForDirectory(filterCwd, {
 						includeDeleted: options.includeDeleted === true,
 						includeHidden: options.includeHidden === true,
@@ -1995,7 +2371,7 @@ export class RuntimeManager {
 					: this.db.listSessions(undefined, {
 						includeDeleted: options.includeDeleted === true,
 						includeHidden: options.includeHidden === true,
-					})
+					}))
 				entries = (await this.workspaceAllowedSessionEntries(listed)).filter((entry) => sessionMatchesDirectoryFilter(entry, filterCwd))
 			} finally {
 				endList?.({ count: entries.length })
@@ -2012,7 +2388,7 @@ export class RuntimeManager {
 		let entries = []
 		try {
 			this.pruneIdleRuntimes()
-			entries = (await this.workspaceAllowedSessionEntries(this.db.listSessionStatuses({
+			entries = (await this.workspaceAllowedSessionEntries(await this.db.listSessionStatuses({
 				cwd: filterCwd,
 				includeDeleted: options.includeDeleted === true,
 				includeHidden: options.includeHidden === true,
@@ -2037,7 +2413,7 @@ export class RuntimeManager {
 
 	async sessionStatus(id = this.initialSessionId) {
 		if (!id) throw new Error("No session selected")
-		const entry = this.findSessionEntry(id)
+		const entry = await this.findSessionEntry(id)
 		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
 		await this.assertSessionEntryAllowed(entry)
 		return this.sessionStatusForEntry(entry)
@@ -2046,7 +2422,7 @@ export class RuntimeManager {
 	async overviewCwd(cwd = undefined) {
 		if (cwd === undefined || cwd === null || cwd === "") return this.cwd
 		if (cwdIsInsideSessionWorkspacesRoot(cwd)) {
-			const sessionWorkspaceProjectDir = (await this.workspaceAllowedSessionEntries(this.db.listSessionStatuses({ includeHidden: true })))
+			const sessionWorkspaceProjectDir = (await this.workspaceAllowedSessionEntries(await this.db.listSessionStatuses({ includeHidden: true })))
 				.map((entry) => sessionWorkspaceProjectDirForCwd(entry, cwd))
 				.find(Boolean)
 			if (sessionWorkspaceProjectDir) return await this.normalizeUserCwd(sessionWorkspaceProjectDir, "overview cwd")
@@ -2062,20 +2438,134 @@ export class RuntimeManager {
 	async overviewProject(cwd = undefined) {
 		const projectCwd = await this.overviewCwd(cwd)
 		const project = await this.projectInfo(projectCwd)
-		await this.registerProjectRoot(project.root).catch(() => undefined)
-		return project
+		const registration = await this.registerProjectRoot(project.root).catch(() => undefined)
+		return registration?.projectId ? { ...registration.project, id: registration.projectId } : project
+	}
+
+	async storedTranscriptSnapshot(id, options = {}) {
+		const entry = await this.findSessionEntry(id)
+		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
+		await this.assertSessionEntryAllowed(entry)
+		let opened
+		try {
+			opened = await this.openStoredSessionManifest(id)
+		} catch (err) {
+			await this.rethrowSessionNotFound(id, err)
+		}
+		opened.session.legacySessionProperties = entry.agentView
+		const properties = await this.sessionPropertiesAtCurrentProjectLocation(id, opened.session)
+		await this.assertOpenedSessionAllowed(opened.session, entry.cwd, properties)
+		const cwd = properties.cwd ?? opened.session.getMetadata().cwd ?? entry.cwd ?? this.cwd
+		const projectCwd = projectCwdForSnapshot(opened.session, properties, cwd)
+		const [project, subSessions] = await Promise.all([
+			this.projectInfoForSessionEntry(entry, projectCwd),
+			this.listSubSessions(id, { includeClosed: true }),
+		])
+		const config = opened.session.getSessionConfig?.() ?? {}
+		const settings = this.opts.getSettings?.() ?? {}
+		const configuredModel = config.model ?? config.modelRef ?? settings.defaultModel ?? settings.model
+		let model = configuredModel
+		if (typeof configuredModel === "string") {
+			model = await resolveModelWithProviderMetadata(configuredModel, { providers: settings.providers }).catch(() => ({ id: configuredModel }))
+		}
+		const displayEntries = opened.session.getDisplayEntries()
+		const messages = projectVisibleEntries(displayEntries, {
+			showAutomatedMaintenanceUsers: Boolean(await this.db.getProjectMaintenanceSessionBySessionId(id)),
+		}).map((displayEntry) => ({ ...displayEntry.message, entryId: displayEntry.entryId }))
+		const snapshot = {
+			cwd,
+			project,
+			sessionId: id,
+			sessionWorkspacePath: sessionWorkspacePath(id),
+			...(this.cursorGeneration ? { cursorGeneration: this.cursorGeneration } : {}),
+			seq: this.getEventSeq(id),
+			viewEpoch: this.getViewEpoch(id),
+			viewLeafId: opened.session.getLeafId(),
+			...(model ? { model } : {}),
+			thinkingLevel: config.thinkingLevel ?? settings.thinkingLevel,
+			serviceTier: config.serviceTier,
+			modelIoLogEnabled: isModelIoLogEnabled(),
+			isStreaming: false,
+			pendingToolCalls: [],
+			pendingToolCallDetails: [],
+			pendingUserMessages: [],
+			agentView: sessionPropertiesToAgentView(properties),
+			sessionProperties: properties,
+			promptDraft: await this.db.getPromptDraft(id),
+			subSessions,
+			messages,
+			streamingMessage: null,
+		}
+		if (options.includeSessions) snapshot.sessions = await this.sessions()
+		return snapshot
+	}
+
+	async hydrateTranscriptEntries(id, entryIds) {
+		if (!Array.isArray(entryIds)) throw Object.assign(new Error("entryIds must be an array"), { status: 400 })
+		if (entryIds.length > 100) throw Object.assign(new Error("At most 100 transcript entries can be hydrated at once"), { status: 400 })
+		if (entryIds.some((entryId) => typeof entryId !== "string" || !entryId.trim())) {
+			throw Object.assign(new Error("entryIds must contain non-empty strings"), { status: 400 })
+		}
+		const ids = [...new Set(entryIds.map((entryId) => entryId.trim()))]
+		const entry = await this.findSessionEntry(id)
+		if (!entry) throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
+		await this.assertSessionEntryAllowed(entry)
+		if (ids.length === 0) return { messages: [] }
+		const runtime = this.runtimes.get(id)
+		if (runtime && !runtime.agent.isDead) {
+			const selected = new Set(ids)
+			return {
+				messages: projectVisibleEntries(runtime.session.getDisplayEntries(), runtime.visibleProjectionOptions())
+					.filter((displayEntry) => selected.has(displayEntry.entryId))
+					.map((displayEntry) => ({ ...displayEntry.message, entryId: displayEntry.entryId })),
+			}
+		}
+		const projectionOptions = {
+			showAutomatedMaintenanceUsers: Boolean(await this.db.getProjectMaintenanceSessionBySessionId(id)),
+		}
+		const persistedMessages = await loadTranscriptMessagesInDb(this.db, id, ids)
+		return {
+			messages: persistedMessages.flatMap(({ entryId, message }) => {
+				const visible = projectVisibleMessage(message, projectionOptions)
+				return visible ? [{ ...visible, entryId }] : []
+			}),
+		}
 	}
 
 	async snapshot(id = this.initialSessionId, options = this.snapshotOptions) {
 		if (!id) throw new Error("No session selected")
+		const observeHeap = this.diagnostics?.enabled === true && typeof process.memoryUsage === "function"
+		const heapUsedBeforeBytes = observeHeap ? process.memoryUsage().heapUsed : undefined
 		const end = this.diagnostics?.span?.("RuntimeManager.snapshot", {
 			sessionId: id,
 			includeSessions: options.includeSessions === true,
+			transcriptMode: options.transcriptMode ?? "full",
 		})
+		let snapshot
+		let failed = false
 		try {
-			return (await this.getRuntime(id)).snapshot(options)
+			const existing = this.runtimes.get(id)
+			const entry = await this.findSessionEntry(id)
+			if (entry?.projectRetiredAt || (options.transcriptMode === "deferred" && !options.includeContextMessages && (!existing || existing.agent.isDead))) {
+				snapshot = await this.storedTranscriptSnapshot(id, options)
+			} else {
+				snapshot = await (await this.getRuntime(id)).snapshot(options)
+			}
+			return snapshot
+		} catch (err) {
+			failed = true
+			throw err
 		} finally {
-			end?.()
+			const heapUsedAfterBytes = observeHeap ? process.memoryUsage().heapUsed : undefined
+			end?.({
+				...(failed ? { error: true } : {}),
+				messageCount: snapshot?.messages?.length ?? 0,
+				...(observeHeap ? {
+					heapUsedBeforeBytes,
+					heapUsedAfterBytes,
+					heapDeltaBytes: heapUsedAfterBytes - heapUsedBeforeBytes,
+				} : {}),
+			})
 		}
 	}
 
@@ -2110,13 +2600,13 @@ export class RuntimeManager {
 			this.runtimes.delete(id)
 		}
 		try {
-			const entry = this.findSessionEntry(id)
+			const entry = await this.findSessionEntry(id)
 			if (!entry) throw new Error(`Session not found: ${id}`)
 			await this.assertSessionEntryAllowed(entry)
-			const records = gitWorktreeRecordsFromEntries(this.db.loadSessionCustomEntries(id, GIT_WORKTREE_CUSTOM_TYPE))
+			const records = gitWorktreeRecordsFromEntries(await this.db.loadSessionCustomEntries(id, GIT_WORKTREE_CUSTOM_TYPE))
 			return this.workspace.worktrees.statuses(records)
 		} catch (/** @type {any} */ err) {
-			this.rethrowSessionNotFound(id, err, { clearWorktreeStatus: true })
+			await this.rethrowSessionNotFound(id, err, { clearWorktreeStatus: true })
 		}
 	}
 
@@ -2153,7 +2643,7 @@ export class RuntimeManager {
 
 	async worktrees(id = this.initialSessionId, options = {}) {
 		if (!id) throw new Error("No session selected")
-		const sessionMutation = this.db.getSessionMutation(id)
+		const sessionMutation = await this.db.getSessionMutation(id)
 		if (!sessionMutation) {
 			this.worktreeStatusCache.delete(id)
 			throw Object.assign(new Error(`Session not found: ${id}`), { status: 404 })
@@ -2167,8 +2657,8 @@ export class RuntimeManager {
 		const loading = this.worktreeStatusLoads.get(id)
 		if (loading?.mutationVersion === sessionMutation.mutationVersion) return cloneWorktreeStatuses(await loading.promise)
 		const promise = this.loadWorktreesUncached(id)
-			.then((statuses) => {
-				const currentMutation = this.db.getSessionMutation(id)
+			.then(async (statuses) => {
+				const currentMutation = await this.db.getSessionMutation(id)
 				if (currentMutation?.mutationVersion === sessionMutation.mutationVersion) {
 					const cacheEntry = {
 						mutationVersion: sessionMutation.mutationVersion,

@@ -1,4 +1,4 @@
-// Small Fetch-style router for core HTTP services and optional frontends. It intentionally implements only ordered middleware, GET/POST/DELETE routes, named single-segment params, prefix middleware, and a catch-all route.
+// Small Fetch-style router for core HTTP services and optional frontends. It intentionally implements only ordered middleware, common mutation/read routes, named single-segment params, prefix middleware, and a catch-all route.
 
 /**
  * @typedef {(context: HttpContext, next: () => Promise<void>) => Response | void | Promise<Response | void>} HttpMiddleware
@@ -97,6 +97,10 @@ export class HttpRouter {
 
 	post(pattern, handler) {
 		this.#layers.push({ method: "POST", pattern, handler })
+	}
+
+	patch(pattern, handler) {
+		this.#layers.push({ method: "PATCH", pattern, handler })
 	}
 
 	delete(pattern, handler) {

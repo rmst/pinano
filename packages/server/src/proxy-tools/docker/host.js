@@ -2,8 +2,7 @@ import { spawn } from "node:child_process"
 import { isAbsolute, resolve } from "node:path"
 
 import { DOCKER_PROXY_ROUTE } from "../../../../protocol/src/internal-proxy-routes.js"
-import { effectiveSandboxMounts, hostPathForMountedPath } from "../../app/sandbox/paths.js"
-import { addSessionWorkspaceRootMount } from "../../app/workers/tool/state-mounts.js"
+import { hostPathForWorkerPath } from "../../app/workers/tool/worker-mounts.js"
 import { internalHttpJsonResponse, internalHttpRequestBodyText } from "../../app/workers/internal-http.js"
 
 export { DOCKER_PROXY_ROUTE }
@@ -166,14 +165,6 @@ function parseDockerProxyPayload(payload) {
 	}
 }
 
-function sandboxMountPaths(sandbox) {
-	return sandbox?.mountPaths ?? []
-}
-
-function sandboxUseSessionWd(sandbox) {
-	return sandbox?.useSessionWd ?? true
-}
-
 function resolveWorkerPath(path, cwd) {
 	if (!path) return undefined
 	if (isAbsolute(path)) return resolve(path)
@@ -181,28 +172,8 @@ function resolveWorkerPath(path, cwd) {
 	return resolve(cwd, path)
 }
 
-function effectiveWorkerMounts(workerContext = {}) {
-	const sandbox = workerContext.sandbox ?? { type: "none" }
-	let mounts = effectiveSandboxMounts({
-		sessionWd: workerContext.sessionWd ?? workerContext.startCwd,
-		useSessionWd: sandboxUseSessionWd(sandbox),
-		mountPaths: sandboxMountPaths(sandbox),
-	}, "Docker proxy path mapping")
-	return addSessionWorkspaceRootMount(mounts, stringOrUndefined(workerContext.sessionDir))
-}
-
 export function hostPathForWorkerDockerPath(workerPath, workerContext = {}) {
-	const path = stringOrUndefined(workerPath)
-	if (!path || !isAbsolute(path)) return undefined
-	if (workerContext.target?.type !== "local") return undefined
-	const sandbox = workerContext.sandbox ?? { type: "none" }
-	if (sandbox.type === "none") return { path: resolve(path), readOnly: false }
-	if (sandbox.type !== "native" && sandbox.type !== "container") return undefined
-	try {
-		return hostPathForMountedPath(effectiveWorkerMounts(workerContext), path)
-	} catch {
-		return undefined
-	}
+	return hostPathForWorkerPath(workerPath, workerContext)
 }
 
 function dockerOwnerLabels(context = {}) {

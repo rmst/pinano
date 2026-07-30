@@ -5,13 +5,16 @@
 // authenticated local HTTP and WebSocket endpoints over loopback TCP.
 
 import { randomUUID } from "node:crypto"
+import { statSync } from "node:fs"
 import { mkdir, readFile, rm } from "node:fs/promises"
 import * as http from "node:http"
 import { join, resolve } from "node:path"
 
 import { ensureRuntimeSourceReference } from "../runtime/source-reference.js"
+import { metricsDbPath, serverDbPath } from "../paths.js"
 import { loadSettings, updateSetting } from "../settings.js"
 import { RuntimeManager } from "../session/runtime/index.js"
+import { recoverPendingPromptImageAttachments } from "../session/attachments.js"
 import { authenticateRequest, authenticateRequestParts, bearerTokenFromHeader } from "../http/auth.js"
 import { configuredServiceDebug, configuredServiceDiagnostics, configuredWebDefaults } from "./config.js"
 import { getOrCreateServiceToken } from "./token.js"
@@ -41,6 +44,24 @@ import { PreviewManager } from "../preview/manager.js"
 import { previewAccessTokenForServiceToken } from "../preview/access.js"
 import { PREVIEW_AUTHORIZATION_HEADER, previewPublicUrlFromSettings, previewRoutingSlugFromSettings } from "../preview/manifest.js"
 import { serviceHostForListen } from "./network.js"
+import { closeModelIoLogDb, modelIoLogDbPath, modelIoLogStatus, setModelIoLogDiagnostics } from "../../ai-apis/model-io-log.js"
+import {
+	closeDefaultModelApiMetrics,
+	defaultModelApiMetricsStatus,
+	startDefaultModelApiMetrics,
+} from "../metrics/model-api.js"
+
+function fileSize(path) {
+	try { return statSync(path).size } catch { return undefined }
+}
+
+function sqliteFileContext(path) {
+	return {
+		dbBytes: fileSize(path),
+		walBytes: fileSize(`${path}-wal`),
+		shmBytes: fileSize(`${path}-shm`),
+	}
+}
 
 /** @typedef {import("../agent/runtime.js").AgentRuntime} Agent */
 import {
@@ -52,7 +73,7 @@ import {
 	mainPath,
 	serviceDir,
 	appendServiceLog,
-	openOwnedServerDb,
+	openOwnedServerPersistence,
 	serviceIdleShutdownDelayMs,
 	serviceIdleShutdownInfo,
 	authError,
@@ -100,9 +121,14 @@ import {
  */
 export async function runService(options) {
 	await bestEffortAutoInstallBundledBubblewrap()
-	const serviceSettings = await loadSettings()
+	const settingsRef = { current: await loadSettings() }
+	const serviceSettings = settingsRef.current
+	const serviceToken = typeof options.token === "string" && options.token ? options.token : await getOrCreateServiceToken()
+	const previewAccessToken = previewAccessTokenForServiceToken(serviceToken)
 	const workspaceHost = options.workspaceHost ?? await createLocalWorkspaceHost({
 		workspaceRoot: workspaceRootFromSettings(serviceSettings),
+		getSettings: () => settingsRef.current,
+		previewAccessToken,
 		...(typeof options.loadWebMode === "function" ? {
 			createProjectWorkspace: async (workspaceOptions) => {
 				const { createProjectWorkspaceBackend } = await options.loadWebMode()
@@ -117,8 +143,10 @@ export async function runService(options) {
 		await workspaceHost.close?.()
 	}
 	try {
-		return await startServiceWithWorkspaceHost(options, { serviceSettings, workspaceHost, closeWorkspaceHost })
+		return await startServiceWithWorkspaceHost(options, { serviceSettings, settingsRef, serviceToken, previewAccessToken, workspaceHost, closeWorkspaceHost })
 	} catch (err) {
+		closeDefaultModelApiMetrics()
+		setModelIoLogDiagnostics(undefined)
 		try { await closeWorkspaceHost() } catch {}
 		throw err
 	}
@@ -126,6 +154,12 @@ export async function runService(options) {
 
 async function startServiceWithWorkspaceHost(options, startup) {
 	let serviceSettings = startup.serviceSettings
+	const settingsRef = startup.settingsRef ?? { current: serviceSettings }
+	const replaceServiceSettings = (settings) => {
+		serviceSettings = settings
+		settingsRef.current = settings
+		return settings
+	}
 	const { workspaceHost, closeWorkspaceHost } = startup
 	const workspace = workspaceHost.client
 	const serviceCwd = await workspace.paths.normalizeUserCwd(options.cwd, "service startup cwd")
@@ -135,8 +169,9 @@ async function startServiceWithWorkspaceHost(options, startup) {
 		path: diagnosticsOptions.path || join(serviceDir(), "diagnostics.jsonl"),
 		processName: "cerex service",
 	})
-	const serviceToken = typeof options.token === "string" && options.token ? options.token : await getOrCreateServiceToken()
-	const previewAccessToken = previewAccessTokenForServiceToken(serviceToken)
+	setModelIoLogDiagnostics(diagnostics)
+	startDefaultModelApiMetrics({ path: metricsDbPath(), diagnostics })
+	const { serviceToken, previewAccessToken } = startup
 	const runtimeIdentity = await processRuntimeIdentity()
 	const codeFingerprint = runtimeIdentity.codeFingerprint
 	if (options.serviceClaimId) await ensureCurrentRuntimeIsDesired(runtimeIdentity, options.serviceClaimId)
@@ -165,17 +200,50 @@ async function startServiceWithWorkspaceHost(options, startup) {
 		ownershipCheckTimer = undefined
 	}
 	const hub = createLiveEventHub(() => scheduleIdleCheck())
-	const db = await openOwnedServerDb({ recoverRunningRuns: true })
-	db.recoverServiceRuns(undefined, serviceRunId)
-	db.startServiceRun({
-		id: serviceRunId,
-		pid: process.pid,
-		cwd: serviceCwd,
-		transport: "tcp",
-		port: options.port,
-		codeFingerprint,
-		startedAt: serviceStartedAt,
-	})
+	const closeBaseResources = async () => {
+		try { await closeWorkspaceHost() } catch {}
+		try { await closeModelIoLogDb() } catch {}
+		closeDefaultModelApiMetrics()
+		setModelIoLogDiagnostics(undefined)
+		try { await diagnostics.close() } catch {}
+	}
+	let db
+	try {
+		db = await openOwnedServerPersistence({ recoverRunningRuns: true, diagnostics })
+	} catch (error) {
+		await closeBaseResources()
+		throw error
+	}
+	const closeOwnedResources = async () => {
+		try { hub.closeAll?.() } catch {}
+		try { await db.finishServiceRun(serviceRunId, { status: "clean_exit", reason: shutdownReason }) } catch {}
+		let persistenceCloseError
+		try { await db.close() } catch (error) { persistenceCloseError = error }
+		await closeBaseResources()
+		if (persistenceCloseError) throw persistenceCloseError
+	}
+	try {
+		await recoverPendingPromptImageAttachments(db, {
+			diagnostics,
+			onError: (error, reservation) => console.error(
+				`Could not recover pending prompt image ${reservation.id} for session ${reservation.sessionId}: ${error?.message ?? error}`,
+			),
+		})
+		await db.recoverServiceRuns(undefined, serviceRunId)
+		await db.startServiceRun({
+			id: serviceRunId,
+			pid: process.pid,
+			cwd: serviceCwd,
+			transport: "tcp",
+			port: options.port,
+			codeFingerprint,
+			startedAt: serviceStartedAt,
+		})
+	} catch (error) {
+		shutdownReason = "startup_failed"
+		try { await closeOwnedResources() } catch {}
+		throw error
+	}
 	let serviceModelOverride = false
 	let serviceEndpoint = /** @type {{ host?: string, port?: number, requestedPort?: number, portFallback?: boolean }} */ ({ host: options.host, port: options.port, requestedPort: options.port, portFallback: false })
 	let webServer = /** @type {any} */ (undefined)
@@ -188,15 +256,22 @@ async function startServiceWithWorkspaceHost(options, startup) {
 		const port = Number(webOptions?.port ?? webServer?.port ?? serviceEndpoint.port)
 		return Number.isInteger(port) && port > 0 ? `http://localhost:${port}/` : undefined
 	}
-	const manager = await RuntimeManager.create({
-		cwd: serviceCwd,
-		workspace,
-		createAgent: (info) => options.createAgent({ ...info, previewAccessToken }),
-		getSettings: () => serviceModelOverride ? serviceSettings : { ...serviceSettings, defaultModel: undefined },
-		getPreviewPublicUrl: webPreviewPublicUrl,
-		noContextFiles: options.noContextFiles === true,
-		diagnostics,
-	}, db, hub)
+	let manager
+	try {
+		manager = await RuntimeManager.create({
+			cwd: serviceCwd,
+			workspace,
+			createAgent: (info) => options.createAgent({ ...info, previewAccessToken }),
+			getSettings: () => serviceModelOverride ? serviceSettings : { ...serviceSettings, defaultModel: undefined },
+			getPreviewPublicUrl: webPreviewPublicUrl,
+			noContextFiles: options.noContextFiles === true,
+			diagnostics,
+		}, db, hub)
+	} catch (error) {
+		shutdownReason = "startup_failed"
+		try { await closeOwnedResources() } catch {}
+		throw error
+	}
 	manager.resumeRunnableInterruptedRuns().catch((err) => console.error("service auto-resume error", err))
 	let server
 	let serviceLiveServer
@@ -212,12 +287,23 @@ async function startServiceWithWorkspaceHost(options, startup) {
 	const runningRuntimes = () => [...manager.runtimes.values()].filter((runtime) => runtime.isStreaming())
 	const backgroundRuntimes = () => [...manager.runtimes.values()].filter((runtime) => runtime.hasBackgroundWork?.())
 	const waitingInfos = () => runningRuntimes().map((runtime) => runtime.waitingInfo())
+	const serverDatabasePath = serverDbPath()
+	const modelDatabasePath = modelIoLogDbPath()
+	const metricsDatabasePath = metricsDbPath()
 	diagnostics.setContextProvider?.(() => ({
 		activeRequests,
 		liveSubscriptions: hub.subscriptionCount(),
 		webActive: Boolean(webServer),
 		runningSessions: runningRuntimes().length,
 		runningSessionIds: runningRuntimes().map((runtime) => runtime.sessionId),
+		sqliteFiles: {
+			server: sqliteFileContext(serverDatabasePath),
+			modelIo: sqliteFileContext(modelDatabasePath),
+			metrics: sqliteFileContext(metricsDatabasePath),
+		},
+		modelIoLog: modelIoLogStatus(),
+		serverPersistence: db.status(),
+		modelApiMetrics: defaultModelApiMetricsStatus(),
 		backgroundSessions: backgroundRuntimes().length,
 		waiting: waitingInfos().length,
 	}))
@@ -334,10 +420,10 @@ async function startServiceWithWorkspaceHost(options, startup) {
 		await appendServiceLog("service_idle_shutdown_disabled", { serviceRunId })
 		return { ok: true, ...serviceIdleShutdownInfo(idleShutdownDelayMs) }
 	}
-	const resolveSessionId = (id) => {
+	const resolveSessionId = async (id) => {
 		const requested = String(id ?? "").trim()
 		if (!requested) throw Object.assign(new Error("session id is required"), { status: 400 })
-		const matches = db.findSessionIdsByPrefix(requested)
+		const matches = await db.findSessionIdsByPrefix(requested)
 		if (matches.includes(requested)) return requested
 		if (matches.length === 1) return matches[0]
 		if (matches.length > 1) throw Object.assign(new Error(`ambiguous session id ${requested}`), { status: 400 })
@@ -435,6 +521,7 @@ async function startServiceWithWorkspaceHost(options, startup) {
 		const webApp = await createManagerWebApp({
 			cwd: serviceCwd,
 			manager,
+			diagnostics,
 			hub,
 			db,
 			host: desired.host,
@@ -454,11 +541,11 @@ async function startServiceWithWorkspaceHost(options, startup) {
 			getSettings: () => serviceSettings,
 			setDefaultModel: async (model) => {
 				serviceModelOverride = true
-				serviceSettings = await updateDefaultModel(model, serviceSettings)
+				replaceServiceSettings(await updateDefaultModel(model, serviceSettings))
 				return serviceSettings
 			},
 			setDefaultReasoning: async (level) => {
-				serviceSettings = await updateSetting("thinkingLevel", /** @type {any} */ (level))
+				replaceServiceSettings(await updateSetting("thinkingLevel", /** @type {any} */ (level)))
 				return serviceSettings
 			},
 		}, appOptions)
@@ -482,11 +569,11 @@ async function startServiceWithWorkspaceHost(options, startup) {
 		getSettings: () => serviceSettings,
 		setDefaultModel: async (model) => {
 			serviceModelOverride = true
-			serviceSettings = await updateDefaultModel(model, serviceSettings)
+			replaceServiceSettings(await updateDefaultModel(model, serviceSettings))
 			return serviceSettings
 		},
 		setDefaultReasoning: async (level) => {
-			serviceSettings = await updateSetting("thinkingLevel", /** @type {any} */ (level))
+			replaceServiceSettings(await updateSetting("thinkingLevel", /** @type {any} */ (level)))
 			return serviceSettings
 		},
 	})
@@ -509,6 +596,7 @@ async function startServiceWithWorkspaceHost(options, startup) {
 	})
 	serviceLiveServer = createLiveResourceWebSocketServer({
 		path: `${SERVICE_ROUTE_PREFIX}/live`,
+		diagnostics,
 		resources: {
 			app: createAppLiveResource({ api: serviceApi, hub }),
 			sessions: sessionLists,
@@ -738,11 +826,25 @@ async function startServiceWithWorkspaceHost(options, startup) {
 				duplex: body ? "half" : undefined,
 				signal: requestAbort.signal,
 			}))
-			finishRequest({ status: response.status })
 			const headers = Object.fromEntries(response.headers)
 			outgoing.writeHead(response.status, headers)
-			await writeResponseBody(incoming, outgoing, response)
+			const endWrite = diagnostics.span("service.response.write", {
+				method: incoming.method,
+				path: requestPath,
+				status: response.status,
+			})
+			let responseBytes = 0
+			let writeFailed = false
+			try {
+				responseBytes = await writeResponseBody(incoming, outgoing, response)
+			} catch (err) {
+				writeFailed = true
+				throw err
+			} finally {
+				endWrite({ responseBytes, ...(writeFailed ? { error: true } : {}) })
+			}
 			if (!outgoing.destroyed) await new Promise((resolve) => outgoing.end(resolve))
+			finishRequest({ status: response.status, responseBytes })
 			finishActiveRequest()
 		} catch (err) {
 			finishRequest({ error: true })
@@ -787,93 +889,23 @@ async function startServiceWithWorkspaceHost(options, startup) {
 			})
 	})
 
-	const listenHost = serviceHostForListen(options.host)
-	const listenResult = await listenTcpEndpoint(server, listenHost, options.port ?? 0, { allowPortFallback: options.allowPortFallback })
-	const address = server.address()
-	const host = serviceHostForListen(options.host)
-	const port = typeof address === "object" && address ? address.port : options.port
-	const requestedPort = listenResult.requestedPort
-	const portFallback = listenResult.portFallback
-	serviceEndpoint = { host, port, requestedPort, portFallback }
-	const serviceInfoDir = serviceDir()
-	serviceInfoFile = join(serviceInfoDir, "service.json")
-	serviceInfo = {
-		pid: process.pid,
-		cwd: serviceCwd,
-		transport: "tcp",
-		host,
-		port,
-		requestedPort,
-		portFallback,
-		token: serviceToken,
-		serviceRunId,
-		protocolVersion: SERVICE_PROTOCOL_VERSION,
-		codeFingerprint,
-		runtimeKey: runtimeIdentity.runtimeKey,
-		packageName: runtimeIdentity.packageName,
-		packageVersion: runtimeIdentity.packageVersion,
-		mainPath,
-		sourceRoot,
-		packageRoot,
-		execPath: process.execPath,
-		argv: process.argv,
-		startedAt: serviceStartedAt,
-		...serviceIdleShutdownInfo(idleShutdownDelayMs),
+	const processHandlers = []
+	const removeProcessHandlers = () => {
+		for (const [event, handler] of processHandlers.splice(0)) process.removeListener?.(event, handler)
 	}
-	db.startServiceRun({
-		id: serviceRunId,
-		pid: process.pid,
-		cwd: serviceCwd,
-		transport: "tcp",
-		port,
-		codeFingerprint,
-		runtimeKey: runtimeIdentity.runtimeKey,
-		packageName: runtimeIdentity.packageName,
-		packageVersion: runtimeIdentity.packageVersion,
-		mainPath,
-		sourceRoot,
-		packageRoot,
-		execPath: process.execPath,
-		argv: process.argv,
-		startedAt: serviceStartedAt,
-	})
-	await mkdir(serviceInfoDir, { recursive: true })
-	if (options.serviceLifecycleOperationId) {
-		let supersededDetails = null
-		await withServiceLifecycleLock(async () => {
-			const operation = await readLifecycleOperationUnlocked()
-			if (!serviceStartupLifecycleCurrent(operation, options.serviceLifecycleOperationId, serviceRunId)) {
-				supersededDetails = serviceStartupLifecycleSupersededDetails(options.serviceLifecycleOperationId, serviceRunId, operation)
-				return
-			}
-			await writePrivateJson(serviceInfoFile, serviceInfo)
-		})
-		if (supersededDetails) {
-			await appendServiceLog("service_startup_lifecycle_superseded", supersededDetails)
-			throw lifecycleSupersededError("Service startup lifecycle operation was superseded")
-		}
-	} else {
-		await writePrivateJson(serviceInfoFile, serviceInfo)
-	}
-	await appendServiceLog("service_started", { pid: process.pid, serviceRunId, cwd: serviceCwd, transport: "tcp", host, port, requestedPort, portFallback, codeFingerprint, runtimeKey: runtimeIdentity.runtimeKey })
-	startOwnershipChecks()
-	codexUsagePoller = startCodexUsagePoller({ getSettings: () => serviceSettings })
-
-	const cleanup = async () => {
+	const performCleanup = async () => {
 		if (closed) return
 		closed = true
+		removeProcessHandlers()
 		clearIdleTimer()
 		clearOwnershipCheckTimer()
 		try { codexUsagePoller.close() } catch {}
 		try { serviceLiveServer?.close() } catch {}
-		try { hub.closeAll?.() } catch {}
 		try { await stopWeb() } catch {}
 		try { server.close() } catch {}
 		try { manager.dispose() } catch {}
-		try { await closeWorkspaceHost() } catch {}
-		try { db.finishServiceRun(serviceRunId, { status: "clean_exit", reason: shutdownReason }) } catch {}
-		try { db.close() } catch {}
-		try { await diagnostics.close() } catch {}
+		let cleanupError
+		try { await closeOwnedResources() } catch (error) { cleanupError = error }
 		let info = null
 		try {
 			info = normalizeServiceInfo(JSON.parse(await readFile(serviceInfoFile, "utf-8")), serviceInfoFile)
@@ -885,35 +917,121 @@ async function startServiceWithWorkspaceHost(options, startup) {
 		} else {
 			await appendServiceLog("cleanup_skipped_foreign_service_info", { serviceRunId, ownerServiceRunId: info.serviceRunId, ownerPid: info.pid })
 		}
+		if (cleanupError) throw cleanupError
 	}
-	process.once("SIGINT", () => {
+	let cleanupPromise
+	const cleanup = () => {
+		if (!cleanupPromise) cleanupPromise = performCleanup()
+		return cleanupPromise
+	}
+
+	try {
+		const listenHost = serviceHostForListen(options.host)
+		const listenResult = await listenTcpEndpoint(server, listenHost, options.port ?? 0, { allowPortFallback: options.allowPortFallback })
+		const address = server.address()
+		const host = serviceHostForListen(options.host)
+		const port = typeof address === "object" && address ? address.port : options.port
+		const requestedPort = listenResult.requestedPort
+		const portFallback = listenResult.portFallback
+		serviceEndpoint = { host, port, requestedPort, portFallback }
+		const serviceInfoDir = serviceDir()
+		serviceInfoFile = join(serviceInfoDir, "service.json")
+		serviceInfo = {
+			pid: process.pid,
+			cwd: serviceCwd,
+			transport: "tcp",
+			host,
+			port,
+			requestedPort,
+			portFallback,
+			token: serviceToken,
+			serviceRunId,
+			protocolVersion: SERVICE_PROTOCOL_VERSION,
+			codeFingerprint,
+			runtimeKey: runtimeIdentity.runtimeKey,
+			packageName: runtimeIdentity.packageName,
+			packageVersion: runtimeIdentity.packageVersion,
+			mainPath,
+			sourceRoot,
+			packageRoot,
+			execPath: process.execPath,
+			argv: process.argv,
+			startedAt: serviceStartedAt,
+			...serviceIdleShutdownInfo(idleShutdownDelayMs),
+		}
+		await db.startServiceRun({
+			id: serviceRunId,
+			pid: process.pid,
+			cwd: serviceCwd,
+			transport: "tcp",
+			port,
+			codeFingerprint,
+			runtimeKey: runtimeIdentity.runtimeKey,
+			packageName: runtimeIdentity.packageName,
+			packageVersion: runtimeIdentity.packageVersion,
+			mainPath,
+			sourceRoot,
+			packageRoot,
+			execPath: process.execPath,
+			argv: process.argv,
+			startedAt: serviceStartedAt,
+		})
+		await mkdir(serviceInfoDir, { recursive: true })
+		if (options.serviceLifecycleOperationId) {
+			let supersededDetails = null
+			await withServiceLifecycleLock(async () => {
+				const operation = await readLifecycleOperationUnlocked()
+				if (!serviceStartupLifecycleCurrent(operation, options.serviceLifecycleOperationId, serviceRunId)) {
+					supersededDetails = serviceStartupLifecycleSupersededDetails(options.serviceLifecycleOperationId, serviceRunId, operation)
+					return
+				}
+				await writePrivateJson(serviceInfoFile, serviceInfo)
+			})
+			if (supersededDetails) {
+				await appendServiceLog("service_startup_lifecycle_superseded", supersededDetails)
+				throw lifecycleSupersededError("Service startup lifecycle operation was superseded")
+			}
+		} else {
+			await writePrivateJson(serviceInfoFile, serviceInfo)
+		}
+		await appendServiceLog("service_started", { pid: process.pid, serviceRunId, cwd: serviceCwd, transport: "tcp", host, port, requestedPort, portFallback, codeFingerprint, runtimeKey: runtimeIdentity.runtimeKey })
+		startOwnershipChecks()
+		codexUsagePoller = startCodexUsagePoller({ getSettings: () => serviceSettings })
+	} catch (error) {
+		shutdownReason = "startup_failed"
+		try { await cleanup() } catch {}
+		throw error
+	}
+	const onSigint = () => {
 		shutdownReason = "signal_SIGINT"
 		exitAfterCleanup(0).catch((err) => {
 			console.error("service shutdown error", err)
 			if (!options.onIdle) process.exit(1)
 		})
-	})
-	process.once("SIGTERM", () => {
+	}
+	const onSigterm = () => {
 		shutdownReason = "signal_SIGTERM"
 		exitAfterCleanup(0).catch((err) => {
 			console.error("service shutdown error", err)
 			if (!options.onIdle) process.exit(1)
 		})
-	})
-	process.once("exit", () => {
-		if (!closed) {
-			try { db.finishServiceRun(serviceRunId, { status: "process_exit", reason: "process_exit_without_cleanup" }) } catch {}
-			try { void closeWorkspaceHost().catch(() => {}) } catch {}
-		}
+	}
+	const onExit = () => {
+		if (!closed) try { void closeWorkspaceHost().catch(() => {}) } catch {}
 		try { manager.dispose() } catch {}
-		try { db.close() } catch {}
-	})
+		closeDefaultModelApiMetrics()
+		setModelIoLogDiagnostics(undefined)
+	}
+	processHandlers.push(["SIGINT", onSigint], ["SIGTERM", onSigterm], ["exit", onExit])
+	process.once("SIGINT", onSigint)
+	process.once("SIGTERM", onSigterm)
+	process.once("exit", onExit)
 	let startupWeb = null
 	try {
 		if (options.startWeb === true) startupWeb = await startWeb({})
 	} catch (err) {
 		shutdownReason = "web_startup_failed"
-		await cleanup()
+		try { await cleanup() } catch {}
 		throw err
 	}
 	scheduleIdleCheck()

@@ -109,65 +109,69 @@ export function cachedPreviewRowsFromOverview(row) {
 	return rows
 }
 
-// For active ancestors, session_entry_refs.seq is root-to-leaf order because parents are referenced before children. Use it to choose the two preview target entries before loading message blocks.
+// For active ancestors, session_entries.seq is root-to-leaf order because parents are stored before children. Use it to choose the two preview target entries before loading message blocks.
 export function previewMessagesForSelectedSql(selectedValuesSql) {
 	return `
 		WITH RECURSIVE
 			selected(ord, session_id) AS (
 				VALUES ${selectedValuesSql}
 			),
-			leaf(ord, session_id, global_id) AS (
+			leaf(ord, session_id, entry_id) AS (
 				SELECT selected.ord, selected.session_id, COALESCE(
-					s.active_leaf_global_id,
 					(
-						SELECT ser.global_id
-						FROM session_entry_refs ser
-						JOIN conversation_entries ce ON ce.global_id = ser.global_id
-						WHERE ser.session_id = selected.session_id AND ce.id = s.active_leaf_entry_id
+						SELECT se.entry_id
+						FROM session_entries se
+						WHERE se.session_id = selected.session_id AND se.entry_id = s.active_leaf_entry_id
 						LIMIT 1
 					),
 					(
-						SELECT ser.global_id
-						FROM session_entry_refs ser
-						WHERE ser.session_id = selected.session_id
-						ORDER BY ser.seq DESC
+						SELECT se.entry_id
+						FROM session_entries se
+						WHERE se.session_id = selected.session_id
+						ORDER BY se.seq DESC
 						LIMIT 1
 					)
 				)
 				FROM selected
 				JOIN sessions s ON s.id = selected.session_id AND s.deleted_at IS NULL
 			),
-			ancestors(ord, session_id, global_id, parent_global_id) AS (
-				SELECT leaf.ord, leaf.session_id, ce.global_id, ce.parent_global_id
+			ancestors(ord, session_id, entry_id, parent_entry_id) AS (
+				SELECT leaf.ord, leaf.session_id, se.entry_id, se.parent_entry_id
 				FROM leaf
-				JOIN conversation_entries ce ON ce.global_id = leaf.global_id
+				JOIN session_entries se ON se.session_id = leaf.session_id AND se.entry_id = leaf.entry_id
 				UNION ALL
-				SELECT ancestors.ord, ancestors.session_id, parent.global_id, parent.parent_global_id
+				SELECT ancestors.ord, ancestors.session_id, parent.entry_id, parent.parent_entry_id
 				FROM ancestors
-				JOIN conversation_entries parent ON parent.global_id = ancestors.parent_global_id
+				JOIN session_entries parent
+					ON parent.session_id = ancestors.session_id
+					AND parent.entry_id = ancestors.parent_entry_id
 			),
 			visible_entries AS (
 				SELECT
 					ancestors.ord AS ord,
 					ancestors.session_id AS sessionId,
-					ancestors.global_id AS globalId,
-					ser.seq AS seq,
+					se.global_id AS globalId,
+					se.entry_id AS entryId,
+					se.timestamp AS timestamp,
+					se.seq AS seq,
 					em.role AS role
 				FROM ancestors
-				JOIN session_entry_refs ser ON ser.session_id = ancestors.session_id AND ser.global_id = ancestors.global_id
-				JOIN entry_messages em ON em.global_id = ancestors.global_id
+				JOIN session_entries se ON se.session_id = ancestors.session_id AND se.entry_id = ancestors.entry_id
+				JOIN entry_messages em ON em.global_id = se.global_id
 				WHERE NOT (${HIDDEN_MESSAGE_EXTRA_SQL})
 					AND NOT (${PROJECT_CONTEXT_EXTRA_SQL})
 				UNION ALL
 				SELECT
 					ancestors.ord AS ord,
 					ancestors.session_id AS sessionId,
-					ancestors.global_id AS globalId,
-					ser.seq AS seq,
+					se.global_id AS globalId,
+					se.entry_id AS entryId,
+					se.timestamp AS timestamp,
+					se.seq AS seq,
 					'${BASH_SHORTCUT_MESSAGE_ROLE}' AS role
 				FROM ancestors
-				JOIN session_entry_refs ser ON ser.session_id = ancestors.session_id AND ser.global_id = ancestors.global_id
-				JOIN entry_custom_entries ece ON ece.global_id = ancestors.global_id
+				JOIN session_entries se ON se.session_id = ancestors.session_id AND se.entry_id = ancestors.entry_id
+				JOIN entry_custom_entries ece ON ece.global_id = se.global_id
 				WHERE ece.custom_type = '${BASH_SHORTCUT_CUSTOM_TYPE}'
 			),
 			preview_seqs AS (
@@ -185,7 +189,9 @@ export function previewMessagesForSelectedSql(selectedValuesSql) {
 					'first' AS previewKind,
 					visible_entries.ord AS ord,
 					visible_entries.sessionId AS sessionId,
-					visible_entries.globalId AS globalId
+					visible_entries.globalId AS globalId,
+					visible_entries.entryId AS entryId,
+					visible_entries.timestamp AS timestamp
 				FROM preview_seqs
 				JOIN visible_entries ON visible_entries.ord = preview_seqs.ord
 					AND visible_entries.sessionId = preview_seqs.sessionId
@@ -197,7 +203,9 @@ export function previewMessagesForSelectedSql(selectedValuesSql) {
 					'lastUser' AS previewKind,
 					visible_entries.ord AS ord,
 					visible_entries.sessionId AS sessionId,
-					visible_entries.globalId AS globalId
+					visible_entries.globalId AS globalId,
+					visible_entries.entryId AS entryId,
+					visible_entries.timestamp AS timestamp
 				FROM preview_seqs
 				JOIN visible_entries ON visible_entries.ord = preview_seqs.ord
 					AND visible_entries.sessionId = preview_seqs.sessionId
@@ -207,8 +215,8 @@ export function previewMessagesForSelectedSql(selectedValuesSql) {
 		SELECT
 			preview_targets.previewKind,
 			preview_targets.sessionId,
-			ce.id AS entryId,
-			ce.timestamp AS timestamp,
+			preview_targets.entryId AS entryId,
+			preview_targets.timestamp AS timestamp,
 			COALESCE(em.role, CASE WHEN ece.custom_type = '${BASH_SHORTCUT_CUSTOM_TYPE}' THEN '${BASH_SHORTCUT_MESSAGE_ROLE}' END) AS role,
 			CASE WHEN ece.custom_type = '${BASH_SHORTCUT_CUSTOM_TYPE}' THEN 'array' ELSE em.content_format END AS contentFormat,
 			CASE WHEN ece.custom_type = '${BASH_SHORTCUT_CUSTOM_TYPE}' THEN
@@ -230,7 +238,6 @@ export function previewMessagesForSelectedSql(selectedValuesSql) {
 				) mb
 			) END AS blocksJson
 		FROM preview_targets
-		JOIN conversation_entries ce ON ce.global_id = preview_targets.globalId
 		LEFT JOIN entry_messages em ON em.global_id = preview_targets.globalId
 		LEFT JOIN entry_custom_entries ece ON ece.global_id = preview_targets.globalId AND ece.custom_type = '${BASH_SHORTCUT_CUSTOM_TYPE}'
 		WHERE em.global_id IS NOT NULL OR ece.global_id IS NOT NULL
@@ -262,17 +269,16 @@ function overviewLeavesForSessionBatch(db, ids) {
 			selected.session_id AS sessionId,
 			COALESCE(
 				(
-					SELECT ce.id
-					FROM conversation_entries ce
-					WHERE ce.global_id = s.active_leaf_global_id
+					SELECT se.entry_id
+					FROM session_entries se
+					WHERE se.session_id = selected.session_id AND se.entry_id = s.active_leaf_entry_id
+					LIMIT 1
 				),
-				s.active_leaf_entry_id,
 				(
-					SELECT ce.id
-					FROM session_entry_refs ser
-					JOIN conversation_entries ce ON ce.global_id = ser.global_id
-					WHERE ser.session_id = selected.session_id
-					ORDER BY ser.seq DESC
+					SELECT se.entry_id
+					FROM session_entries se
+					WHERE se.session_id = selected.session_id
+					ORDER BY se.seq DESC
 					LIMIT 1
 				)
 			) AS activeLeafEntryId

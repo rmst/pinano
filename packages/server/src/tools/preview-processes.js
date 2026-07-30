@@ -1,11 +1,11 @@
 import { spawn } from "node:child_process"
-import { createWriteStream, existsSync, mkdirSync } from "node:fs"
-import { dirname, resolve } from "node:path"
+import { createWriteStream, existsSync } from "node:fs"
+import { isAbsolute, relative, resolve, sep } from "node:path"
 
+import { preparePreviewLogPathSync } from "../app/preview/log-files.js"
 import { previewLogPath } from "../app/preview/manifest.js"
 import { envForToolSubprocess } from "./tool-env.js"
 
-const DEFAULT_SHELL = existsSync("/bin/bash") ? "/bin/bash" : "sh"
 const MAX_CAPTURE_BYTES = 256 * 1024
 const DEFAULT_STOP_FORCE_AFTER_MS = 1000
 
@@ -28,9 +28,13 @@ function killProcessGroup(pid, signalName) {
 	}
 }
 
-function resolveWorkdir(baseCwd) {
+function resolveWorkdir(baseCwd, relativeCwd = ".") {
 	if (typeof baseCwd !== "string" || !baseCwd) throw new Error("Preview base working directory is required")
-	const cwd = resolve(baseCwd)
+	if (typeof relativeCwd !== "string" || !relativeCwd || isAbsolute(relativeCwd)) throw new Error("Preview working directory must be relative")
+	const root = resolve(baseCwd)
+	const cwd = resolve(root, relativeCwd)
+	const path = relative(root, cwd)
+	if (path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path)) throw new Error("Preview working directory must stay within its base directory")
 	if (!existsSync(cwd)) throw new Error(`Preview working directory does not exist: ${cwd}`)
 	return cwd
 }
@@ -38,7 +42,7 @@ function resolveWorkdir(baseCwd) {
 function openPreviewLog(logPath, preview) {
 	if (!logPath) return undefined
 	try {
-		mkdirSync(dirname(logPath), { recursive: true })
+		preparePreviewLogPathSync(logPath)
 		const append = preview.appendLog === true
 		const stream = createWriteStream(logPath, { flags: append ? "a" : "w", mode: 0o600 })
 		stream.on("error", () => {})
@@ -61,7 +65,8 @@ class PreviewProcess {
 		this.id = options.id
 		this.name = options.name
 		this.command = options.command
-		this.cwd = resolveWorkdir(options.baseCwd)
+		if (typeof this.command !== "string" || !this.command) throw new Error("Preview command must be a non-empty string")
+		this.cwd = resolveWorkdir(options.baseCwd, options.cwd)
 		this.port = options.port
 		this.host = options.host
 		this.publicUrl = options.publicUrl
@@ -75,7 +80,7 @@ class PreviewProcess {
 		this.appendLog = options.appendLog === true
 		this.log = openPreviewLog(this.logPath, this)
 
-		this.child = spawn(DEFAULT_SHELL, ["-c", this.command], {
+		this.child = spawn("/bin/sh", ["-c", this.command], {
 			cwd: this.cwd,
 			detached: true,
 			env: envForToolSubprocess({
@@ -83,10 +88,10 @@ class PreviewProcess {
 				CEREX_PREVIEW: "1",
 				CEREX_PREVIEW_ID: this.id,
 				CEREX_PREVIEW_NAME: this.name,
-				CEREX_HOST: this.host,
-				CEREX_PORT: String(this.port),
-				CEREX_PUBLIC_URL: this.publicUrl,
-				...(this.logPath ? { CEREX_PREVIEW_LOG: this.logPath } : {}),
+				CEREX_PREVIEW_HOST: this.host,
+				CEREX_PREVIEW_PORT: String(this.port),
+				CEREX_PREVIEW_PUBLIC_URL: this.publicUrl,
+				...(this.logPath ? { CEREX_PREVIEW_LOG_PATH: this.logPath } : {}),
 			}, { toolCallId: `preview:${this.id}` }),
 			stdio: ["ignore", "pipe", "pipe"],
 		})

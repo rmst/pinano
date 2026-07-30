@@ -188,38 +188,87 @@ const config = ${config}
 const bar = document.getElementById("bar")
 const title = document.getElementById("title")
 const log = document.getElementById("log")
+const logText = document.createTextNode("")
 const restart = document.getElementById("restart")
 const infoUrl = document.getElementById("info-url")
 const infoStatus = document.getElementById("info-status")
 const infoLogPath = document.getElementById("info-log-path")
 let currentStatus = { state: "starting" }
 let currentLog = ""
+let renderedLog = ""
 let pollDelay = 350
 let opened = false
+let selectingLog = false
+
+log.appendChild(logText)
 
 function text(value) {
 	return value == null ? "" : String(value)
 }
 
+function selectionTouches(element) {
+	const selection = window.getSelection?.()
+	if (!selection || selection.isCollapsed) return false
+	if (element.contains(selection.anchorNode) || element.contains(selection.focusNode)) return true
+	try {
+		return selection.containsNode?.(element, true) === true
+	} catch {
+		return false
+	}
+}
+
+function setElementText(element, value) {
+	const next = text(value)
+	if (element.textContent === next || selectionTouches(element)) return
+	element.textContent = next
+}
+
+function logIsAtBottom() {
+	return log.scrollHeight - log.clientHeight - log.scrollTop <= 2
+}
+
+function updateLogText(next) {
+	if (next.startsWith(renderedLog)) {
+		logText.appendData(next.slice(renderedLog.length))
+	} else {
+		let start = 0
+		const sharedLength = Math.min(renderedLog.length, next.length)
+		while (start < sharedLength && renderedLog.charCodeAt(start) === next.charCodeAt(start)) start++
+
+		let previousEnd = renderedLog.length
+		let nextEnd = next.length
+		while (previousEnd > start && nextEnd > start && renderedLog.charCodeAt(previousEnd - 1) === next.charCodeAt(nextEnd - 1)) {
+			previousEnd--
+			nextEnd--
+		}
+		logText.replaceData(start, previousEnd - start, next.slice(start, nextEnd))
+	}
+	renderedLog = next
+}
+
 function setLog(value) {
 	currentLog = text(value)
-	log.textContent = currentLog || "[no preview output yet]"
+	const next = currentLog || "[no preview output yet]"
+	if (next === renderedLog || selectingLog || selectionTouches(log)) return
+	const followTail = logIsAtBottom()
+	updateLogText(next)
+	if (followTail) log.scrollTop = log.scrollHeight
 }
 
 function updateInfo() {
 	const state = text(currentStatus.state || "unknown")
-	infoUrl.textContent = config.targetUrl
+	setElementText(infoUrl, config.targetUrl)
 	infoUrl.title = config.targetUrl
-	infoStatus.textContent = state
+	setElementText(infoStatus, state)
 	infoStatus.dataset.state = state
-	infoLogPath.textContent = currentStatus.logPath || "Unavailable"
+	setElementText(infoLogPath, currentStatus.logPath || "Unavailable")
 	infoLogPath.title = currentStatus.logPath || "Unavailable"
 	bar.dataset.state = state
 	if (currentStatus.error) {
-		title.textContent = currentStatus.error
+		setElementText(title, currentStatus.error)
 		bar.classList.add("error")
 	} else {
-		title.textContent = config.autoOpenWhenReady && state === "ready" ? "Opening preview" : state === "ready" ? "Preview logs" : "Starting preview"
+		setElementText(title, config.autoOpenWhenReady && state === "ready" ? "Opening preview" : state === "ready" ? "Preview logs" : "Starting preview")
 		bar.classList.remove("error")
 	}
 }
@@ -281,7 +330,6 @@ async function poll() {
 		} else {
 			pollDelay = 350
 		}
-		log.scrollTop = log.scrollHeight
 	} catch (error) {
 		currentStatus = { state: "error", error: error && error.message ? error.message : String(error) }
 		updateInfo()
@@ -290,6 +338,14 @@ async function poll() {
 	setTimeout(poll, pollDelay)
 }
 
+log.addEventListener("pointerdown", () => {
+	selectingLog = true
+})
+for (const eventName of ["pointerup", "pointercancel", "blur"]) {
+	window.addEventListener(eventName, () => {
+		selectingLog = false
+	})
+}
 restart.addEventListener("click", () => {
 	restartPreview().catch((error) => {
 		currentStatus = { state: "error", error: error && error.message ? error.message : String(error) }
@@ -477,12 +533,71 @@ export function previewFrameBridgeScriptResponse() {
 		const maximum = Math.max(root.scrollHeight - window.innerHeight, 0)
 		return maximum ? Math.min(Math.max(root.scrollTop / maximum, 0), 1) : 0
 	}
+	let sourceAnchorCache
+	const invalidateSourceAnchors = () => { sourceAnchorCache = undefined }
+	const sourceAnchors = () => {
+		if (sourceAnchorCache) return sourceAnchorCache
+		const root = document.scrollingElement || document.documentElement
+		const countElement = document.querySelector("[data-cerex-source-line-count]")
+		const lineCount = Number(countElement?.getAttribute("data-cerex-source-line-count"))
+		const candidates = [{ sourceLine: 1, scrollTop: 0 }]
+		let authored = 0
+		for (const element of document.querySelectorAll?.("[data-cerex-source-line]") ?? []) {
+			const sourceLine = Number(element.getAttribute("data-cerex-source-line"))
+			const rect = element.getBoundingClientRect()
+			if (!Number.isFinite(sourceLine) || sourceLine < 1 || (!rect.width && !rect.height)) continue
+			candidates.push({ sourceLine, scrollTop: root.scrollTop + rect.top })
+			authored++
+		}
+		if (!authored) return sourceAnchorCache = []
+		if (Number.isFinite(lineCount) && lineCount >= 1) candidates.push({ sourceLine: lineCount + 1, scrollTop: root.scrollHeight })
+		candidates.sort((left, right) => left.sourceLine - right.sourceLine || left.scrollTop - right.scrollTop)
+		const anchors = []
+		for (const anchor of candidates) {
+			const previous = anchors.at(-1)
+			if (!Number.isFinite(anchor.scrollTop) || anchor.scrollTop < 0 || previous?.sourceLine === anchor.sourceLine || (previous && anchor.scrollTop <= previous.scrollTop)) continue
+			anchors.push(anchor)
+		}
+		return sourceAnchorCache = anchors
+	}
+	if (typeof window.MutationObserver === "function") {
+		new window.MutationObserver(invalidateSourceAnchors).observe(document.documentElement, { attributes: true, characterData: true, childList: true, subtree: true })
+	}
+	let sourceResizeObserver
+	if (typeof window.ResizeObserver === "function") {
+		sourceResizeObserver = new window.ResizeObserver(invalidateSourceAnchors)
+		sourceResizeObserver.observe(document.documentElement)
+	}
+	window.addEventListener("load", () => {
+		if (document.body) sourceResizeObserver?.observe(document.body)
+		invalidateSourceAnchors()
+	})
+	window.addEventListener("resize", invalidateSourceAnchors)
+	const interpolateSourceAnchor = (anchors, value, input, output) => {
+		if (!anchors.length || !Number.isFinite(value)) return undefined
+		if (value <= anchors[0][input]) return anchors[0][output]
+		for (let index = 1; index < anchors.length; index++) {
+			const next = anchors[index]
+			if (value > next[input]) continue
+			const previous = anchors[index - 1]
+			const span = next[input] - previous[input]
+			if (span <= 0) return next[output]
+			return previous[output] + (value - previous[input]) / span * (next[output] - previous[output])
+		}
+		return anchors.at(-1)[output]
+	}
+	const currentSourceLine = () => {
+		const root = document.scrollingElement || document.documentElement
+		return interpolateSourceAnchor(sourceAnchors(), root.scrollTop, "scrollTop", "sourceLine")
+	}
 	const postScroll = (cause, sequence) => {
+		const sourceLine = currentSourceLine()
 		parentPostMessage({
 			source,
 			kind: "scroll",
 			cause,
 			ratio: scrollRatio(),
+			...(Number.isFinite(sourceLine) ? { sourceLine } : {}),
 			...(Number.isFinite(sequence) ? { sequence } : {}),
 		}, "*")
 	}
@@ -527,10 +642,31 @@ export function previewFrameBridgeScriptResponse() {
 		parentPostMessage({ source, kind: "zoom", command }, "*")
 	}, true)
 
-	const anchorForClick = (event) => {
+	const linkForClick = (event) => {
 		const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target]
-		return path.find((node) => node?.tagName?.toLowerCase?.() === "a" && typeof node.getAttribute === "function")
+		return path.find((node) => ["a", "area"].includes(node?.tagName?.toLowerCase?.()) && typeof node.getAttribute === "function")
 	}
+	const openExternalLink = (event) => {
+		if (!connected || !capability || event.defaultPrevented || !event.isTrusted || event.altKey) return
+		const linkActivation = (event.type === "click" && event.button === 0) || (event.type === "auxclick" && event.button === 1)
+		if (!linkActivation) return
+		const link = linkForClick(event)
+		if (!link || link.hasAttribute("download")) return
+		const href = link.getAttribute("href")
+		if (!href) return
+		let url
+		try {
+			url = new URL(href, document.baseURI || window.location.href)
+		} catch {
+			return
+		}
+		if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin === window.location.origin) return
+		event.preventDefault()
+		stopImmediatePropagation(event)
+		parentPostMessage({ source, kind: "open-external", url: url.href, capability }, "*")
+	}
+	window.addEventListener("click", openExternalLink, true)
+	window.addEventListener("auxclick", openExternalLink, true)
 	const navigateDocumentLink = async (endpoint) => {
 		if (!bridgeFetch) {
 			window.location.href = endpoint.href
@@ -552,11 +688,11 @@ export function previewFrameBridgeScriptResponse() {
 	if (documentLinks && openDocumentPath) {
 		window.addEventListener("click", (event) => {
 			if (event.defaultPrevented || !event.isTrusted || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
-			const anchor = anchorForClick(event)
-			if (!anchor || anchor.hasAttribute("download")) return
-			const targetName = (anchor.getAttribute("target") || "").trim().toLowerCase()
+			const link = linkForClick(event)
+			if (!link || link.hasAttribute("download")) return
+			const targetName = (link.getAttribute("target") || "").trim().toLowerCase()
 			if (targetName && targetName !== "_self" && targetName !== "_blank") return
-			const href = anchor.getAttribute("href")
+			const href = link.getAttribute("href")
 			if (!href || href.startsWith("#")) return
 			let resolved
 			let base
@@ -599,10 +735,14 @@ export function previewFrameBridgeScriptResponse() {
 			const root = document.scrollingElement || document.documentElement
 			const maximum = Math.max(root.scrollHeight - window.innerHeight, 0)
 			const ratio = Math.min(Math.max(message.ratio, 0), 1)
+			const sourceScrollTop = interpolateSourceAnchor(sourceAnchors(), message.sourceLine, "sourceLine", "scrollTop")
+			const scrollTop = (ratio === 0 || ratio === 1 || !Number.isFinite(sourceScrollTop))
+				? ratio * maximum
+				: Math.min(Math.max(sourceScrollTop, 0), maximum)
 			const generation = ++scrollCommandGeneration
 			cancelUserScrollReport()
 			applyingScrollCommand = true
-			window.scrollTo({ top: ratio * maximum, behavior: "instant" })
+			window.scrollTo({ top: scrollTop, behavior: "instant" })
 			postScroll("command", message.sequence)
 			requestAnimationFrame(() => {
 				requestAnimationFrame(() => {

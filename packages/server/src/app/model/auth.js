@@ -1,5 +1,5 @@
 import { refreshCodex } from "../../ai-apis/codex/oauth.js"
-import { getCredential, resolveApiKey, updateCredential } from "../auth/credentials.js"
+import { getCredential, refreshCredential, resolveApiKey } from "../auth/credentials.js"
 
 const CODEX_REFRESH_SKEW_MS = 60_000
 const CODEX_REFRESH_LOCK_WAIT_MS = 30_000
@@ -28,7 +28,7 @@ function codexCredentialNeedsRefresh(cred) {
 export async function getFreshCodexCredential() {
 	const cred = requireCodexCredential(await getCredential("openai-codex"))
 	if (!codexCredentialNeedsRefresh(cred)) return cred
-	return await updateCredential("openai-codex", async (current) => {
+	return await refreshCredential("openai-codex", async (current) => {
 		const locked = requireCodexCredential(current)
 		if (!codexCredentialNeedsRefresh(locked)) return locked
 		const fresh = await refreshCodex(locked.refresh)

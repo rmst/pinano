@@ -29,7 +29,7 @@ export const SERVICE_UPGRADE_EXIT_GRACE_MS = 15000
 export const SERVICE_UPGRADE_EXIT_POLL_MS = 100
 export const SERVICE_STOP_SOFT_WAIT_MS = 5000
 export const SERVICE_STOP_EXIT_WAIT_MS = 5000
-export const SERVICE_STARTUP_TIMEOUT_MS = 15000
+export const SERVICE_STARTUP_TIMEOUT_MS = 5 * 60 * 1000
 export const SERVICE_CONNECTIVITY_TIMEOUT_MS = 1500
 export const SERVICE_REQUEST_TIMEOUT_MS = 30000
 export const SERVICE_CLIENT_RUNTIME_CHECK_INTERVAL_MS = 1000
@@ -81,9 +81,9 @@ export async function appendServiceLog(event, details = {}) {
 	} catch {}
 }
 
-export async function openOwnedServerDb(options) {
-	const { openServerDb } = await import("../database/index.js")
-	return openServerDb(options)
+export async function openOwnedServerPersistence(options) {
+	const { openServerPersistence } = await import("../database/persistence.js")
+	return openServerPersistence(options)
 }
 
 export function servicePid(info) {

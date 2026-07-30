@@ -1,6 +1,38 @@
 import { createLiveResourceSession } from "./resource-server.js"
 import { acceptWebSocket, rejectWebSocketUpgrade } from "../websocket/server.js"
 
+function heapUsedBytes(diagnostics) {
+	if (diagnostics?.enabled !== true || typeof process.memoryUsage !== "function") return undefined
+	return process.memoryUsage().heapUsed
+}
+
+export function serializeLiveMessage(message, diagnostics) {
+	const heapUsedBeforeBytes = heapUsedBytes(diagnostics)
+	const end = diagnostics?.span?.("service.live.serialize", {
+		messageType: message?.type,
+		resource: message?.resource,
+		subscriptionId: message?.id,
+		sessionId: message?.data?.sessionId,
+	})
+	try {
+		const serialized = JSON.stringify(message)
+		if (typeof serialized !== "string") throw new TypeError("Live protocol messages must be JSON-serializable values")
+		const heapUsedAfterBytes = heapUsedBytes(diagnostics)
+		end?.({
+			serializedBytes: Buffer.byteLength(serialized),
+			...(heapUsedBeforeBytes === undefined || heapUsedAfterBytes === undefined ? {} : {
+				heapUsedBeforeBytes,
+				heapUsedAfterBytes,
+				heapDeltaBytes: heapUsedAfterBytes - heapUsedBeforeBytes,
+			}),
+		})
+		return serialized
+	} catch (err) {
+		end?.({ error: true })
+		throw err
+	}
+}
+
 /**
  * Bind live resources to one authenticated WebSocket path. Authentication and resources stay transport-independent; this object owns connection and resource cleanup.
  */
@@ -25,7 +57,7 @@ export function createLiveResourceWebSocketServer(options) {
 					connections.add(opened)
 					session = createLiveResourceSession({
 						resources: options.resources,
-						send: (message) => opened.sendJson(message),
+						send: (message) => opened.sendText(serializeLiveMessage(message, options.diagnostics)),
 					})
 				},
 				onMessage(message) {

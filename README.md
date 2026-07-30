@@ -1,10 +1,17 @@
 <p align="center">
-<img src="docs/assets/brand/cerex-logo.png" alt="Cerex logo" width="112">
+<a href="docs/assets/cerex-web-preview.png"><img src="docs/assets/cerex-web-preview.png" alt="Cerex Web showing project files, a rendered document, and agent sessions" width="100%"></a>
 </p>
 
-<h1 align="center">Cerex</h1>
+<p align="right">
+<picture>
+	<source media="(prefers-color-scheme: dark)" srcset="docs/assets/cerex-web-caption-dark.svg">
+	<img src="docs/assets/cerex-web-caption-light.svg" alt="Preview of Cerex Web IDE (coming soon)" width="260" height="14">
+</picture>
+</p>
 
-Cerex is an agent engine for durable, fault-tolerant AI sessions. The current open-source release focuses on coding and ships with a terminal client. The SDK is not fully stable yet; if you want to build on it, talk to us via *Issues* or email `simon@ramstedt.org`.
+<br>
+
+Cerex is an agent engine for durable, fault-tolerant AI sessions. The current open-source release focuses on coding and ships with a terminal client. The SDK is not fully stable yet; if you want to build on it, talk to us via *Issues* or email `simonramstedt@gmail.com`.
 
 Cerex matches the Codex CLI system prompt and tool profile without requiring its source tree or binary. Any other OpenAI-compatible API is also supported, with model-specific tool profiles for Kimi K3 and others in development.
 

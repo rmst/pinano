@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
 import { existsSync, realpathSync } from "node:fs"
-import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rm, stat } from "node:fs/promises"
+import { chmod, cp, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
@@ -11,9 +11,11 @@ import { applyProductEnvAliases } from "../../../../protocol/src/product.js"
 import { createSeatbeltSandboxArgs } from "../sandbox/seatbelt.js"
 import { environmentContainerHomePath, environmentHomePath, managedContainerHomePath, optionalProductHomePath, optionalRuntimeSourceReferencePath } from "../paths.js"
 import { ensureSessionWorkspaceDir } from "../session/workspaces.js"
-import { addWritableMountUnlessCovered, assertReadOnlyMountsNotCoveredByWritable, effectiveSandboxMounts, mountedPathForHostPath, pathIsWithin } from "../sandbox/paths.js"
+import { addWritableMountUnlessCovered, assertReadOnlyMountsNotCoveredByWritable, effectiveSandboxMounts, minimizeCoveredMounts, mountedPathForHostPath, pathIsWithin } from "../sandbox/paths.js"
+import { bubblewrapIsolationArgs, bubblewrapSecurityProbeArgs } from "../sandbox/bwrap/isolation.js"
 import { addImplicitStateMounts, addManagedContainerHomeMount, normalizeStateMount } from "./tool/state-mounts.js"
 import { bestEffortAutoInstallBundledBubblewrap, bundledBubblewrapBuildFromSourceEnabled, bundledBubblewrapDownloadInfo, verifiedCachedBundledBubblewrapPath } from "../sandbox/bwrap/bundled.js"
+import { preparePreviewLogPath } from "../preview/log-files.js"
 import { previewLogPath } from "../preview/manifest.js"
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -37,19 +39,67 @@ const managedPreviewContainerBindHost = "0.0.0.0"
 const managedPreviewRouteHost = "127.0.0.1"
 const managedContainerDiagnosticMaxChars = 4000
 const macosHomebrewPathEntries = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"]
-const bubblewrapProbeArgs = [
-	"--die-with-parent",
-	"--ro-bind", "/", "/",
-	"--dev", "/dev",
-	"--proc", "/proc",
-	"--tmpfs", "/tmp",
-	"--chdir", "/",
-	"/bin/sh", "-c", "true",
-]
+const bubblewrapProbeArgs = bubblewrapSecurityProbeArgs()
 
 /** @param {string} s */
 export function shellQuote(s) {
 	return `'${String(s).replaceAll("'", "'\\''")}'`
+}
+
+/** Run a command and preserve its exit status. Intended for bounded one-shot sandbox jobs. */
+function runCaptured(command, args, options = {}) {
+	return new Promise((resolve, reject) => {
+		const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"] })
+		const maxOutputBytes = options.maxOutputBytes ?? 8 * 1024 * 1024
+		let stdout = Buffer.alloc(0)
+		let stderr = Buffer.alloc(0)
+		let outputBytes = 0
+		let finished = false
+		let timeoutTimer
+		let killTimer
+		let stopError
+		let abort = () => {}
+		const finish = (err, result) => {
+			if (finished) return
+			finished = true
+			clearTimeout(timeoutTimer)
+			clearTimeout(killTimer)
+			options.signal?.removeEventListener("abort", abort)
+			if (err) reject(err)
+			else resolve(result)
+		}
+		const stop = (err, signal = "SIGKILL") => {
+			if (finished || stopError) return
+			stopError = err
+			child.kill(signal)
+			if (signal !== "SIGKILL") killTimer = setTimeout(() => child.kill("SIGKILL"), 1000)
+		}
+		const append = (current, chunk) => {
+			const value = Buffer.from(chunk)
+			outputBytes += value.length
+			if (outputBytes > maxOutputBytes) throw new Error(`Sandboxed command output exceeded ${maxOutputBytes} bytes`)
+			return Buffer.concat([current, value])
+		}
+		child.stdout.on("data", (chunk) => {
+			try { stdout = append(stdout, chunk) } catch (err) { stop(err) }
+		})
+		child.stderr.on("data", (chunk) => {
+			try { stderr = append(stderr, chunk) } catch (err) { stop(err) }
+		})
+		child.on("error", (err) => finish(err))
+		child.on("close", (exitCode, signal) => {
+			if (stopError) finish(stopError)
+			else finish(undefined, { stdout, stderr, exitCode: exitCode ?? (signal ? 128 : 1), signal })
+		})
+		abort = () => stop(new Error("Sandboxed command was cancelled"), "SIGTERM")
+		if (options.signal?.aborted) abort()
+		else options.signal?.addEventListener("abort", abort, { once: true })
+		if (Number.isFinite(options.timeoutMs)) timeoutTimer = setTimeout(() => stop(new Error("Sandboxed command timed out")), options.timeoutMs)
+		if (options.input !== undefined && !stopError) {
+			child.stdin.on("error", (err) => stop(err))
+			child.stdin.end(options.input)
+		}
+	})
 }
 
 function sourceReadyCheck(path) {
@@ -399,7 +449,7 @@ function bubblewrapArgs({ workdir, roots, writableRoots = [], readableRoots = []
 	const writeRoots = [...new Set([...roots, ...writableRoots].map((root) => resolve(root)))]
 	const tmpfsDirs = [...new Set([...writeRoots, ...readRoots].flatMap((root) => tmpfsDestinationDirs(root, tmpfsMounts)))]
 	return [
-		"--die-with-parent",
+		...bubblewrapIsolationArgs(),
 		"--ro-bind", "/", "/",
 		"--dev", "/dev",
 		"--proc", "/proc",
@@ -408,6 +458,7 @@ function bubblewrapArgs({ workdir, roots, writableRoots = [], readableRoots = []
 		...readRoots.flatMap((root) => ["--ro-bind", root, root]),
 		...writeRoots.flatMap((root) => ["--bind", root, root]),
 		"--chdir", workdir,
+		"--",
 		...command,
 	]
 }
@@ -966,6 +1017,120 @@ async function startManagedContainer({ engine, image, user, workdir, mounts, env
 	return name
 }
 
+function nativeCommandEnvironment(extra, scratch) {
+	const inherited = Object.fromEntries(["PATH", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR"]
+		.map((name) => [name, process.env[name]])
+		.filter(([, value]) => typeof value === "string"))
+	return { ...inherited, HOME: join(scratch, "home"), TMPDIR: join(scratch, "tmp"), TMP: join(scratch, "tmp"), TEMP: join(scratch, "tmp"), ...extra }
+}
+
+/**
+ * Run a short-lived shell script in an isolated sibling of a tool environment. The command gets the same project mounts, a fresh HOME, bounded output, and optional stdin; callers must never place secrets in `env` or command arguments.
+ * @param {{ sandbox?: any, cwd: string, mounts: any[], script: string, args?: string[], env?: Record<string, string>, input?: string | Buffer, signal?: AbortSignal, timeoutMs?: number }} options
+ */
+export async function runSandboxedScript(options) {
+	const sandbox = options.sandbox ?? { type: "none" }
+	if (sandbox.type === "container" && sandbox.container) throw new Error("Secure proxy commands are unavailable with a fixed shared container; configure a managed container image instead")
+	const hostScratch = await mkdtemp(join(tmpdir(), "cerex-sandbox-command-"))
+	const sandboxScratch = sandbox.type === "container" ? `/opt/${basename(hostScratch)}` : hostScratch
+	const sandboxRuntime = sandbox.type === "container" ? `/tmp/${basename(hostScratch)}` : hostScratch
+	const hostScript = join(hostScratch, "command.sh")
+	const sandboxScript = join(sandboxScratch, "command.sh")
+	try {
+		await chmod(hostScratch, 0o755)
+		await Promise.all([
+			mkdir(join(hostScratch, "home"), { recursive: true, mode: 0o700 }),
+			mkdir(join(hostScratch, "tmp"), { recursive: true, mode: 0o700 }),
+		])
+		await writeFile(hostScript, options.script, { mode: 0o755 })
+		await chmod(hostScript, 0o755)
+		if (sandbox.type === "container") {
+			const engine = await detectManagedContainerEngine(sandbox.engine)
+			const container = `cerex-sandbox-${randomUUID()}`
+			const mounts = containerMountsForRun(minimizeCoveredMounts([
+				...options.mounts,
+				{ from: hostScratch, to: sandboxScratch, readOnly: true },
+			]))
+			const env = {
+				HOME: join(sandboxRuntime, "home"),
+				TMPDIR: join(sandboxRuntime, "tmp"),
+				TMP: join(sandboxRuntime, "tmp"),
+				TEMP: join(sandboxRuntime, "tmp"),
+				...(options.env ?? {}),
+			}
+			const args = [
+				"run", "--rm", "--interactive",
+				"--name", container,
+				"--label", "app.cerex.managed=true",
+				"--cap-drop", "ALL",
+				"--security-opt", "no-new-privileges",
+				"--pids-limit", "256",
+				"--read-only",
+				"--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+				"--workdir", options.cwd,
+				...managedContainerUserArg(sandbox.user),
+				...containerEnvArgs(env),
+				...(sandbox.network ? ["--network", sandbox.network] : []),
+				...mounts.flatMap((mount) => ["--volume", volumeArg(mount)]),
+				sandbox.image ?? defaultManagedContainerImage,
+				"sh", sandboxScript, ...(options.args ?? []),
+			]
+			try {
+				return await runCaptured(engine, args, {
+					env: process.env,
+					input: options.input,
+					signal: options.signal,
+					timeoutMs: options.timeoutMs ?? 5 * 60 * 1000,
+				})
+			} finally {
+				const removed = await removeContainer(engine, container)
+				if (!removed) {
+					managedContainerCleanup(engine, container)()
+					throw new Error(`Failed to clean up sandboxed command container: ${container}`)
+				}
+			}
+		}
+
+		const readableRoots = options.mounts.map((mount) => mount.from)
+		const writableRoots = options.mounts.filter((mount) => !mount.readOnly).map((mount) => mount.from)
+		const env = nativeCommandEnvironment(options.env ?? {}, hostScratch)
+		const command = "/bin/sh"
+		let sandboxCommand
+		let sandboxArgs
+		if (process.platform === "darwin") {
+			const availability = await assertNativeSandboxAvailable({ platform: process.platform })
+			sandboxCommand = availability.command
+			sandboxArgs = createSeatbeltSandboxArgs({
+				command: [command, hostScript, ...(options.args ?? [])],
+				readableRoots: macosSeatbeltReadableRoots([...readableRoots, hostScratch], hostScript, command),
+				writableRoots: absolutePathVariantSet([...writableRoots, hostScratch]),
+			})
+		} else if (process.platform === "linux") {
+			await bestEffortAutoInstallBundledBubblewrap({ platform: process.platform })
+			const availability = await assertNativeSandboxAvailable({ platform: process.platform })
+			sandboxCommand = availability.command
+			sandboxArgs = bubblewrapArgs({
+				workdir: options.cwd,
+				roots: writableRoots,
+				writableRoots: [hostScratch],
+				readableRoots: [...readableRoots.filter((root) => !writableRoots.includes(root)), ...linuxBubblewrapReadableRoots(hostScript, command)],
+				command: [command, hostScript, ...(options.args ?? [])],
+			})
+		} else {
+			throw new Error(nativeSandboxUnsupportedMessage(process.platform))
+		}
+		return await runCaptured(sandboxCommand, sandboxArgs, {
+			cwd: options.cwd,
+			env,
+			input: options.input,
+			signal: options.signal,
+			timeoutMs: options.timeoutMs ?? 5 * 60 * 1000,
+		})
+	} finally {
+		await rm(hostScratch, { recursive: true, force: true })
+	}
+}
+
 function containerRemovalAlreadyComplete(output) {
 	return /\bno such container\b|\bno container with (?:name|id)\b|\bcontainer\b.*\b(?:does not exist|not found)\b|\b(?:does not exist|not found)\b.*\bcontainer\b/i.test(output)
 }
@@ -1069,25 +1234,35 @@ function managedPreviewEnv(options) {
 		CEREX_PREVIEW: "1",
 		CEREX_PREVIEW_ID: options.id,
 		CEREX_PREVIEW_NAME: options.name,
-		CEREX_HOST: options.bindHost,
-		CEREX_PORT: String(options.bindPort),
-		CEREX_PUBLIC_URL: options.publicUrl,
-		...(options.logPath ? { CEREX_PREVIEW_LOG: options.logPath } : {}),
+		CEREX_PREVIEW_HOST: options.bindHost,
+		CEREX_PREVIEW_PORT: String(options.bindPort),
+		CEREX_PREVIEW_PUBLIC_URL: options.publicUrl,
+		...(options.logPath ? { CEREX_PREVIEW_LOG_PATH: options.logPath } : {}),
 	})
 }
 
 function managedPreviewCommand(command, options = {}) {
-	const quoted = shellQuote(command)
+	if (typeof command !== "string" || !command) throw new Error("Managed container preview command must be a non-empty string")
+	const shellCommand = `/bin/sh -c ${shellQuote(command)}`
 	const marker = shellQuote(`[cerex] --- ${options.appendLog ? "restarting" : "starting"} ${new Date().toISOString()} ---`)
 	const redirect = options.appendLog ? ">>" : ">"
 	return [
-		`if [ -n "\${CEREX_PREVIEW_LOG:-}" ] && mkdir -p "$(dirname "$CEREX_PREVIEW_LOG")"; then`,
-		`printf '%s\\n' ${marker} ${redirect} "$CEREX_PREVIEW_LOG"`,
-		`printf '%s\\n' '[cerex] preview process starting' >> "$CEREX_PREVIEW_LOG"`,
-		`exec sh -lc ${quoted} >> "$CEREX_PREVIEW_LOG" 2>&1`,
+		`if [ -n "\${CEREX_PREVIEW_LOG_PATH:-}" ] && mkdir -p "$(dirname "$CEREX_PREVIEW_LOG_PATH")"; then`,
+		`printf '%s\\n' ${marker} ${redirect} "$CEREX_PREVIEW_LOG_PATH"`,
+		`printf '%s\\n' '[cerex] preview process starting' >> "$CEREX_PREVIEW_LOG_PATH"`,
+		`exec ${shellCommand} >> "$CEREX_PREVIEW_LOG_PATH" 2>&1`,
 		"fi",
-		`exec sh -lc ${quoted}`,
+		`exec ${shellCommand}`,
 	].join("\n")
+}
+
+function managedPreviewWorkdir(baseCwd, cwd = ".") {
+	if (typeof baseCwd !== "string" || !baseCwd) throw new Error("Managed container preview base working directory is required")
+	if (typeof cwd !== "string" || !cwd || isAbsolute(cwd)) throw new Error("Managed container preview working directory must be relative")
+	const root = resolve(baseCwd)
+	const workdir = resolve(root, cwd)
+	if (!pathIsWithin(root, workdir)) throw new Error("Managed container preview working directory must stay within its base directory")
+	return workdir
 }
 
 function managedPreviewLabels(options) {
@@ -1332,6 +1507,7 @@ export class ManagedContainerPreviewProcess {
 	 * @param {string} options.name
 	 * @param {string} options.command
 	 * @param {string | undefined} options.baseCwd
+	 * @param {string | undefined} options.cwd
 	 * @param {string} options.host
 	 * @param {number} options.port
 	 * @param {string} options.publicUrl
@@ -1349,7 +1525,7 @@ export class ManagedContainerPreviewProcess {
 		this.id = options.id
 		this.name = options.name
 		this.command = options.command
-		this.cwd = options.baseCwd
+		this.cwd = managedPreviewWorkdir(options.baseCwd, options.cwd)
 		this.routeHost = options.host || managedPreviewRouteHost
 		this.routePort = options.port
 		this.bindHost = managedPreviewBindHost(sandbox.network)
@@ -1387,7 +1563,7 @@ export class ManagedContainerPreviewProcess {
 			stateMount: this.stateMount,
 		})
 		if (this.logPath) {
-			await mkdir(dirname(this.logPath), { recursive: true })
+			await preparePreviewLogPath(this.logPath)
 			mounts = addWritableMountUnlessCovered(mounts, dirname(this.logPath))
 		}
 		const home = await addManagedContainerIsolatedHome(mounts, {
@@ -1423,7 +1599,7 @@ export class ManagedContainerPreviewProcess {
 			namePrefix: "cerex-preview",
 			labels: managedPreviewLabels(this),
 			publish: managedPreviewPublishBindings(this.sandbox.network, this.routeHost, this.routePort, this.bindPort),
-			command: ["sh", "-lc", managedPreviewCommand(this.command, { appendLog: this.appendLog })],
+			command: ["/bin/sh", "-c", managedPreviewCommand(this.command, { appendLog: this.appendLog })],
 			description: "Managed container preview",
 			failureFooter: "The preview command did not run.",
 		})

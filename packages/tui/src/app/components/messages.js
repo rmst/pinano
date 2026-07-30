@@ -122,7 +122,7 @@ function assistantTextBlockSelected(message, block, hasToolCalls, options, strea
  * @param {AnyMessage} message
  * @returns {string}
  */
-function userText(message) {
+function visibleMessageText(message) {
 	const c = message.content
 	if (typeof c === "string") return c
 	if (!Array.isArray(c)) return ""
@@ -151,7 +151,7 @@ export class UserMessageComponent extends Container {
 		super()
 		this.message = message
 		this.onContextMenu = options.onContextMenu
-		const text = typeof message === "string" ? message : userText(message)
+		const text = typeof message === "string" ? message : visibleMessageText(message)
 		const box = new Box(1, 1, (s) => theme.bg("userMessageBg", s))
 		box.addChild(
 			new Markdown(text, 0, 0, getMarkdownTheme(), {
@@ -291,13 +291,13 @@ export class AssistantMessageComponent extends Container {
 	}
 }
 
-class CompactionToggleLine extends RetainedComponent {
-	/** @type {CompactionMarkerComponent} */
+class TranscriptDisclosureToggleLine extends RetainedComponent {
+	/** @type {TranscriptDisclosureComponent} */
 	owner
 	/** @type {string} */
 	text = ""
 
-	/** @param {CompactionMarkerComponent} owner */
+	/** @param {TranscriptDisclosureComponent} owner */
 	constructor(owner) {
 		super()
 		this.owner = owner
@@ -306,7 +306,7 @@ class CompactionToggleLine extends RetainedComponent {
 
 	updateText() {
 		const marker = this.owner.expanded ? "▾" : "▸"
-		this.text = `${" ".repeat(ASSISTANT_SECONDARY_TEXT_INDENT)}${theme.dim(`${marker} ${compactionMarkerLabel(this.owner.message)}`)}`
+		this.text = `${" ".repeat(ASSISTANT_SECONDARY_TEXT_INDENT)}${theme.dim(`${marker} ${this.owner.label}`)}`
 	}
 
 	/**
@@ -320,9 +320,9 @@ class CompactionToggleLine extends RetainedComponent {
 			text: this.text,
 			width,
 			component: this,
-			id: `compaction:${this.owner.message?.entryId ?? this.owner.message?.timestamp ?? "marker"}`,
+			id: this.owner.id,
 			role: "button",
-			label: this.owner.expanded ? "collapse compaction summary" : "expand compaction summary",
+			label: `${this.owner.expanded ? "collapse" : "expand"} ${this.owner.disclosureName}`,
 			onClick: () => this.owner.toggleExpanded(),
 		})
 		return { lines: [this.text], spans: span ? [span] : [], sourceSpans: [], regions: [] }
@@ -334,30 +334,39 @@ class CompactionToggleLine extends RetainedComponent {
 	}
 }
 
-class CompactionMarkerComponent extends Container {
-	/** @type {AnyMessage} */
-	message
+class TranscriptDisclosureComponent extends Container {
+	/** @type {string} */
+	label
+	/** @type {string} */
+	body
+	/** @type {string} */
+	id
+	/** @type {string} */
+	disclosureName
 	expanded = false
 
-	/** @param {AnyMessage} message */
-	constructor(message) {
+	/** @param {{ label: string, body: string, id: string, disclosureName: string }} options */
+	constructor(options) {
 		super()
-		this.message = message
+		this.label = options.label
+		this.body = options.body
+		this.id = options.id
+		this.disclosureName = options.disclosureName
 		this.rebuild()
 	}
 
 	rebuild() {
 		this.clear()
-		const body = compactionMarkerBody(this.message)
+		const toggle = new TranscriptDisclosureToggleLine(this)
 		if (!this.expanded) {
-			this.addChild(new CompactionToggleLine(this))
+			this.addChild(toggle)
 			return
 		}
 		const box = new Box(0, 0, (s) => theme.bg("toolSuccessBg", s))
 		const inner = new Container()
 		box.addChild(inner)
-		inner.addChild(new CompactionToggleLine(this))
-		if (body) inner.addChild(new Text(theme.fg("toolOutput", body), 1, 0))
+		inner.addChild(toggle)
+		if (this.body) inner.addChild(new Text(theme.fg("toolOutput", this.body), 1, 0))
 		this.addChild(box)
 	}
 
@@ -365,6 +374,18 @@ class CompactionMarkerComponent extends Container {
 		this.expanded = !this.expanded
 		this.rebuild()
 		return { consume: true }
+	}
+}
+
+class CompactionMarkerComponent extends TranscriptDisclosureComponent {
+	/** @param {AnyMessage} message */
+	constructor(message) {
+		super({
+			label: compactionMarkerLabel(message),
+			body: compactionMarkerBody(message),
+			id: `compaction:${message?.entryId ?? message?.timestamp ?? "marker"}`,
+			disclosureName: "compaction summary",
+		})
 	}
 }
 
@@ -587,6 +608,20 @@ export function isBashShortcutMessage(message) {
 // =============================================================================
 // Context / custom / system messages
 // =============================================================================
+
+/** Compact project-location marker whose expanded body is the model-facing notice recorded for that move. */
+export class ProjectLocationComponent extends TranscriptDisclosureComponent {
+	/** @param {AnyMessage} message */
+	constructor(message) {
+		const root = message?.projectLocationChanged?.root
+		super({
+			label: root ? `project dir changed to ${formatToolPath(root)}` : "project dir changed",
+			body: visibleMessageText(message),
+			id: `project-location:${message?.entryId ?? message?.timestamp ?? "marker"}`,
+			disclosureName: "project location update",
+		})
+	}
+}
 
 /**
  * @param {any} load

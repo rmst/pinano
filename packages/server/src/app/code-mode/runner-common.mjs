@@ -124,7 +124,7 @@ export function bootstrapSource(tools, storedValues, maxOutputChars) {
 		}
 		const callTool = (definition, input) => {
 			const id = String(nextToolId++)
-			enqueue({ type: "tool_call", id, name: definition.name, kind: definition.kind, input: clone(input === undefined && definition.kind === "function" ? {} : input) })
+			enqueue({ type: "tool_call", id, name: definition.toolName, kind: definition.kind, input: clone(input === undefined && definition.kind === "function" ? {} : input) })
 			return new Promise((resolve, reject) => pendingTools.set(id, { resolve, reject }))
 		}
 		const toolsObject = Object.create(null)
@@ -138,7 +138,7 @@ export function bootstrapSource(tools, storedValues, maxOutputChars) {
 		Object.assign(globalThis, {
 			console: undefined,
 			tools: toolsObject,
-			ALL_TOOLS: Object.freeze(definitions.map(({ name, description }) => Object.freeze({ name, description }))),
+			ALL_TOOLS: Object.freeze(definitions.map(({ globalName: name, description }) => Object.freeze({ name, description }))),
 			text: (value) => appendOutput({ type: "text", text: textValue(value) }),
 			image: (value, detail) => appendOutput(normalizeImage(value, detail)),
 			store: (key, value) => {

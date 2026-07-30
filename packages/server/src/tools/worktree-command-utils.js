@@ -48,7 +48,7 @@ function parseResponseBody(text) {
 	}
 }
 
-function postInternalEventWithHttp(url, token, data, options = {}) {
+function postJsonWithHttp(url, token, data, options = {}) {
 	return new Promise((resolvePromise) => {
 		let resolved = false
 		let req
@@ -83,14 +83,7 @@ function postInternalEventWithHttp(url, token, data, options = {}) {
 	})
 }
 
-export async function postInternalEvent(baseUrl, token, route, body, options = {}) {
-	if (!baseUrl || !token) return { ok: false, status: 0, text: "Cerex internal API environment is not available" }
-	let url
-	try {
-		url = new URL(route, baseUrl)
-	} catch {
-		return { ok: false, status: 0, text: "invalid Cerex internal API URL" }
-	}
+export async function postJson(url, token, body, options = {}) {
 	const data = JSON.stringify(body)
 	if (typeof fetch === "function" && typeof AbortController === "function") {
 		const controller = new AbortController()
@@ -117,5 +110,16 @@ export async function postInternalEvent(baseUrl, token, route, body, options = {
 			clearTimeout(timer)
 		}
 	}
-	return await postInternalEventWithHttp(url, token, data, options)
+	return await postJsonWithHttp(url, token, data, options)
+}
+
+export async function postInternalEvent(baseUrl, token, route, body, options = {}) {
+	if (!baseUrl || !token) return { ok: false, status: 0, text: "Cerex internal API environment is not available" }
+	let url
+	try {
+		url = new URL(route, baseUrl)
+	} catch {
+		return { ok: false, status: 0, text: "invalid Cerex internal API URL" }
+	}
+	return await postJson(url, token, body, options)
 }

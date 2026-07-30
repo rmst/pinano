@@ -14,6 +14,7 @@ import { getEffectiveSessionProperties } from "../session/properties.js"
 import { prependSkillsContext } from "../context/skills.js"
 import { updatePlanToolsForModel } from "../update-plan-tool.js"
 import { CodeModeRuntime } from "../code-mode/runtime.js"
+import { createRequestPermissionTool } from "../permissions/tool.js"
 
 const AUTO_COMPACT_THRESHOLD = 0.85
 
@@ -113,6 +114,7 @@ export function createAgentRuntime(options) {
 		const tools = [
 			...baseToolsForModel(model),
 			...updatePlanToolsForModel(model),
+			...(options.settings.web === true ? [createRequestPermissionTool(() => agent)] : []),
 		]
 		if (model?.toolMode === "code_mode_only") {
 			const directModelOnly = tools.filter((tool) => tool.exposure === "direct_model_only")

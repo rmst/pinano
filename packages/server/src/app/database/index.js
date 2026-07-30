@@ -5,18 +5,18 @@
 // changes as explicit migrations using PRAGMA user_version, matching the
 // pattern used in our other apps.
 
-import { randomUUID } from "node:crypto"
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs"
+import { mkdirSync } from "node:fs"
 import { dirname, sep } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 
 import { promptImageLabel } from "../../../../protocol/src/prompt-images.js"
+import { startOperationSpan, syncOperationTracer } from "../../operation-tracing.js"
 import { serverDbPath } from "../paths.js"
 import {
 	SESSION_ATTACHMENT_KIND_IMAGE,
+	SESSION_ATTACHMENT_KIND_PENDING_IMAGE,
 	SESSION_ATTACHMENT_VARIANT_DISPLAY,
 	SESSION_ATTACHMENT_VARIANT_ORIGINAL,
-	writePromptImageAttachmentFilesSync,
 } from "../session/attachments.js"
 import {
 	cachedPreviewRowsFromOverview,
@@ -28,11 +28,12 @@ import {
 import {
 	attachmentImageBlockFromRows,
 	attachmentSelectSql,
-	insertSessionAttachmentRows,
+	insertSessionAttachmentRow,
+	insertSessionAttachmentVariantRows,
 	nextImageAttachmentNumber,
 } from "./attachments.js"
 import {
-	migrateServerDb,
+	ensureServerDbSchema,
 	SESSION_KIND_NORMAL,
 	SESSION_KIND_PROJECT_MAINTENANCE,
 } from "./schema.js"
@@ -42,6 +43,27 @@ export { SCHEMA_VERSION, SESSION_KIND_NORMAL, SESSION_KIND_PROJECT_MAINTENANCE }
 
 const SERVER_DB_CACHE_SIZE_KIB = 128 * 1024
 const SESSION_PREVIEW_BATCH_SIZE = 200
+
+function sqliteTransaction(db, trace, task, begin = "BEGIN IMMEDIATE") {
+	trace("begin", () => db.exec(begin))
+	try {
+		const result = trace("work", task)
+		trace("commit", () => db.exec("COMMIT"))
+		return result
+	} catch (error) {
+		trace("rollback", () => db.exec("ROLLBACK"))
+		throw error
+	}
+}
+
+function instrumentServerDbApi(api, diagnostics) {
+	if (diagnostics?.enabled === false || typeof diagnostics?.span !== "function") return api
+	for (const [name, method] of Object.entries(api)) {
+		if (typeof method !== "function") continue
+		api[name] = (...args) => syncOperationTracer(diagnostics, `ServerDb.${name}`, { database: "server" })("call", () => method.apply(api, args))
+	}
+	return api
+}
 
 /**
  * @typedef {object} ServerDbSession
@@ -59,11 +81,39 @@ const SESSION_PREVIEW_BATCH_SIZE = 200
  * @property {"not_started" | "running" | "stopped" | string | undefined} [lifecycleState]
  * @property {{ state?: "working" | "needs_input" | "ready_for_review" | "discussing" | "deferred" | "completed" | "experiencing_problems" | string, descriptionInUi?: string, description?: string, projectTag?: string, needsInput?: string, result?: string, updatedAt?: string } | undefined} [agentView]
  * @property {string | undefined} [projectDir]
+ * @property {string | undefined} [projectRootAtLeaf]
+ * @property {string | undefined} [projectId]
+ * @property {string | undefined} [projectRetiredAt]
  * @property {string | undefined} [initialWd]
  * @property {boolean} [hidden]
  * @property {boolean} [hasWorktrees]
  * @property {string | undefined} [sessionKind]
  * @property {SubSessionRow} [subSession]
+ */
+
+/**
+ * @typedef {object} ProjectRow
+ * @property {string} id
+ * @property {string} root
+ * @property {string} createdAt
+ * @property {string} updatedAt
+ * @property {string | undefined} [retiredAt]
+ */
+
+/**
+ * @typedef {object} ProjectSessionRuntimeState
+ * @property {string} id
+ * @property {string | undefined} [runtimeState]
+ * @property {string | undefined} [runtimeStateUpdatedAt]
+ */
+
+/**
+ * @typedef {object} ProjectRetirement
+ * @property {ProjectRow} previousProject
+ * @property {ProjectRow} project
+ * @property {PreviewRootCacheRow[]} previewRoots
+ * @property {ProjectSessionRuntimeState[]} sessionRuntimeStates
+ * @property {string[]} legacySessionIds
  */
 
 /**
@@ -112,7 +162,15 @@ const SESSION_PREVIEW_BATCH_SIZE = 200
  * @property {(id: string, hidden?: boolean) => void} setSessionHidden
  * @property {(id: string, state: string) => void} setSessionRuntimeState
  * @property {(id: string, metadata: { state?: string, descriptionInUi?: string, description?: string, projectTag?: string, needsInput?: string, result?: string, updatedAt?: string }) => void} setAgentViewMetadata
- * @property {(id: string, projectDir?: string | null) => void} setSessionProjectDir
+ * @property {(id: string, projection: { cwd?: string, initialWd?: string, projectDir: string | null, updatedAt?: string }) => void} setSessionTranscriptProjection
+ * @property {(id: string, projectId: string | null, projectDir: string | null) => void} setSessionProject
+ * @property {(record: { id: string, root: string, createdAt?: string, updatedAt?: string }) => ProjectRow} insertProject
+ * @property {(id: string) => ProjectRow | undefined} getProject
+ * @property {(root: string) => ProjectRow | undefined} getProjectByRoot
+ * @property {(projectId: string, legacyRoot: string) => ServerDbSession[]} listSessionsForProject
+ * @property {(projectId: string, root: string, previousRoot: string) => ProjectRow} moveProject
+ * @property {(projectId: string, root: string) => ProjectRetirement} retireProject
+ * @property {(retirement: ProjectRetirement) => ProjectRow} rollbackProjectRetirement
  * @property {(id: string) => { state?: string, descriptionInUi?: string, description?: string, projectTag?: string, needsInput?: string, result?: string, updatedAt?: string } | undefined} getAgentViewMetadata
  * @property {(id: string) => { mutationVersion: number, mutationRunId?: string, runtimeState?: string, agentViewState?: string } | undefined} getSessionMutation
  * @property {(id: string) => PromptDraft} getPromptDraft
@@ -120,10 +178,13 @@ const SESSION_PREVIEW_BATCH_SIZE = 200
  * @property {(key: string) => any | undefined} getUiState
  * @property {(key: string, value: any) => any} setUiState
  * @property {(key: string) => boolean} deleteUiState
- * @property {(sessionId: string, images: any[], options?: { minimumNumber?: number }) => any[]} createPromptImageAttachments
+ * @property {(sessionId: string, reservations: Array<{ id: string, detail?: string | null }>, options: { minimumNumber: number }) => Array<{ id: string, sessionId: string, number: number, label: string, detail: string | null, createdAt: string }>} reservePromptImageAttachments
+ * @property {(sessionId: string, attachments: Array<{ id: string, number: number, variants: { display: any, original?: any } }>) => any[]} finalizePromptImageAttachments
+ * @property {(sessionId: string, ids: string[]) => number} cancelPromptImageAttachmentReservations
+ * @property {() => Array<{ id: string, sessionId: string, number: number, label: string, detail: string | null, createdAt: string }>} listPendingPromptImageAttachmentReservations
  * @property {(id: string) => any | undefined} getImageAttachment
  * @property {(sessionId: string, number: number) => any | undefined} getImageAttachmentByNumber
- * @property {(sessionId: string, attachmentId: string, variant?: string) => ({ data: Buffer, mimeType: string, filename?: string } & Record<string, any>) | undefined} getAttachmentVariant
+ * @property {(sessionId: string, attachmentId: string, variant?: string) => ({ mimeType: string, filename?: string, filePath?: string } & Record<string, any>) | undefined} getAttachmentVariantMetadata
  * @property {(id: string, options?: { includeDeleted?: boolean }) => ServerDbSession | undefined} getSession
  * @property {(id: string, options?: { includeHidden?: boolean, includeDeleted?: boolean }) => ServerDbSession | undefined} getSessionListEntry
  * @property {(cwd?: string, options?: { includeHidden?: boolean, includeDeleted?: boolean }) => ServerDbSession[]} listSessions
@@ -186,6 +247,9 @@ function sessionFromRow(row) {
 		cwd: row.cwd,
 		initialWd: row.initialWd ?? undefined,
 		projectDir: row.projectDir ?? undefined,
+		projectRootAtLeaf: row.projectRootAtLeaf ?? row.projectDir ?? undefined,
+		projectId: row.projectId ?? undefined,
+		projectRetiredAt: row.projectRetiredAt ?? undefined,
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,
 		deletedAt: row.deletedAt ?? undefined,
@@ -207,6 +271,17 @@ function sessionFromRow(row) {
 			result: row.agentViewResult ?? undefined,
 			updatedAt: row.agentViewUpdatedAt ?? undefined,
 		} : undefined,
+	}
+}
+
+function projectFromRow(row) {
+	if (!row) return undefined
+	return {
+		id: row.id,
+		root: row.root,
+		createdAt: row.createdAt,
+		updatedAt: row.updatedAt,
+		retiredAt: row.retiredAt ?? undefined,
 	}
 }
 
@@ -270,19 +345,24 @@ function previewRootCacheFromRow(row) {
 }
 
 /**
- * Open and migrate the Cerex server metadata db.
- * @param {{ path?: string, recoverRunningRuns?: boolean }} [options]
+ * Open the Cerex server metadata db, initializing a fresh schema when needed.
+ * @param {{ path?: string, recoverRunningRuns?: boolean, diagnostics?: any }} [options]
  * @returns {ServerDb}
  */
 export function openServerDb(options = {}) {
 	const path = options.path ?? serverDbPath()
-	mkdirSync(dirname(path), { recursive: true })
-	const db = new DatabaseSync(path)
-	db.exec(`PRAGMA cache_size = -${SERVER_DB_CACHE_SIZE_KIB}`)
-	db.exec("PRAGMA journal_mode = WAL")
-	db.exec("PRAGMA busy_timeout = 1000")
-	db.exec("PRAGMA foreign_keys = ON")
-	migrateServerDb(db, { dbPath: path })
+	const diagnostics = options.diagnostics
+	const openTrace = syncOperationTracer(diagnostics, "ServerDb.open", { database: "server" })
+	openTrace("mkdir", () => mkdirSync(dirname(path), { recursive: true }))
+	const db = openTrace("connect", () => new DatabaseSync(path))
+	openTrace("configure", () => {
+		db.exec(`PRAGMA cache_size = -${SERVER_DB_CACHE_SIZE_KIB}`)
+		db.exec("PRAGMA journal_mode = WAL")
+		db.exec("PRAGMA busy_timeout = 1000")
+	})
+	openTrace("schema", () => ensureServerDbSchema(db))
+	openTrace("foreignKeys", () => db.exec("PRAGMA foreign_keys = ON"))
+	const endPrepare = startOperationSpan(diagnostics, "ServerDb.open.prepare", { database: "server" })
 
 	// sessions.name is intentionally retained as an unused reserved column. Runtime code should not read or write it.
 	const upsertSessionStmt = db.prepare(`
@@ -303,7 +383,101 @@ export function openServerDb(options = {}) {
 	const restoreSessionStmt = db.prepare("UPDATE sessions SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL")
 	const setSessionHiddenStmt = db.prepare("UPDATE sessions SET hidden = ? WHERE id = ? AND deleted_at IS NULL")
 	const setRuntimeStateStmt = db.prepare("UPDATE sessions SET runtime_state = ?, runtime_state_updated_at = ? WHERE id = ? AND deleted_at IS NULL")
-	const setSessionProjectDirStmt = db.prepare("UPDATE sessions SET project_dir = ? WHERE id = ? AND deleted_at IS NULL")
+	const setSessionTranscriptProjectionStmt = db.prepare(`
+		UPDATE sessions
+		SET cwd = COALESCE(?, cwd),
+			initial_wd = COALESCE(?, initial_wd),
+			project_dir = ?,
+			updated_at = COALESCE(?, updated_at)
+		WHERE id = ? AND deleted_at IS NULL
+	`)
+	const setSessionProjectStmt = db.prepare("UPDATE sessions SET project_id = ?, project_dir = ? WHERE id = ?")
+	const insertProjectStmt = db.prepare(`
+		INSERT INTO projects (id, root, created_at, updated_at)
+		VALUES (?, ?, ?, ?)
+		RETURNING id, root, created_at AS createdAt, updated_at AS updatedAt, retired_at AS retiredAt
+	`)
+	const getProjectStmt = db.prepare(`
+		SELECT id, root, created_at AS createdAt, updated_at AS updatedAt, retired_at AS retiredAt
+		FROM projects
+		WHERE id = ?
+	`)
+	const getProjectByRootStmt = db.prepare(`
+		SELECT id, root, created_at AS createdAt, updated_at AS updatedAt, retired_at AS retiredAt
+		FROM projects
+		WHERE root = ? AND retired_at IS NULL
+	`)
+	const updateProjectRootStmt = db.prepare(`
+		UPDATE projects
+		SET root = ?, updated_at = ?
+		WHERE id = ? AND retired_at IS NULL
+		RETURNING id, root, created_at AS createdAt, updated_at AS updatedAt, retired_at AS retiredAt
+	`)
+	const retireProjectStmt = db.prepare(`
+		UPDATE projects
+		SET retired_at = ?, updated_at = ?
+		WHERE id = ? AND root = ? AND retired_at IS NULL
+		RETURNING id, root, created_at AS createdAt, updated_at AS updatedAt, retired_at AS retiredAt
+	`)
+	const rollbackProjectRetirementStmt = db.prepare(`
+		UPDATE projects
+		SET root = ?, updated_at = ?, retired_at = NULL
+		WHERE id = ? AND root = ? AND retired_at = ?
+		RETURNING id, root, created_at AS createdAt, updated_at AS updatedAt, retired_at AS retiredAt
+	`)
+	const retireProjectMaintenanceSessionsStmt = db.prepare(`
+		UPDATE sessions
+		SET deleted_at = ?
+		WHERE project_id = ? AND session_kind = ? AND deleted_at IS NULL
+	`)
+	const idleProjectSessionsStmt = db.prepare(`
+		UPDATE sessions
+		SET runtime_state = 'idle', runtime_state_updated_at = ?
+		WHERE project_id = ?
+	`)
+	const selectProjectSessionRuntimeStatesStmt = db.prepare(`
+		SELECT id, runtime_state AS runtimeState, runtime_state_updated_at AS runtimeStateUpdatedAt
+		FROM sessions
+		WHERE project_id = ?
+	`)
+	const rollbackProjectSessionRuntimeStateStmt = db.prepare(`
+		UPDATE sessions
+		SET runtime_state = ?, runtime_state_updated_at = ?
+		WHERE id = ? AND project_id = ? AND runtime_state_updated_at = ?
+	`)
+	const restoreRetiredProjectMaintenanceSessionsStmt = db.prepare(`
+		UPDATE sessions
+		SET deleted_at = NULL
+		WHERE project_id = ? AND session_kind = ? AND deleted_at = ?
+	`)
+	const associateLegacyProjectSessionsStmt = db.prepare(`
+		UPDATE sessions
+		SET project_id = ?
+		WHERE project_id IS NULL AND project_dir = ?
+	`)
+	const selectLegacyProjectSessionIdsStmt = db.prepare(`
+		SELECT id
+		FROM sessions
+		WHERE project_id IS NULL AND project_dir = ?
+	`)
+	const rollbackLegacyProjectSessionAssociationStmt = db.prepare(`
+		UPDATE sessions
+		SET project_id = NULL
+		WHERE id = ? AND project_id = ? AND project_dir = ?
+	`)
+	const deletePreviewRootsForProjectStmt = db.prepare("DELETE FROM preview_root_cache WHERE project_dir = ?")
+	const selectPreviewRootsForProjectStmt = db.prepare(`
+		SELECT
+			scope_id AS scopeId,
+			scope_kind AS scopeKind,
+			root_path AS rootPath,
+			project_dir AS projectDir,
+			session_id AS sessionId,
+			created_at AS createdAt,
+			updated_at AS updatedAt
+		FROM preview_root_cache
+		WHERE project_dir = ?
+	`)
 	const setAgentViewStmt = db.prepare(`
 		UPDATE sessions
 		SET agent_view_state = ?,
@@ -363,6 +537,38 @@ export function openServerDb(options = {}) {
 	`)
 	const deleteUiStateStmt = db.prepare("DELETE FROM ui_state WHERE state_key = ?")
 	const getImageAttachmentByIdStmt = db.prepare(attachmentSelectSql("WHERE a.id = ? AND a.kind = ?"))
+	const getPromptImageAttachmentReservationStmt = db.prepare(`
+		SELECT
+			id,
+			session_id AS sessionId,
+			number,
+			label,
+			detail,
+			created_at AS createdAt
+		FROM session_attachments
+		WHERE id = ? AND session_id = ? AND kind = ?
+	`)
+	const finalizePromptImageAttachmentReservationStmt = db.prepare(`
+		UPDATE session_attachments
+		SET kind = ?
+		WHERE id = ? AND session_id = ? AND number = ? AND kind = ?
+	`)
+	const cancelPromptImageAttachmentReservationStmt = db.prepare(`
+		DELETE FROM session_attachments
+		WHERE id = ? AND session_id = ? AND kind = ?
+	`)
+	const listPendingPromptImageAttachmentReservationsStmt = db.prepare(`
+		SELECT
+			id,
+			session_id AS sessionId,
+			number,
+			label,
+			detail,
+			created_at AS createdAt
+		FROM session_attachments
+		WHERE kind = ?
+		ORDER BY created_at ASC, id ASC
+	`)
 	const getImageAttachmentByNumberStmt = db.prepare(attachmentSelectSql(`
 		JOIN (
 			SELECT owned.id AS attachmentId, 0 AS rank
@@ -370,7 +576,7 @@ export function openServerDb(options = {}) {
 			WHERE owned.session_id = ? AND owned.kind = ? AND owned.number = ?
 			UNION ALL
 			SELECT mb.image_attachment_id AS attachmentId, 1 AS rank
-			FROM session_entry_refs ser
+			FROM session_entries ser
 			JOIN entry_message_blocks mb ON mb.global_id = ser.global_id
 			WHERE ser.session_id = ?
 				AND mb.type = 'image'
@@ -381,7 +587,7 @@ export function openServerDb(options = {}) {
 		ORDER BY visible.rank ASC
 		LIMIT 1
 	`))
-	const getAttachmentVariantStmt = db.prepare(`
+	const getAttachmentVariantMetadataStmt = db.prepare(`
 		SELECT
 			a.id,
 			a.session_id AS sessionId,
@@ -402,11 +608,11 @@ export function openServerDb(options = {}) {
 		WHERE a.session_id = ?
 			AND a.id = ?
 			AND v.variant = ?
+			AND a.kind = ?
 	`)
 	const markProjectMaintenanceSessionStmt = db.prepare(`
 		UPDATE sessions
-		SET hidden = 1,
-			session_kind = ?,
+		SET session_kind = ?,
 			project_dir = ?
 		WHERE id = ? AND deleted_at IS NULL
 		RETURNING
@@ -417,36 +623,39 @@ export function openServerDb(options = {}) {
 	`)
 	const getProjectMaintenanceSessionStmt = db.prepare(`
 		SELECT
-			project_dir AS projectDir,
-			id AS sessionId,
-			created_at AS createdAt,
-			updated_at AS updatedAt
-		FROM sessions
-		WHERE deleted_at IS NULL
-			AND session_kind = ?
-			AND project_dir = ?
+			COALESCE(p.root, s.project_dir) AS projectDir,
+			s.id AS sessionId,
+			s.created_at AS createdAt,
+			s.updated_at AS updatedAt
+		FROM sessions s
+		LEFT JOIN projects p ON p.id = s.project_id
+		WHERE s.deleted_at IS NULL
+			AND s.session_kind = ?
+			AND COALESCE(p.root, s.project_dir) = ?
 	`)
 	const getProjectMaintenanceSessionBySessionIdStmt = db.prepare(`
 		SELECT
-			project_dir AS projectDir,
-			id AS sessionId,
-			created_at AS createdAt,
-			updated_at AS updatedAt
-		FROM sessions
-		WHERE deleted_at IS NULL
-			AND session_kind = ?
-			AND id = ?
+			COALESCE(p.root, s.project_dir) AS projectDir,
+			s.id AS sessionId,
+			s.created_at AS createdAt,
+			s.updated_at AS updatedAt
+		FROM sessions s
+		LEFT JOIN projects p ON p.id = s.project_id
+		WHERE s.deleted_at IS NULL
+			AND s.session_kind = ?
+			AND s.id = ?
 	`)
 	const listProjectMaintenanceSessionsStmt = db.prepare(`
 		SELECT
-			project_dir AS projectDir,
-			id AS sessionId,
-			created_at AS createdAt,
-			updated_at AS updatedAt
-		FROM sessions
-		WHERE deleted_at IS NULL
-			AND session_kind = ?
-		ORDER BY updated_at DESC
+			COALESCE(p.root, s.project_dir) AS projectDir,
+			s.id AS sessionId,
+			s.created_at AS createdAt,
+			s.updated_at AS updatedAt
+		FROM sessions s
+		LEFT JOIN projects p ON p.id = s.project_id
+		WHERE s.deleted_at IS NULL
+			AND s.session_kind = ?
+		ORDER BY s.updated_at DESC
 	`)
 	const upsertPreviewRootStmt = db.prepare(`
 		INSERT INTO preview_root_cache (scope_id, scope_kind, root_path, project_dir, session_id, created_at, updated_at)
@@ -687,7 +896,10 @@ export function openServerDb(options = {}) {
 			s.id,
 			s.cwd,
 			s.initial_wd AS initialWd,
-			s.project_dir AS projectDir,
+			s.project_dir AS projectRootAtLeaf,
+			COALESCE(p.root, s.project_dir) AS projectDir,
+			s.project_id AS projectId,
+			p.retired_at AS projectRetiredAt,
 			s.session_kind AS sessionKind,
 			s.created_at AS createdAt,
 			s.updated_at AS updatedAt,
@@ -707,6 +919,7 @@ export function openServerDb(options = {}) {
 			latest_run.error AS latestRunError,
 			latest_run.stop_reason AS latestRunStopReason
 		FROM sessions s
+		LEFT JOIN projects p ON p.id = s.project_id
 		LEFT JOIN runs latest_run ON latest_run.rowid = (
 			SELECT r.rowid
 			FROM runs r
@@ -719,11 +932,16 @@ export function openServerDb(options = {}) {
 			s.id IN (
 				SELECT ser.session_id
 				FROM entry_custom_entries ece
-				JOIN session_entry_refs ser ON ser.global_id = ece.global_id
+				JOIN session_entries ser ON ser.global_id = ece.global_id
 				WHERE ece.custom_type = 'git_worktree'
 			) AS hasWorktrees,
 	`)
 	const sessionReadSelectSql = sessionSelectSql()
+	const listSessionsForProjectStmt = db.prepare(`
+		${sessionReadSelectSql}
+		WHERE s.project_id = ? OR (s.project_id IS NULL AND s.project_dir = ?)
+		ORDER BY s.deleted_at IS NOT NULL, COALESCE(s.deleted_at, s.updated_at) DESC, s.updated_at DESC
+	`)
 	const getSessionStmt = db.prepare(`
 		${sessionReadSelectSql}
 		WHERE s.id = ? AND (? = 1 OR s.deleted_at IS NULL)
@@ -742,6 +960,9 @@ export function openServerDb(options = {}) {
 				? IS NULL
 				OR COALESCE(NULLIF(s.initial_wd, ''), s.cwd) = ?
 				OR instr(COALESCE(NULLIF(s.initial_wd, ''), s.cwd), ?) = 1
+				OR p.root = ?
+				OR instr(p.root, ?) = 1
+				OR instr(?, p.root || ?) = 1
 			)
 		ORDER BY s.deleted_at IS NOT NULL, COALESCE(s.deleted_at, s.updated_at) DESC, s.updated_at DESC
 	`)
@@ -791,20 +1012,21 @@ export function openServerDb(options = {}) {
 			AND (
 				COALESCE(NULLIF(s.initial_wd, ''), s.cwd) = ?
 				OR instr(COALESCE(NULLIF(s.initial_wd, ''), s.cwd), ?) = 1
+				OR p.root = ?
+				OR instr(p.root, ?) = 1
+				OR instr(?, p.root || ?) = 1
 			)
 		ORDER BY s.deleted_at IS NOT NULL, COALESCE(s.deleted_at, s.updated_at) DESC, s.updated_at DESC
 	`)
 	const previewMessagesStmt = db.prepare(previewMessagesForSelectedSql("(0, ?)"))
 	const sessionCustomEntriesStmt = db.prepare(`
 		SELECT
-			ce.id,
-			parent.id AS parentId,
-			ce.timestamp,
+			ser.entry_id AS id,
+			ser.parent_entry_id AS parentId,
+			ser.timestamp,
 			ece.data_json AS dataJson
-		FROM session_entry_refs ser
-		JOIN conversation_entries ce ON ce.global_id = ser.global_id
+		FROM session_entries ser
 		JOIN entry_custom_entries ece ON ece.global_id = ser.global_id
-		LEFT JOIN conversation_entries parent ON parent.global_id = ce.parent_global_id
 		WHERE ser.session_id = ? AND ece.custom_type = ?
 		ORDER BY ser.seq ASC
 	`)
@@ -847,15 +1069,11 @@ export function openServerDb(options = {}) {
 	const refreshSessionOverviewsForSessions = (ids) => {
 		const uniqueIds = [...new Set(ids.filter(Boolean))]
 		if (uniqueIds.length === 0) return []
-		db.exec("BEGIN")
-		try {
-			const refreshed = recomputeSessionOverviewProjections(db, uniqueIds)
-			db.exec("COMMIT")
-			return refreshed
-		} catch (err) {
-			db.exec("ROLLBACK")
-			throw err
-		}
+		const trace = syncOperationTracer(diagnostics, "ServerDb.refreshSessionOverviews.transaction", {
+			database: "server",
+			sessionCount: uniqueIds.length,
+		})
+		return sqliteTransaction(db, trace, () => recomputeSessionOverviewProjections(db, uniqueIds), "BEGIN")
 	}
 	const latestForCwdStmt = db.prepare(`
 		SELECT id FROM sessions
@@ -995,6 +1213,7 @@ export function openServerDb(options = {}) {
 		ORDER BY started_at DESC
 		LIMIT ?
 	`)
+	endPrepare()
 
 	/** @type {ServerDb} */
 	const api = {
@@ -1038,8 +1257,105 @@ export function openServerDb(options = {}) {
 				id,
 			)
 		},
-		setSessionProjectDir(id, projectDir = null) {
-			setSessionProjectDirStmt.run(projectDir ?? null, id)
+		setSessionTranscriptProjection(id, projection) {
+			setSessionTranscriptProjectionStmt.run(
+				projection.cwd ?? null,
+				projection.initialWd ?? null,
+				projection.projectDir ?? null,
+				projection.updatedAt ?? null,
+				id,
+			)
+		},
+		setSessionProject(id, projectId, projectDir) {
+			setSessionProjectStmt.run(projectId ?? null, projectDir ?? null, id)
+		},
+		insertProject(record) {
+			const createdAt = record.createdAt ?? nowIso()
+			return projectFromRow(insertProjectStmt.get(record.id, record.root, createdAt, record.updatedAt ?? createdAt))
+		},
+		getProject(id) {
+			return projectFromRow(getProjectStmt.get(id))
+		},
+		getProjectByRoot(root) {
+			return projectFromRow(getProjectByRootStmt.get(root))
+		},
+		listSessionsForProject(projectId, legacyRoot) {
+			return listSessionsForProjectStmt.all(projectId, legacyRoot).map(sessionFromRow)
+		},
+		moveProject(projectId, root, previousRoot) {
+			const trace = syncOperationTracer(diagnostics, "ServerDb.moveProject.transaction", { database: "server", projectId })
+			return sqliteTransaction(db, trace, () => {
+				associateLegacyProjectSessionsStmt.run(projectId, previousRoot)
+				deletePreviewRootsForProjectStmt.run(previousRoot)
+				const project = projectFromRow(updateProjectRootStmt.get(root, nowIso(), projectId))
+				if (!project) throw new Error(`Project not found: ${projectId}`)
+				return project
+			})
+		},
+		retireProject(projectId, root) {
+			const trace = syncOperationTracer(diagnostics, "ServerDb.retireProject.transaction", { database: "server", projectId })
+			return sqliteTransaction(db, trace, () => {
+				const legacySessionIds = selectLegacyProjectSessionIdsStmt.all(root).map((row) => row.id)
+				associateLegacyProjectSessionsStmt.run(projectId, root)
+				const previousProject = projectFromRow(getProjectStmt.get(projectId))
+				if (!previousProject || previousProject.root !== root || previousProject.retiredAt) {
+					throw new Error(`Active project not found at ${root}: ${projectId}`)
+				}
+				const previewRoots = selectPreviewRootsForProjectStmt.all(root).map(previewRootCacheFromRow)
+				const sessionRuntimeStates = selectProjectSessionRuntimeStatesStmt.all(projectId).map((row) => ({
+					id: row.id,
+					runtimeState: row.runtimeState ?? undefined,
+					runtimeStateUpdatedAt: row.runtimeStateUpdatedAt ?? undefined,
+				}))
+				const retiredAt = nowIso()
+				const project = projectFromRow(retireProjectStmt.get(retiredAt, retiredAt, projectId, root))
+				if (!project) throw new Error(`Active project not found at ${root}: ${projectId}`)
+				idleProjectSessionsStmt.run(retiredAt, projectId)
+				retireProjectMaintenanceSessionsStmt.run(retiredAt, projectId, SESSION_KIND_PROJECT_MAINTENANCE)
+				deletePreviewRootsForProjectStmt.run(root)
+				return { previousProject, project, previewRoots, sessionRuntimeStates, legacySessionIds }
+			})
+		},
+		rollbackProjectRetirement(retirement) {
+			const projectId = retirement.project.id
+			const retiredAt = retirement.project.retiredAt
+			if (!retiredAt) throw new Error(`Project retirement is missing a retirement timestamp: ${projectId}`)
+			const trace = syncOperationTracer(diagnostics, "ServerDb.rollbackProjectRetirement.transaction", { database: "server", projectId })
+			return sqliteTransaction(db, trace, () => {
+				const project = projectFromRow(rollbackProjectRetirementStmt.get(
+					retirement.previousProject.root,
+					retirement.previousProject.updatedAt,
+					projectId,
+					retirement.project.root,
+					retiredAt,
+				))
+				if (!project) throw new Error(`Project retirement can no longer be rolled back: ${projectId}`)
+				restoreRetiredProjectMaintenanceSessionsStmt.run(projectId, SESSION_KIND_PROJECT_MAINTENANCE, retiredAt)
+				for (const session of retirement.sessionRuntimeStates) {
+					rollbackProjectSessionRuntimeStateStmt.run(
+						session.runtimeState ?? null,
+						session.runtimeStateUpdatedAt ?? null,
+						session.id,
+						projectId,
+						retiredAt,
+					)
+				}
+				for (const sessionId of retirement.legacySessionIds) {
+					rollbackLegacyProjectSessionAssociationStmt.run(sessionId, projectId, retirement.previousProject.root)
+				}
+				for (const preview of retirement.previewRoots) {
+					upsertPreviewRootStmt.get(
+						preview.scopeId,
+						preview.scopeKind,
+						preview.rootPath,
+						preview.projectDir ?? null,
+						preview.sessionId ?? null,
+						preview.createdAt,
+						preview.updatedAt,
+					)
+				}
+				return project
+			})
 		},
 		getAgentViewMetadata(id) {
 			const row = getAgentViewStmt.get(id)
@@ -1070,12 +1386,15 @@ export function openServerDb(options = {}) {
 		setPromptDraft(id, text, options = {}) {
 			const clientId = typeof options.clientId === "string" && options.clientId ? options.clientId : null
 			const clientSeq = Number.isInteger(options.clientSeq) && options.clientSeq > 0 ? options.clientSeq : null
-			db.exec("BEGIN IMMEDIATE")
-			try {
+			const trace = syncOperationTracer(diagnostics, "ServerDb.setPromptDraft.transaction", {
+				database: "server",
+				sessionId: id,
+				textChars: text.length,
+			})
+			return sqliteTransaction(db, trace, () => {
 				if (clientId && clientSeq !== null) {
 					const previousClientSeq = Number(getPromptDraftClientSeqStmt.get(id, clientId)?.lastSeq ?? 0)
 					if (clientSeq <= previousClientSeq) {
-						db.exec("COMMIT")
 						return promptDraftFromRow(getPromptDraftStmt.get(id), { applied: false })
 					}
 				}
@@ -1083,12 +1402,8 @@ export function openServerDb(options = {}) {
 				const at = nowIso()
 				setPromptDraftStmt.run(id, text, version, at, clientId, clientSeq)
 				if (clientId && clientSeq !== null) upsertPromptDraftClientSeqStmt.run(id, clientId, clientSeq)
-				db.exec("COMMIT")
 				return promptDraftFromRow(getPromptDraftStmt.get(id), { applied: true })
-			} catch (err) {
-				db.exec("ROLLBACK")
-				throw err
-			}
+			})
 		},
 		getUiState(key) {
 			const row = getUiStateStmt.get(key)
@@ -1103,58 +1418,111 @@ export function openServerDb(options = {}) {
 		deleteUiState(key) {
 			return Number(deleteUiStateStmt.run(key).changes ?? 0) > 0
 		},
-		createPromptImageAttachments(sessionId, images, options = {}) {
-			const created = []
-			if (!Array.isArray(images) || images.length === 0) return created
-			const writtenFiles = []
-			db.exec("BEGIN IMMEDIATE")
-			try {
-				let next = nextImageAttachmentNumber(db, sessionId, options.minimumNumber ?? 1)
-				for (const image of images) {
+		reservePromptImageAttachments(sessionId, reservations, options = {}) {
+			if (!Array.isArray(reservations) || reservations.length === 0) return []
+			if (!Number.isInteger(options.minimumNumber) || options.minimumNumber <= 0) {
+				throw new TypeError("prompt image minimum number must be a positive integer")
+			}
+			const ids = new Set()
+			for (const reservation of reservations) {
+				if (typeof reservation?.id !== "string" || !reservation.id || ids.has(reservation.id)) {
+					throw new TypeError("prompt image reservation ids must be unique non-empty strings")
+				}
+				ids.add(reservation.id)
+			}
+			const trace = syncOperationTracer(diagnostics, "ServerDb.reservePromptImageAttachments.transaction", {
+				database: "server",
+				sessionId,
+				imageCount: reservations.length,
+			})
+			return sqliteTransaction(db, trace, () => {
+				let next = trace("number", () => nextImageAttachmentNumber(db, sessionId, options.minimumNumber))
+				return trace("insert", () => reservations.map((reservation) => {
 					const number = next
 					next += 1
-					const id = randomUUID()
-					const label = promptImageLabel(number)
-					const variants = writePromptImageAttachmentFilesSync(sessionId, number, image, { dbPath: path })
-					writtenFiles.push(...[variants.display?.filePath, variants.original?.filePath].filter(Boolean))
-					insertSessionAttachmentRows(db, {
-						id,
+					const row = {
+						id: reservation.id,
 						sessionId,
-						kind: SESSION_ATTACHMENT_KIND_IMAGE,
+						kind: SESSION_ATTACHMENT_KIND_PENDING_IMAGE,
 						number,
-						label,
-						detail: image.detail ?? null,
+						label: promptImageLabel(number),
+						detail: reservation.detail ?? null,
 						createdAt: nowIso(),
-					}, [variants.display, variants.original])
-					created.push({
-						type: "image",
-						attachmentId: id,
-						attachmentSessionId: sessionId,
-						imageNumber: number,
-						mimeType: variants.display.mimeType,
-						...(image.detail ? { detail: image.detail } : {}),
-						...(variants.display.widthPx !== null && variants.display.widthPx !== undefined ? { widthPx: variants.display.widthPx } : {}),
-						...(variants.display.heightPx !== null && variants.display.heightPx !== undefined ? { heightPx: variants.display.heightPx } : {}),
-						storageKey: variants.display.storageKey,
-						path: variants.display.filePath,
-						...(variants.original ? {
-							original: {
-								mimeType: variants.original.mimeType,
-								...(variants.original.widthPx !== null && variants.original.widthPx !== undefined ? { widthPx: variants.original.widthPx } : {}),
-								...(variants.original.heightPx !== null && variants.original.heightPx !== undefined ? { heightPx: variants.original.heightPx } : {}),
-								storageKey: variants.original.storageKey,
-								path: variants.original.filePath,
-							},
-						} : {}),
-					})
+					}
+					insertSessionAttachmentRow(db, row)
+					return {
+						id: row.id,
+						sessionId: row.sessionId,
+						number: row.number,
+						label: row.label,
+						detail: row.detail,
+						createdAt: row.createdAt,
+					}
+				}))
+			})
+		},
+		finalizePromptImageAttachments(sessionId, attachments) {
+			if (!Array.isArray(attachments) || attachments.length === 0) return []
+			const ids = new Set()
+			for (const attachment of attachments) {
+				if (typeof attachment?.id !== "string" || !attachment.id || ids.has(attachment.id)) {
+					throw new TypeError("prompt image attachment ids must be unique non-empty strings")
 				}
-				db.exec("COMMIT")
-				return created
-			} catch (err) {
-				db.exec("ROLLBACK")
-				for (const filePath of writtenFiles) rmSync(filePath, { force: true })
-				throw err
+				if (!Number.isInteger(attachment.number) || attachment.number <= 0) {
+					throw new TypeError("prompt image attachment numbers must be positive integers")
+				}
+				if (attachment.variants?.display?.variant !== SESSION_ATTACHMENT_VARIANT_DISPLAY
+					|| (attachment.variants?.original && attachment.variants.original.variant !== SESSION_ATTACHMENT_VARIANT_ORIGINAL)) {
+					throw new TypeError("prompt image attachments require a display variant and an optional original variant")
+				}
+				ids.add(attachment.id)
 			}
+			const trace = syncOperationTracer(diagnostics, "ServerDb.finalizePromptImageAttachments.transaction", {
+				database: "server",
+				sessionId,
+				imageCount: attachments.length,
+			})
+			return sqliteTransaction(db, trace, () => {
+				for (const attachment of attachments) {
+					const reservation = getPromptImageAttachmentReservationStmt.get(
+						attachment.id,
+						sessionId,
+						SESSION_ATTACHMENT_KIND_PENDING_IMAGE,
+					)
+					if (!reservation || Number(reservation.number) !== attachment.number) {
+						throw Object.assign(new Error(`Prompt image reservation is no longer pending: ${attachment.id}`), {
+							code: "promptImageReservationInvalid",
+							status: 409,
+						})
+					}
+					insertSessionAttachmentVariantRows(db, attachment.id, [attachment.variants.display, attachment.variants.original])
+					const changes = Number(finalizePromptImageAttachmentReservationStmt.run(
+						SESSION_ATTACHMENT_KIND_IMAGE,
+						attachment.id,
+						sessionId,
+						attachment.number,
+						SESSION_ATTACHMENT_KIND_PENDING_IMAGE,
+					).changes ?? 0)
+					if (changes !== 1) throw new Error(`Could not finalize prompt image reservation: ${attachment.id}`)
+				}
+				return attachments.map((attachment) => attachmentImageBlockFromRows(
+					getImageAttachmentByIdStmt.get(attachment.id, SESSION_ATTACHMENT_KIND_IMAGE),
+				))
+			})
+		},
+		cancelPromptImageAttachmentReservations(sessionId, ids) {
+			if (!Array.isArray(ids) || ids.length === 0) return 0
+			const trace = syncOperationTracer(diagnostics, "ServerDb.cancelPromptImageAttachmentReservations.transaction", {
+				database: "server",
+				sessionId,
+				imageCount: ids.length,
+			})
+			return sqliteTransaction(db, trace, () => ids.reduce((count, id) => count + Number(
+				cancelPromptImageAttachmentReservationStmt.run(id, sessionId, SESSION_ATTACHMENT_KIND_PENDING_IMAGE).changes ?? 0
+			), 0))
+		},
+		listPendingPromptImageAttachmentReservations() {
+			return listPendingPromptImageAttachmentReservationsStmt.all(SESSION_ATTACHMENT_KIND_PENDING_IMAGE)
 		},
 		getImageAttachment(id) {
 			return attachmentImageBlockFromRows(getImageAttachmentByIdStmt.get(id, SESSION_ATTACHMENT_KIND_IMAGE))
@@ -1169,13 +1537,8 @@ export function openServerDb(options = {}) {
 				SESSION_ATTACHMENT_KIND_IMAGE,
 			))
 		},
-		getAttachmentVariant(sessionId, attachmentId, variant = SESSION_ATTACHMENT_VARIANT_DISPLAY) {
-			const row = getAttachmentVariantStmt.get(sessionId, attachmentId, variant)
-			if (!row?.filePath || !existsSync(row.filePath)) return undefined
-			return {
-				...row,
-				data: readFileSync(row.filePath),
-			}
+		getAttachmentVariantMetadata(sessionId, attachmentId, variant = SESSION_ATTACHMENT_VARIANT_DISPLAY) {
+			return getAttachmentVariantMetadataStmt.get(sessionId, attachmentId, variant, SESSION_ATTACHMENT_KIND_IMAGE)
 		},
 		markProjectMaintenanceSession(record) {
 			return projectMaintenanceSessionFromRow(markProjectMaintenanceSessionStmt.get(
@@ -1278,6 +1641,10 @@ export function openServerDb(options = {}) {
 				options.includeHidden === true ? 1 : 0,
 				cwd,
 				prefix,
+				cwd,
+				prefix,
+				cwd,
+				sep,
 			).map(sessionFromRow)
 		},
 		listSessionStatuses(options = {}) {
@@ -1288,6 +1655,10 @@ export function openServerDb(options = {}) {
 				cwd ?? null,
 				cwd ?? null,
 				cwd ? (cwd.endsWith(sep) ? cwd : `${cwd}${sep}`) : null,
+				cwd ?? null,
+				cwd ? (cwd.endsWith(sep) ? cwd : `${cwd}${sep}`) : null,
+				cwd ?? null,
+				sep,
 			).map(sessionFromRow)
 		},
 		loadSessionCustomEntries(sessionId, customType) {
@@ -1323,15 +1694,14 @@ export function openServerDb(options = {}) {
 			return findByPrefixStmt.all(`${prefix}%`).map((row) => row.id)
 		},
 		replaceSessions(sessions) {
-			db.exec("BEGIN IMMEDIATE")
-			try {
+			const trace = syncOperationTracer(diagnostics, "ServerDb.replaceSessions.transaction", {
+				database: "server",
+				sessionCount: sessions.length,
+			})
+			sqliteTransaction(db, trace, () => {
 				db.prepare("UPDATE sessions SET deleted_at = ? WHERE deleted_at IS NULL").run(nowIso())
 				for (const session of sessions) api.upsertSession(session)
-				db.exec("COMMIT")
-			} catch (err) {
-				db.exec("ROLLBACK")
-				throw err
-			}
+			})
 		},
 		sessionCount() {
 			return Number(sessionCountStmt.get().n ?? 0)
@@ -1341,8 +1711,11 @@ export function openServerDb(options = {}) {
 			if (!Number.isInteger(run.expectedMutationVersion)) {
 				throw mutationError("A session mutation version is required to start a run.", "CEREX_SESSION_MUTATION_VERSION_REQUIRED")
 			}
-			db.exec("BEGIN IMMEDIATE")
-			try {
+			const trace = syncOperationTracer(diagnostics, "ServerDb.startRun.transaction", {
+				database: "server",
+				sessionId: run.sessionId,
+			})
+			sqliteTransaction(db, trace, () => {
 				startRunStmt.run(run.id, run.sessionId, at)
 				const claimed = startRunSessionStateStmt.run(
 					at,
@@ -1358,16 +1731,15 @@ export function openServerDb(options = {}) {
 					}
 					throw mutationError(`Session ${run.sessionId} changed in the database; reopen it before starting a run.`, "CEREX_SESSION_STALE")
 				}
-				db.exec("COMMIT")
-			} catch (err) {
-				db.exec("ROLLBACK")
-				throw err
-			}
+			})
 		},
 		finishRun(id, update) {
 			const at = update.endedAt ?? nowIso()
-			db.exec("BEGIN IMMEDIATE")
-			try {
+			const trace = syncOperationTracer(diagnostics, "ServerDb.finishRun.transaction", {
+				database: "server",
+				status: update.status,
+			})
+			sqliteTransaction(db, trace, () => {
 				finishRunStmt.run(
 					update.status,
 					at,
@@ -1377,18 +1749,18 @@ export function openServerDb(options = {}) {
 				)
 				const state = update.status === "completed" ? "idle" : normalizeRunStatus(update.status)
 				finishRunSessionStateStmt.run(state, at, id, id, id)
-				db.exec("COMMIT")
-			} catch (err) {
-				db.exec("ROLLBACK")
-				throw err
-			}
+			})
 		},
 		finishLatestInterruptedRunForSession(sessionId, update) {
 			const row = latestInterruptedRunForSessionStmt.get(sessionId)
 			if (!row?.id) return false
 			const at = update.endedAt ?? nowIso()
-			db.exec("BEGIN IMMEDIATE")
-			try {
+			const trace = syncOperationTracer(diagnostics, "ServerDb.finishLatestInterruptedRun.transaction", {
+				database: "server",
+				sessionId,
+				status: update.status,
+			})
+			return sqliteTransaction(db, trace, () => {
 				finishRunStmt.run(
 					update.status,
 					at,
@@ -1398,25 +1770,17 @@ export function openServerDb(options = {}) {
 				)
 				const state = update.status === "completed" ? "idle" : normalizeRunStatus(update.status)
 				finishLatestInterruptedRunSessionStateStmt.run(state, at, row.id, sessionId, row.id)
-				db.exec("COMMIT")
 				return true
-			} catch (err) {
-				db.exec("ROLLBACK")
-				throw err
-			}
+			})
 		},
 		interruptRunningRuns() {
 			const at = nowIso()
-			db.exec("BEGIN IMMEDIATE")
-			try {
+			const trace = syncOperationTracer(diagnostics, "ServerDb.interruptRunningRuns.transaction", { database: "server" })
+			return sqliteTransaction(db, trace, () => {
 				const changes = Number(interruptRunningStmt.run(at).changes ?? 0)
 				if (changes > 0) interruptRunningSessionsStmt.run(at, at)
-				db.exec("COMMIT")
 				return changes
-			} catch (err) {
-				db.exec("ROLLBACK")
-				throw err
-			}
+			})
 		},
 		startServiceRun(run) {
 			startServiceRunStmt.run(
@@ -1450,6 +1814,7 @@ export function openServerDb(options = {}) {
 		},
 	}
 
-	if (options.recoverRunningRuns) api.interruptRunningRuns()
-	return api
+	const instrumentedApi = instrumentServerDbApi(api, diagnostics)
+	if (options.recoverRunningRuns) instrumentedApi.interruptRunningRuns()
+	return instrumentedApi
 }

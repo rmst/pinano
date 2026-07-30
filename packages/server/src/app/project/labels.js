@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import { lstat, mkdir, readFile, readdir, rename, rm, rmdir, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
@@ -8,6 +9,9 @@ export const LEGACY_PROJECT_STATE_DIRNAME = LEGACY_PRODUCT_STATE_DIRECTORY
 export const PROJECT_METADATA_RELATIVE_PATH = `${PROJECT_STATE_DIRNAME}/project.json`
 export const LEGACY_PROJECT_METADATA_RELATIVE_PATH = `${LEGACY_PROJECT_STATE_DIRNAME}/project.json`
 
+const PROJECT_PREVIEWS_DIRECTORY_NAME = "previews"
+const PROJECT_PREVIEWS_TREE_GITIGNORE_ENTRY = `!${PROJECT_PREVIEWS_DIRECTORY_NAME}/**`
+
 const projectMetadataMigrations = new Map()
 
 /** Project metadata is JSON, so a recursively key-sorted representation gives us runtime-portable semantic equality. @param {unknown} value */
@@ -15,6 +19,13 @@ function canonicalJsonValue(value) {
 	if (Array.isArray(value)) return value.map(canonicalJsonValue)
 	if (!value || typeof value !== "object") return value
 	return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJsonValue(value[key])]))
+}
+
+/** @param {unknown} value */
+export function cleanProjectId(value) {
+	if (typeof value !== "string") return ""
+	const id = value.trim().toLowerCase()
+	return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id) ? id : ""
 }
 
 /** @param {unknown} a @param {unknown} b */
@@ -96,6 +107,25 @@ async function ensureChildDirectory(path) {
 	}
 }
 
+/** Create the preview-local ignore without overwriting an existing policy. @param {string} root */
+export async function initializeProjectPreviewDirectoryIgnore(root) {
+	const previewsDir = join(resolve(root), PROJECT_STATE_DIRNAME, PROJECT_PREVIEWS_DIRECTORY_NAME)
+	try {
+		const info = await lstat(previewsDir)
+		if (!info.isDirectory() || info.isSymbolicLink()) return false
+	} catch (/** @type {any} */ err) {
+		if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return false
+		throw err
+	}
+	try {
+		await writeFile(join(previewsDir, ".gitignore"), "*\n", { flag: "wx" })
+		return true
+	} catch (/** @type {any} */ err) {
+		if (err?.code === "EEXIST") return false
+		throw err
+	}
+}
+
 /** @param {string} root */
 async function ensureCanonicalProjectStateDirectoryIgnored(root) {
 	const stateDir = join(root, PROJECT_STATE_DIRNAME)
@@ -109,12 +139,14 @@ async function ensureCanonicalProjectStateDirectoryIgnored(root) {
 		text = ""
 	}
 	const entries = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#"))
+	// Initialize existing preview directories before the parent rule exposes their contents; that rule then serves as the one-time migration marker.
+	if (!entries.includes(PROJECT_PREVIEWS_TREE_GITIGNORE_ENTRY)) await initializeProjectPreviewDirectoryIgnore(root)
 	const required = [
 		"*",
 		`!${PROJECT_DOCUMENTS_DIRECTORY_NAME}/`,
 		`!${PROJECT_DOCUMENTS_DIRECTORY_NAME}/**`,
-		"!previews/",
-		"!previews/*.preview.json",
+		`!${PROJECT_PREVIEWS_DIRECTORY_NAME}/`,
+		PROJECT_PREVIEWS_TREE_GITIGNORE_ENTRY,
 	]
 	const missing = required.filter((entry) => !entries.includes(entry))
 	if (missing.length === 0) return { changed: false, path: gitignore }
@@ -185,9 +217,11 @@ async function readProjectMetadataObject(cwd) {
 	return await readJsonObject(join(cwd, PROJECT_METADATA_RELATIVE_PATH)) ?? {}
 }
 
-/** @param {string} cwd */
-async function readProjectMetadataName(cwd) {
-	return cleanProjectName((await readProjectMetadataObject(cwd))?.name)
+/** Read a project's internal identity without adding it to user/model-facing project metadata. @param {string | undefined} cwd */
+export async function projectIdentityForCwd(cwd) {
+	const root = resolve(cwd || process.cwd())
+	await migrateLegacyProjectMetadata(root)
+	return { id: cleanProjectId((await readProjectMetadataObject(root)).id) || undefined }
 }
 
 /** @param {string} cwd */
@@ -196,6 +230,32 @@ export async function ensureProjectStateDirectoryIgnored(cwd) {
 	const migration = await migrateLegacyProjectMetadata(root)
 	const ignore = await ensureCanonicalProjectStateDirectoryIgnored(root)
 	return { ...ignore, changed: migration.ignoreChanged || ignore.changed }
+}
+
+/** Ensure that a project root has a durable local identity. Supplying replace=true is reserved for resolving copied metadata whose ID already belongs to another registered root.
+ * @param {string | undefined} cwd
+ * @param {{ id?: string, replace?: boolean }} [options]
+ */
+export async function ensureProjectIdentityForCwd(cwd, options = {}) {
+	const root = resolve(cwd || process.cwd())
+	await migrateLegacyProjectMetadata(root)
+	const metadata = await readProjectMetadataObject(root)
+	const existingId = cleanProjectId(metadata.id)
+	const requestedId = options.id === undefined ? "" : cleanProjectId(options.id)
+	if (options.id !== undefined && !requestedId) throw Object.assign(new Error("project id must be a UUID"), { status: 400 })
+	if (existingId && requestedId && existingId !== requestedId && options.replace !== true) {
+		throw Object.assign(new Error("project already has a different identity"), { status: 409 })
+	}
+	const id = options.replace === true ? requestedId || randomUUID() : existingId || requestedId || randomUUID()
+	const write = await writeProjectMetadataPatch(root, { id })
+	return {
+		id,
+		project: await projectInfoForCwd(root),
+		changed: write.changed,
+		ignoreChanged: write.ignoreChanged,
+		metadataPath: write.metadataPath,
+		gitignorePath: write.gitignorePath,
+	}
 }
 
 /**
@@ -252,7 +312,8 @@ export async function setProjectNameForCwd(cwd, value) {
 export async function projectInfoForCwd(cwd) {
 	const root = resolve(cwd || process.cwd())
 	await migrateLegacyProjectMetadata(root)
-	const name = await readProjectMetadataName(root)
+	const metadata = await readProjectMetadataObject(root)
+	const name = cleanProjectName(metadata.name)
 	if (name) return {
 		label: name,
 		name,

@@ -15,9 +15,8 @@ function toolExecutionData(entry) {
 
 function toolExecutionHasDurableResult(data) {
 	if (!data?.toolCallId) return false
-	if (data.phase === "recovered_unknown") return true
-	if (data.phase !== "ended") return false
-	return data.hasDurableMessage === true || !!data.messageEntryId || data.hasRecoveryMessage === true || !!data.message
+	if (data.phase !== "ended" && data.phase !== "recovered_unknown") return false
+	return data.hasDurableMessage === true || !!data.messageEntryId
 }
 
 function unknownToolResultMessage(tool) {
@@ -89,14 +88,16 @@ export async function synthesizeUnknownToolResultsForStartedTools(session) {
 	const messages = []
 	for (const tool of pending) {
 		const message = unknownToolResultMessage(tool)
+		const messageEntryId = await session.appendMessage(message)
 		await session.appendCustomEntry("tool_execution", {
-			version: 1,
+			version: 2,
 			phase: "recovered_unknown",
 			toolCallId: tool.toolCallId,
 			toolName: tool.toolName,
 			args: tool.args,
 			startedEntryId: tool.entryId,
-			message,
+			messageEntryId,
+			hasDurableMessage: true,
 		})
 		messages.push(message)
 	}

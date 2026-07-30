@@ -7,14 +7,14 @@ import { spawn } from "node:child_process"
 import { closeSync, openSync } from "node:fs"
 import { mkdir, readFile, rm } from "node:fs/promises"
 import { createInterface } from "node:readline/promises"
-import { join, resolve } from "node:path"
+import { join } from "node:path"
 
 import { CerexClient } from "../../../../sdk/src/index.js"
 import { runtimeSourceReferencePath } from "../paths.js"
 import { configuredServiceEndpointDefaults } from "./config.js"
 import { withoutReexecSupervisorEnv } from "../runtime/reexec.js"
 import { bestEffortAutoInstallBundledBubblewrap } from "../sandbox/bwrap/bundled.js"
-import { pathIsWithin } from "../sandbox/paths.js"
+import { sessionMatchesDirectoryFilter } from "../session/directory-filter.js"
 import { HOP_BY_HOP_HEADERS, proxyHttpRequest } from "../http/proxy.js"
 import { createWebSocketClient } from "../websocket/client.js"
 import { WEB_BROWSER_UI_NAME } from "../../../../protocol/src/web-branding.js"
@@ -816,11 +816,6 @@ export function createServiceClient(info, options = {}) {
 	let runtimeCheckTimer = /** @type {NodeJS.Timeout | undefined} */ (undefined)
 	let runtimeCheckInFlight = false
 
-	const sessionMatchesDirectoryFilter = (session, cwd) => {
-		if (!cwd) return true
-		const initialWd = typeof session?.initialWd === "string" && session.initialWd ? session.initialWd : session?.cwd
-		return typeof initialWd === "string" && initialWd ? pathIsWithin(resolve(cwd), resolve(initialWd)) : false
-	}
 	const filterSessionEvent = (event) => {
 		if (!sessionListCwd || !Array.isArray(event?.sessions)) return event
 		return { ...event, sessions: event.sessions.filter((session) => sessionMatchesDirectoryFilter(session, sessionListCwd)) }
@@ -1074,6 +1069,14 @@ export function createServiceClient(info, options = {}) {
 					reportEventHandlerError(err)
 				}
 			}
+			const callOption = (handler, ...args) => {
+				if (typeof handler !== "function") return
+				try {
+					Promise.resolve(handler(...args)).catch(reportEventHandlerError)
+				} catch (err) {
+					reportEventHandlerError(err)
+				}
+			}
 			let established = false
 			let failed = false
 			let closed = false
@@ -1085,10 +1088,12 @@ export function createServiceClient(info, options = {}) {
 				...(subscribeOptions.excludeWorktreeStatus === true ? { excludeWorktreeStatus: true } : {}),
 				...(subscribeOptions.excludeSessions === true ? { excludeSessions: true } : {}),
 				...(subscribeOptions.worktreeStatusOnly === true ? { worktreeStatusOnly: true } : {}),
+				...(subscribeOptions.readySnapshotOnly === true ? { readySnapshotOnly: true } : {}),
 				...(sessionListCwd ? { cwd: sessionListCwd } : {}),
 				...(clientCwd ? { contextCwd: clientCwd } : {}),
 			}, {
 				onReady() {
+					callOption(subscribeOptions.onReady)
 					if (failed || established) dispatchEvent({ type: "service_live_reconnected", reason: failed ? "resource" : "transport" })
 					established = true
 					failed = false
@@ -1098,6 +1103,7 @@ export function createServiceClient(info, options = {}) {
 					dispatchEvent(filterSessionEvent(event))
 				},
 				onError(err) {
+					callOption(subscribeOptions.onError, err)
 					failed = true
 					dispatchEvent({ type: "error", error: err?.message ?? String(err) })
 				},

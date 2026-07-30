@@ -183,11 +183,41 @@ function resolveFootnotes(tokens) {
 	return footnotes
 }
 
+const normalizeSourceNewlines = (source) => source.replace(/\r\n?/g, "\n")
+const sourceLineCount = (source) => 1 + (normalizeSourceNewlines(source).match(/\n/g)?.length ?? 0)
+
+function sourceTokenOffset(source, raw, offset) {
+	if (!raw) return offset
+	let candidate = source.indexOf(raw, offset)
+	while (candidate >= 0) {
+		if (candidate === offset || candidate === 0 || source[candidate - 1] === "\n") return candidate
+		candidate = source.indexOf(raw, candidate + 1)
+	}
+	return -1
+}
+
+function annotateSourceLines(tokens, source) {
+	const normalizedSource = normalizeSourceNewlines(source)
+	let offset = 0
+	let line = 1
+	for (const token of tokens) {
+		const raw = normalizeSourceNewlines(token.raw ?? "")
+		const foundAt = sourceTokenOffset(normalizedSource, raw, offset)
+		const start = foundAt < 0 ? offset : foundAt
+		line += (normalizedSource.slice(offset, start).match(/\n/g)?.length ?? 0)
+		token.sourceLine = line
+		line += (raw.match(/\n/g)?.length ?? 0)
+		offset = start + raw.length
+	}
+	return tokens
+}
+
 export function parseMarkdown(source, { frontmatter: parseFrontmatter = false } = {}) {
 	const frontmatter = parseFrontmatter ? splitFrontmatter(source) : null
 	const tokens = normalizeTokens(markdownParser.lexer(frontmatter?.body ?? source))
 	if (frontmatter) tokens.unshift({ type: "frontmatter", raw: frontmatter.raw, text: frontmatter.text })
-	return { tokens, footnotes: resolveFootnotes(tokens) }
+	annotateSourceLines(tokens, source)
+	return { tokens, footnotes: resolveFootnotes(tokens), sourceLineCount: sourceLineCount(source) }
 }
 
 export function parseMarkdownInline(source) {

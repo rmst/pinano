@@ -22,7 +22,11 @@
 /** @typedef {import("../../../protocol/src/reasoning.js").ReasoningLevel | "off"} ThinkingLevel */
 
 /** @typedef {"sequential" | "parallel"} ToolExecutionMode */
-/** @typedef {"direct" | "direct_model_only"} ToolExposure */
+/**
+ * `deferred` tools remain available to code-mode cells but are omitted from the model-visible `exec` description. Models without code mode receive them directly as a compatibility fallback.
+ * `direct_model_only` tools remain model-visible and are excluded from code-mode cells.
+ * @typedef {"direct" | "deferred" | "direct_model_only"} ToolExposure
+ */
 
 /**
  * @typedef {object} AgentToolCodeMode

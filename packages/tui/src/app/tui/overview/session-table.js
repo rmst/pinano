@@ -1,10 +1,10 @@
-import { isAbsolute, resolve } from "node:path"
+import { resolve } from "node:path"
 import { ListViewportController, MouseWheelDeltaTracker, TUI, clickableRowSpan, clipLinesToViewport, truncateToWidth, visibleWidth } from "../../../tui/index.js"
 import { OVERVIEW_AGENT_PRIORITY, OVERVIEW_FOLDED_GROUP_LIMIT, overviewLifecycleStateFor, overviewSortTimestampFor, overviewStateFor } from "../../../../../server/src/app/overview/state.js"
 import { projectHeaderLabel } from "../../../../../server/src/app/project/display.js"
 import { projectNamesEqual } from "../../../../../server/src/app/project/labels.js"
 import { runAcknowledgementKind } from "../../../../../server/src/app/overview/run-acknowledgement.js"
-import { pathIsWithin } from "../../../../../server/src/app/sandbox/paths.js"
+import { sessionMatchesDirectoryFilter } from "../../../../../server/src/app/session/directory-filter.js"
 import { sessionOverviewContextMenuItems } from "../../../../../server/src/app/session/overview-context-menu.js"
 import { theme } from "../../theme.js"
 import { compactHomePath, explicitProjectOverrideLabel, fit, leftRightLine, projectLabel, sessionRowCanStillBeQueued, sessionRowIsRunning, shortSessionId, singleLine, stripAnsi } from "../format.js"
@@ -190,7 +190,7 @@ export class AgentTable {
 				continue
 			}
 			nextSessionIds.add(session.id)
-			const version = `${session.updatedAt ?? ""}:${session.agentView?.updatedAt ?? ""}:${session.latestRunStartedAt ?? ""}:${session.latestRunEndedAt ?? ""}:${session.runStatus ?? ""}:${session.runtimeState ?? ""}`
+			const version = `${session.updatedAt ?? ""}:${session.agentView?.updatedAt ?? ""}:${session.latestRunStartedAt ?? ""}:${session.latestRunEndedAt ?? ""}:${session.runStatus ?? ""}:${session.runtimeState ?? ""}:${session.runtimeNeedsInput === true}`
 			nextWorktreeVersions.set(session.id, version)
 		}
 		for (const sessionId of this.worktrees.keys()) {
@@ -293,10 +293,7 @@ export class AgentTable {
 	rows() {
 		let sessions = this.sessions
 		if (this.directoryFilterEnabled) {
-			sessions = sessions.filter((s) => {
-				const initialWd = typeof s.initialWd === "string" && isAbsolute(s.initialWd) ? resolve(s.initialWd) : undefined
-				return initialWd ? pathIsWithin(this.cwd, initialWd) : false
-			})
+			sessions = sessions.filter((session) => sessionMatchesDirectoryFilter(session, this.cwd))
 		}
 		if (this.filter) {
 			sessions = sessions.filter((s) => {
@@ -739,6 +736,7 @@ export class AgentTable {
 		const runtimeState = session.runtimeState || session.runStatus || "idle"
 		if (lifecycleState === "queued") return theme.cyan("◌")
 		if (lifecycleState === "deleted") return theme.dim("x")
+		if (session.runtimeNeedsInput) return theme.gray("∙")
 		if (this.isRunningSession(session)) return theme.cyan(this.spinnerFrame() || "✽")
 		const acknowledgementKind = runAcknowledgementKind(session)
 		if (acknowledgementKind === "problem") return theme.red("✖")

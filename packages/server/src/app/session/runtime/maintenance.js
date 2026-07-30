@@ -1,7 +1,7 @@
 import { stat } from "node:fs/promises"
 import { join } from "node:path"
 
-import { PREVIEW_LOG_DIRNAME } from "../../preview/manifest.js"
+import { PREVIEW_DIRECTORY_NAME } from "../../preview/manifest.js"
 import { SESSION_CUSTOM_TYPE_PROPERTIES, isAutomatedMaintenanceMessage } from "../properties.js"
 
 export const PRE_TURN_MAINTENANCE_PLACEMENT = "pre_turn"
@@ -12,7 +12,7 @@ export function projectMaintenanceNoticeMessage({ projectDir }) {
 	return {
 		role: "developer",
 		content: [{ type: "text", text: [
-			`This is a hidden Cerex project maintenance session for ${projectDir}.`,
+			`This is an automated Cerex project setup session for ${projectDir}.`,
 			"Keep work focused on durable project metadata and preview proxy setup. Do not modify product source unless the user explicitly asked for that project change.",
 		].join("\n") }],
 		timestamp: Date.now(),
@@ -28,7 +28,7 @@ export async function projectPreviewsDirectoryExists(projectDir, workspace) {
 export async function projectMaintenanceSetupStatus(projectDir, workspace) {
 	const project = await workspace.project.info(projectDir).catch(() => undefined)
 	const previewsDirExists = await projectPreviewsDirectoryExists(projectDir, workspace)
-	const linkedGitWorktree = await workspace.worktrees.isLinked(projectDir).catch(() => false)
+	const linkedGitWorktree = await workspace.worktrees.isLinked(projectDir)
 	const missingProjectName = !project?.name
 	const missingPreviewsDir = !previewsDirExists
 	return {
@@ -56,19 +56,16 @@ export function projectMaintenancePrompt({ projectDir, project, setup = {} }) {
 		...(setup.missingPreviewsDir ? [".cerex/previews does not exist"] : []),
 	]
 	return [
-		`Set up Cerex project metadata and preview modules for ${label}.`,
+		`Set up Cerex project metadata and previews for ${label}.`,
 		"",
 		`Project directory: ${projectDir}`,
 		...(reasons.length ? ["", `Setup reason: ${reasons.join("; ")}.`] : []),
 		"",
 		"Tasks:",
 		"1. Choose a concise stable project name and set it with `cerex project set <name>` unless the existing project metadata is already correct.",
-		"2. Ensure `.cerex/previews/` exists. It is fine for the directory to stay empty when this repository does not have a relevant web/docs preview.",
-		"3. Inspect the project just enough to identify likely local preview commands for this repo. Many repositories, such as mobile apps, libraries, CLIs, or backend-only services, may not need a Cerex preview.",
-		"4. Create `.cerex/previews/<name>.preview.js` modules only for useful web apps or docs servers you can justify from local files. Preview names must be lowercase DNS labels. The module must export `default { exec, description?, healthPath? }`.",
-		"5. Use `exec` as either a shell command string or a JS function `exec({ host, port, publicUrl, logPath, signal, env })`. The preview must listen on `host:port` or `$CEREX_HOST:$CEREX_PORT`; shell commands also receive `$CEREX_PUBLIC_URL` and `$CEREX_PREVIEW_LOG`.",
+		"2. Ensure `.cerex/previews/` exists. Inspect the project for a useful web or documentation preview; when one exists, read `cerex preview --help` and create an appropriate definition.",
 		"",
-		"Keep this maintenance pass conservative: keep scripts small, leave unrelated source alone, and do not install dependencies or use the network.",
+		"Keep this setup pass conservative: keep scripts small, leave unrelated source alone, and do not install dependencies or use the network.",
 	].join("\n")
 }
 
@@ -78,7 +75,7 @@ function shouldAutoRegisterProject(project) {
 
 export async function sessionPreviewsDirectoryExists(sessionDir) {
 	try {
-		return (await stat(join(sessionDir, PREVIEW_LOG_DIRNAME))).isDirectory()
+		return (await stat(join(sessionDir, PREVIEW_DIRECTORY_NAME))).isDirectory()
 	} catch (err) {
 		if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return false
 		throw err

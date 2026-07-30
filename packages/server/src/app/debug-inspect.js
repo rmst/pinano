@@ -386,7 +386,7 @@ export function createDebugInspectApp(options) {
 		}))
 		app.get(`${prefix}/inspect/sessions/:id`, safe("inspect", async (context) => {
 			const rawId = context.req.param("id") ?? ""
-			const id = options.resolveSessionId ? options.resolveSessionId(rawId) : rawId
+			const id = options.resolveSessionId ? await options.resolveSessionId(rawId) : rawId
 			const runtime = options.getManager().runtimes.get(id)
 			return context.json({
 				ok: true,

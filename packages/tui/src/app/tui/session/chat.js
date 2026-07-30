@@ -18,6 +18,7 @@ import {
 	BashShortcutComponent,
 	ContextLoadComponent,
 	CustomMessageComponent,
+	ProjectLocationComponent,
 	isBashShortcutMessage,
 	TextLine,
 	ToolExecutionComponent,
@@ -1182,6 +1183,8 @@ export class Chat {
 			this.chatContainer.addItem(new ContextLoadComponent(msg.contextLoad, flattenContent(msg.content)), "custom", {
 				collapseGroupId: this.ensureTranscriptWorkGroupId(),
 			})
+		} else if (msg.projectLocationChanged) {
+			this.chatContainer.addItem(new ProjectLocationComponent(msg), "custom")
 		} else if (msg.role === PLAN_UPDATE_MESSAGE_ROLE) {
 			this.chatContainer.addItem(new CustomMessageComponent(flattenContent(msg.content), { label: "plan" }), "custom", {
 				collapseGroupId: this.ensureTranscriptWorkGroupId(),

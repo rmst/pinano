@@ -32,26 +32,30 @@ async function cancelReader(reader) {
 }
 
 export async function writeResponseBody(incoming, outgoing, response) {
-	if (incoming.method === "HEAD" || !response.body) return
+	if (incoming.method === "HEAD" || !response.body) return 0
 
 	const reader = response.body.getReader()
 	const closed = closePromise(outgoing)
+	let bytesWritten = 0
 	try {
 		for (;;) {
 			if (outgoing.destroyed) {
 				await cancelReader(reader)
-				return
+				return bytesWritten
 			}
 			const chunk = await Promise.race([reader.read(), closed.promise])
 			if (!chunk || outgoing.destroyed) {
 				await cancelReader(reader)
-				return
+				return bytesWritten
 			}
 			const { done, value } = chunk
-			if (done) return
-			if (!outgoing.write(value) && !await waitForDrainOrClose(outgoing)) {
+			if (done) return bytesWritten
+			const byteLength = value?.byteLength ?? Buffer.byteLength(String(value ?? ""))
+			const accepted = outgoing.write(value)
+			bytesWritten += byteLength
+			if (!accepted && !await waitForDrainOrClose(outgoing)) {
 				await cancelReader(reader)
-				return
+				return bytesWritten
 			}
 		}
 	} finally {

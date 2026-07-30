@@ -6,6 +6,7 @@ import { delimiter } from "node:path"
 import { dirname, isAbsolute, join } from "node:path"
 
 import { dataRoot } from "../../paths.js"
+import { bubblewrapSecurityProbeArgs } from "./isolation.js"
 
 export const bundledBubblewrapSourceBuild = {
 	version: 1,
@@ -26,15 +27,7 @@ export const bundledBubblewrapSourceBuild = {
 }
 
 const sourceBuildTools = ["git", "make", "cc", "ar", "ranlib", "grep", "sed"]
-const sourceBuildSmokeArgs = [
-	"--die-with-parent",
-	"--ro-bind", "/", "/",
-	"--dev", "/dev",
-	"--proc", "/proc",
-	"--tmpfs", "/tmp",
-	"--chdir", "/",
-	"/bin/sh", "-c", "true",
-]
+const sourceBuildSmokeArgs = bubblewrapSecurityProbeArgs()
 
 /** @param {Buffer | Uint8Array | string} data */
 function sha256(data) {

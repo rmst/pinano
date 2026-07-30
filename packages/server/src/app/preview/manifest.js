@@ -3,19 +3,18 @@ import { mkdir, readdir, readFile, rename, stat } from "node:fs/promises"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
 
-import { cleanupLegacyProjectStateDirectory, ensureProjectStateDirectoryIgnored, LEGACY_PROJECT_STATE_DIRNAME, PROJECT_STATE_DIRNAME } from "../project/labels.js"
+import { cleanupLegacyProjectStateDirectory, ensureProjectStateDirectoryIgnored, initializeProjectPreviewDirectoryIgnore, LEGACY_PROJECT_STATE_DIRNAME, PROJECT_STATE_DIRNAME } from "../project/labels.js"
 import { projectDocumentsDirectory } from "../project/documents.js"
 
 export const PREVIEW_DIRECTORY_NAME = "previews"
-export const PREVIEW_FILE_SUFFIX = ".preview.js"
-export const STATIC_PREVIEW_FILE_SUFFIX = ".preview.json"
-export const PROJECT_PREVIEW_LOG_DIRNAME = "preview-logs"
+export const PREVIEW_FILE_SUFFIX = ".preview.json"
+export const PREVIEW_LOG_DIRECTORY_NAME = "logs"
 export const DEFAULT_PREVIEW_HOST = "127.0.0.1"
 export const DEFAULT_PREVIEW_HEALTH_PATH = "/"
 export const DEFAULT_PREVIEW_IDLE_TIMEOUT_MS = 10 * 60 * 1000
+export const DEFAULT_PREVIEW_STARTUP_TIMEOUT_MS = 30 * 1000
 export const PREVIEW_AUTHORIZATION_HEADER = "X-Cerex-Preview-Authorization"
 export const LEGACY_PREVIEW_AUTHORIZATION_HEADER = "X-Pinano-Preview-Authorization"
-export const PREVIEW_LOG_DIRNAME = "previews"
 export const PREVIEW_CONTROL_PATH_PREFIX = "/.cerex/preview"
 export const LEGACY_PREVIEW_CONTROL_PATH_PREFIX = "/.pinano/preview"
 export const PREVIEW_STATUS_PATH = `${PREVIEW_CONTROL_PATH_PREFIX}/status`
@@ -33,7 +32,6 @@ export const PREVIEW_ROOT_KIND_SOURCE = "source"
 
 const PREVIEW_PUBLIC_HOST_LABEL = "run"
 const DEFAULT_PREVIEW_ROUTING_SLUG = "local"
-const MAX_PREVIEW_COMMAND_LENGTH = 8192
 const PREVIEW_SCOPE_HASH_LENGTH = 16
 const MAX_PREVIEW_ROUTING_SLUG_LENGTH = 16
 const MAX_PREVIEW_SCOPE_LABEL_LENGTH = PREVIEW_SCOPE_HASH_LENGTH + 2 + MAX_PREVIEW_ROUTING_SLUG_LENGTH
@@ -41,132 +39,135 @@ const MAX_PREVIEW_NAME_LENGTH = 63 - 2 - MAX_PREVIEW_SCOPE_LABEL_LENGTH
 const PREVIEW_NAME_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/
 const PREVIEW_ROUTING_SLUG_RE = PREVIEW_NAME_RE
 const MAX_PREVIEW_DESCRIPTION_LENGTH = 512
-const PREVIEW_MODULE_TAG = "cerex-preview-module"
+const MAX_PREVIEW_COMMAND_LENGTH = 32 * 1024
+const ROUTE_PARAMETER_RE = /^[A-Za-z][A-Za-z0-9_]*$/
 const projectPreviewMigrations = new Map()
-
-const PREVIEW_MODULE_LOADER_SOURCE = [
-	"import { readFile } from \"node:fs/promises\"",
-	"import { fileURLToPath } from \"node:url\"",
-	`const tag = ${JSON.stringify(PREVIEW_MODULE_TAG)}`,
-	"const tagged = (url) => { try { return new URL(url).searchParams.has(tag) } catch { return false } }",
-	"const relative = (specifier) => specifier.startsWith(\"./\") || specifier.startsWith(\"../\") || specifier.startsWith(\"/\") || specifier.startsWith(\"file:\")",
-	"export async function resolve(specifier, context, nextResolve) {",
-	"	const result = await nextResolve(specifier, context)",
-	"	if (tagged(context.parentURL) && relative(specifier) && result.url.startsWith(\"file:\") && fileURLToPath(result.url).endsWith(\".js\")) {",
-	"		const url = new URL(result.url)",
-	"		url.searchParams.set(tag, \"1\")",
-	"		return { ...result, url: url.href }",
-	"	}",
-	"	return result",
-	"}",
-	"export async function load(url, context, nextLoad) {",
-	"	if (tagged(url) || (url.startsWith(\"file:\") && fileURLToPath(url).endsWith(\".preview.js\"))) return { format: \"module\", source: await readFile(fileURLToPath(url), \"utf8\"), shortCircuit: true }",
-	"	return nextLoad(url, context)",
-	"}",
-].join("\n")
-const PREVIEW_MODULE_LOADER_URL = `data:text/javascript,${encodeURIComponent(PREVIEW_MODULE_LOADER_SOURCE)}`
-const PREVIEW_MODULE_REGISTER_SOURCE = [
-	"import { register } from \"node:module\"",
-	`register(${JSON.stringify(PREVIEW_MODULE_LOADER_URL)}, import.meta.url)`,
-].join("\n")
-const PREVIEW_MODULE_REGISTER_URL = `data:text/javascript,${encodeURIComponent(PREVIEW_MODULE_REGISTER_SOURCE)}`
-
-function shellQuote(value) {
-	return `'${String(value).replaceAll("'", "'\\''")}'`
-}
-
-function staticPreviewNameFromFilename(filename) {
-	if (!filename.endsWith(STATIC_PREVIEW_FILE_SUFFIX)) return undefined
-	const name = filename.slice(0, -STATIC_PREVIEW_FILE_SUFFIX.length)
-	if (!PREVIEW_NAME_RE.test(name) || name.length > MAX_PREVIEW_NAME_LENGTH) return undefined
-	return cleanPreviewName(name)
-}
 
 function isProperPathWithin(rootPath, candidatePath) {
 	const path = relative(rootPath, candidatePath)
 	return Boolean(path) && path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path)
 }
 
-function staticPreviewRoot(projectDir, value, context) {
-	if (typeof value !== "string" || !value.trim()) throw new Error(`${context} root must be a non-empty project-relative path`)
+function cleanRelativePath(value, context, options = {}) {
+	if (typeof value !== "string" || !value.trim()) throw new Error(`${context} must be a non-empty project-relative path`)
 	const path = value.trim()
-	if (path.includes("\0") || path.includes("\\") || isAbsolute(path)) throw new Error(`${context} root must be a project-relative path`)
-	const projectPath = resolve(projectDir)
-	const rootPath = resolve(projectPath, path)
-	if (!isProperPathWithin(projectPath, rootPath)) throw new Error(`${context} root must resolve to a subdirectory of the project`)
-	return rootPath
+	if (path.includes("\0") || path.includes("\\") || isAbsolute(path)) throw new Error(`${context} must be a project-relative path`)
+	const parts = path.split("/").filter((part) => part && part !== ".")
+	if (parts.length === 0) {
+		if (options.allowRoot === true) return "."
+		throw new Error(`${context} must resolve below its base directory`)
+	}
+	if (parts.some((part) => part === "..")) throw new Error(`${context} must stay within its base directory`)
+	return parts.join("/")
 }
 
-function defaultStaticPreviewRoot(projectDir, configPath, context) {
-	const projectPath = resolve(projectDir)
-	const rootPath = resolve(dirname(configPath))
-	if (!isProperPathWithin(projectPath, rootPath)) throw new Error(`${context} root must resolve to a subdirectory of the project`)
-	if (rootPath === resolve(projectPreviewDirectory(projectPath))) {
-		throw new Error(`${context} root is required for definitions under ${projectPreviewDirectory(projectPath)}`)
+function projectRelativePath(projectDir, value, context) {
+	const path = cleanRelativePath(value, context)
+	const resolvedPath = resolve(projectDir, path)
+	if (!isProperPathWithin(resolve(projectDir), resolvedPath)) throw new Error(`${context} must stay within the project directory`)
+	return { path, resolvedPath }
+}
+
+function cleanUrlPath(value, context, defaultValue = "/") {
+	if (value === undefined) return defaultValue
+	if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//") || value.includes("\0") || value.includes("?") || value.includes("#")) {
+		throw new Error(`${context} must be an absolute URL path without a query or fragment`)
 	}
-	return rootPath
+	return value
 }
 
 function staticPreviewEntryPath(value, context) {
 	if (value === undefined) return undefined
-	if (typeof value !== "string" || !value.trim()) throw new Error(`${context} entry must be a non-empty relative path`)
-	const path = value.trim()
-	if (path.includes("\0") || path.includes("\\") || path.includes("?") || path.includes("#") || path.startsWith("/")) {
-		throw new Error(`${context} entry must be a local relative path without a query or fragment`)
-	}
-	const trailingSlash = path.endsWith("/")
-	const parts = path.split("/").filter((part) => part && part !== ".")
-	if (parts.length === 0 || parts.some((part) => part === "..")) throw new Error(`${context} entry must stay within the static root`)
-	return `/${parts.map(encodeURIComponent).join("/")}${trailingSlash ? "/" : ""}`
+	const { path } = projectRelativePath("/preview-root", value, `${context} entry`)
+	return `/${path.split("/").map(encodeURIComponent).join("/")}`
 }
 
-export async function staticPreviewFileDefinitionFromPath(path, options = {}) {
-	const resolvedPath = resolve(path)
-	if (!basename(resolvedPath).endsWith(STATIC_PREVIEW_FILE_SUFFIX)) throw new Error(`static preview source file must end with ${STATIC_PREVIEW_FILE_SUFFIX}`)
-	const projectDir = typeof options.projectDir === "string" && options.projectDir ? resolve(options.projectDir) : undefined
-	if (!projectDir) throw new Error("static preview project directory is required")
-	if (!isProperPathWithin(projectDir, resolvedPath)) throw new Error("static preview source must be a file within the project")
-	const info = await stat(resolvedPath)
-	if (!info.isFile()) throw new Error(`static preview source is not a file: ${resolvedPath}`)
-	const name = cleanPreviewName(options.name ?? sourcePreviewName(resolvedPath))
-	if (name === STATIC_PREVIEW_NAME) throw new Error(`${basename(resolvedPath)} uses the reserved built-in preview name ${STATIC_PREVIEW_NAME}`)
-	let config
-	try {
-		const text = await readFile(resolvedPath, "utf-8")
-		config = text.trim() ? JSON.parse(text) : {}
-	} catch (err) {
-		if (err?.code === "ENOENT" || err?.code === "ENOTDIR") throw err
-		throw Object.assign(new Error(`Invalid static preview definition ${resolvedPath}: ${err?.message ?? err}`), { cause: err })
-	}
-	const context = `static preview ${name}`
-	if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error(`${context} must be a JSON object`)
-	const supported = new Set(["root", "entry", "description"])
-	const unknown = Object.keys(config).filter((key) => !supported.has(key))
+function cleanDescription(value, context) {
+	if (value === undefined) return undefined
+	if (typeof value !== "string") throw new Error(`${context} description must be a string`)
+	const text = value.trim()
+	if (!text || text.includes("\0")) return undefined
+	return text.length > MAX_PREVIEW_DESCRIPTION_LENGTH ? `${text.slice(0, MAX_PREVIEW_DESCRIPTION_LENGTH - 3)}...` : text
+}
+
+function assertOnlyProperties(value, supported, context) {
+	const unknown = Object.keys(value).filter((key) => !supported.has(key))
 	if (unknown.length > 0) throw new Error(`${context} has unsupported ${unknown.length === 1 ? "property" : "properties"}: ${unknown.join(", ")}`)
-	if (config.description !== undefined && typeof config.description !== "string") throw new Error(`${context} description must be a string`)
-	const rootPath = config.root === undefined
-		? defaultStaticPreviewRoot(projectDir, resolvedPath, context)
-		: staticPreviewRoot(projectDir, config.root, context)
-	if (rootPath === projectDocumentsDirectory(projectDir)) throw new Error(`${context} root is reserved for the built-in docs preview`)
-	if (rootPath === resolve(projectPreviewDirectory(projectDir))) throw new Error(`${context} root is reserved for preview definitions`)
-	return staticPreviewDefinition(rootPath, {
-		name,
-		description: cleanDescription(config.description),
-		entryPath: staticPreviewEntryPath(config.entry, context),
-		configPath: resolvedPath,
-	})
 }
 
-async function staticPreviewEntryDefinition(projectDir, previewsDir, entry) {
-	if (!entry.isFile()) return undefined
-	const name = staticPreviewNameFromFilename(entry.name)
-	if (!name) return undefined
-	const path = join(previewsDir, entry.name)
-	try {
-		return await staticPreviewFileDefinitionFromPath(path, { name, projectDir })
-	} catch (err) {
-		if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return undefined
-		throw err
+function cleanCommand(value, context) {
+	if (typeof value !== "string" || !value.trim() || value.includes("\0")) throw new Error(`${context} command must be a non-empty string`)
+	const command = value.trim()
+	if (command.length > MAX_PREVIEW_COMMAND_LENGTH) throw new Error(`${context} command is too long`)
+	return command
+}
+
+function routeParameters(path, context) {
+	const names = []
+	const parts = path === "/" ? [] : path.slice(1).split("/")
+	for (const [index, part] of parts.entries()) {
+		if (!part.startsWith(":") && !part.startsWith("*")) continue
+		const name = part.slice(1)
+		if (!ROUTE_PARAMETER_RE.test(name)) throw new Error(`${context} has an invalid route parameter: ${part}`)
+		if (names.includes(name)) throw new Error(`${context} repeats route parameter ${name}`)
+		if (part.startsWith("*") && index !== parts.length - 1) throw new Error(`${context} wildcard parameter ${part} must be the final segment`)
+		names.push(name)
+	}
+	return names
+}
+
+function cleanRouteSourceMapping(mapping, projectDir, context) {
+	if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) throw new Error(`${context} must be an object`)
+	assertOnlyProperties(mapping, new Set(["route", "source"]), context)
+	const routePath = cleanUrlPath(mapping.route, `${context} route`)
+	const route = routePath === "/" ? routePath : routePath.replace(/\/+$/, "")
+	const names = routeParameters(route, context)
+	const source = projectRelativePath(projectDir, mapping.source, `${context} source`).path
+	const placeholders = [...source.matchAll(/\{([^{}]+)\}/g)].map((match) => match[1])
+	if (source.replace(/\{[^{}]+\}/g, "").includes("{") || source.replace(/\{[^{}]+\}/g, "").includes("}")) throw new Error(`${context} source has an invalid placeholder`)
+	if (source.split("/").some((part) => [...part.matchAll(/\{[^{}]+\}/g)].length > 1)) {
+		throw new Error(`${context} source must not contain multiple route parameters in one path segment`)
+	}
+	for (const placeholder of placeholders) {
+		if (!names.includes(placeholder)) throw new Error(`${context} source uses unknown route parameter ${placeholder}`)
+	}
+	for (const name of names) {
+		const occurrences = placeholders.filter((candidate) => candidate === name).length
+		if (occurrences !== 1) throw new Error(`${context} source must contain route parameter {${name}} exactly once`)
+	}
+	return { route, source }
+}
+
+function cleanRouteSourceMap(value, projectDir, context) {
+	if (value === undefined) return undefined
+	if (!Array.isArray(value) || value.length === 0) throw new Error(`${context} routeSourceMap must be a non-empty array`)
+	const mappings = value.map((mapping, index) => cleanRouteSourceMapping(mapping, projectDir, `${context} routeSourceMap[${index}]`))
+	const duplicateRoute = mappings.find((mapping, index) => mappings.findIndex((candidate) => candidate.route === mapping.route) !== index)
+	if (duplicateRoute) throw new Error(`${context} routeSourceMap repeats route ${duplicateRoute.route}`)
+	const duplicateSource = mappings.find((mapping, index) => mappings.findIndex((candidate) => candidate.source === mapping.source) !== index)
+	if (duplicateSource) throw new Error(`${context} routeSourceMap repeats source ${duplicateSource.source}`)
+	return mappings
+}
+
+function cleanProcessTarget(target, context) {
+	assertOnlyProperties(target, new Set(["kind", "command", "cwd", "entry", "health"]), `${context} target`)
+	return {
+		command: cleanCommand(target.command, `${context} target`),
+		cwd: target.cwd === undefined ? "." : cleanRelativePath(target.cwd, `${context} target cwd`, { allowRoot: true }),
+		entryPath: cleanUrlPath(target.entry, `${context} target entry`),
+		healthPath: cleanUrlPath(target.health, `${context} target health`, DEFAULT_PREVIEW_HEALTH_PATH),
+	}
+}
+
+function cleanStaticTarget(target, projectDir, context) {
+	assertOnlyProperties(target, new Set(["kind", "root", "entry"]), `${context} target`)
+	const rootPath = projectRelativePath(projectDir, target.root, `${context} target root`).resolvedPath
+	if (rootPath === projectDocumentsDirectory(projectDir)) throw new Error(`${context} target root is reserved for the built-in docs preview`)
+	const statePath = resolve(dirname(projectPreviewDirectory(projectDir)))
+	if (rootPath === statePath || isProperPathWithin(statePath, rootPath)) throw new Error(`${context} target root must not expose the project state directory`)
+	return {
+		rootPath,
+		entryPath: staticPreviewEntryPath(target.entry, `${context} target`),
 	}
 }
 
@@ -177,270 +178,6 @@ export function cleanPreviewName(name, context = "preview name") {
 		throw new Error(`${context} must be a lowercase DNS label up to ${MAX_PREVIEW_NAME_LENGTH} characters using letters, numbers, and hyphens`)
 	}
 	return value
-}
-
-function cleanHealthPath(value, context) {
-	if (value === undefined || value === null || value === "") return DEFAULT_PREVIEW_HEALTH_PATH
-	if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//")) {
-		throw new Error(`${context} healthPath must be an absolute path`)
-	}
-	return value
-}
-
-function cleanDescription(value) {
-	if (typeof value !== "string") return undefined
-	const text = value.trim()
-	if (!text || text.includes("\0")) return undefined
-	return text.length > MAX_PREVIEW_DESCRIPTION_LENGTH ? `${text.slice(0, MAX_PREVIEW_DESCRIPTION_LENGTH - 3)}...` : text
-}
-
-function skipLineComment(text, index) {
-	const end = text.indexOf("\n", index + 2)
-	return end < 0 ? text.length : end + 1
-}
-
-function skipBlockComment(text, index) {
-	const end = text.indexOf("*/", index + 2)
-	return end < 0 ? text.length : end + 2
-}
-
-function skipQuotedString(text, index, quote) {
-	for (let i = index + 1; i < text.length; i++) {
-		const char = text[i]
-		if (char === "\\") {
-			i++
-			continue
-		}
-		if (char === quote) return i + 1
-	}
-	return text.length
-}
-
-function skipWhitespaceAndComments(text, index) {
-	let i = index
-	for (;;) {
-		while (i < text.length && /\s/.test(text[i])) i++
-		if (text.startsWith("//", i)) {
-			i = skipLineComment(text, i)
-			continue
-		}
-		if (text.startsWith("/*", i)) {
-			i = skipBlockComment(text, i)
-			continue
-		}
-		return i
-	}
-}
-
-function isIdentifierPart(char) {
-	return /[A-Za-z0-9_$]/.test(char ?? "")
-}
-
-function keywordAt(text, index, keyword) {
-	return text.startsWith(keyword, index) && !isIdentifierPart(text[index - 1]) && !isIdentifierPart(text[index + keyword.length])
-}
-
-function exportDefaultEnd(text) {
-	for (let i = 0; i < text.length; i++) {
-		const char = text[i]
-		if (char === "'" || char === "\"" || char === "`") {
-			i = skipQuotedString(text, i, char) - 1
-			continue
-		}
-		if (text.startsWith("//", i)) {
-			i = skipLineComment(text, i) - 1
-			continue
-		}
-		if (text.startsWith("/*", i)) {
-			i = skipBlockComment(text, i) - 1
-			continue
-		}
-		if (!keywordAt(text, i, "export")) continue
-		const defaultIndex = skipWhitespaceAndComments(text, i + "export".length)
-		if (keywordAt(text, defaultIndex, "default")) return defaultIndex + "default".length
-	}
-	return undefined
-}
-
-function exportDefaultObjectBody(text) {
-	const defaultEnd = exportDefaultEnd(text)
-	if (defaultEnd === undefined) return ""
-	let i = skipWhitespaceAndComments(text, defaultEnd)
-	if (text[i] !== "{") return ""
-	const start = i + 1
-	let depth = 1
-	for (i = start; i < text.length; i++) {
-		const char = text[i]
-		if (char === "'" || char === "\"" || char === "`") {
-			i = skipQuotedString(text, i, char) - 1
-			continue
-		}
-		if (text.startsWith("//", i)) {
-			i = skipLineComment(text, i) - 1
-			continue
-		}
-		if (text.startsWith("/*", i)) {
-			i = skipBlockComment(text, i) - 1
-			continue
-		}
-		if (char === "{") depth++
-		else if (char === "}") {
-			depth--
-			if (depth === 0) return text.slice(start, i)
-		}
-	}
-	return ""
-}
-
-function parseJsStringLiteral(text, index) {
-	const quote = text[index]
-	if (quote !== "'" && quote !== "\"" && quote !== "`") return undefined
-	let value = ""
-	for (let i = index + 1; i < text.length; i++) {
-		const char = text[i]
-		if (char === quote) return { value, end: i + 1 }
-		if (char === "\\") {
-			const next = text[++i]
-			if (next === undefined) return undefined
-			if (next === "n") value += "\n"
-			else if (next === "r") value += "\r"
-			else if (next === "t") value += "\t"
-			else value += next
-			continue
-		}
-		if (quote === "`" && char === "$" && text[i + 1] === "{") return undefined
-		value += char
-	}
-	return undefined
-}
-
-function parsePropertyName(text, index) {
-	const i = skipWhitespaceAndComments(text, index)
-	const char = text[i]
-	if (char === "'" || char === "\"" || char === "`") {
-		const parsed = parseJsStringLiteral(text, i)
-		return parsed ? { name: parsed.value, end: parsed.end } : undefined
-	}
-	if (!/[A-Za-z_$]/.test(char ?? "")) return undefined
-	let end = i + 1
-	while (end < text.length && /[A-Za-z0-9_$]/.test(text[end])) end++
-	return { name: text.slice(i, end), end }
-}
-
-function skipObjectPropertyValue(text, index) {
-	let depth = 0
-	for (let i = skipWhitespaceAndComments(text, index); i < text.length; i++) {
-		const char = text[i]
-		if (char === "'" || char === "\"" || char === "`") {
-			i = skipQuotedString(text, i, char) - 1
-			continue
-		}
-		if (text.startsWith("//", i)) {
-			i = skipLineComment(text, i) - 1
-			continue
-		}
-		if (text.startsWith("/*", i)) {
-			i = skipBlockComment(text, i) - 1
-			continue
-		}
-		if (char === "(" || char === "[" || char === "{") depth++
-		else if (depth > 0 && (char === ")" || char === "]" || char === "}")) depth--
-		else if (depth === 0 && char === ",") return i
-	}
-	return text.length
-}
-
-function objectStringProperty(body, name) {
-	let i = 0
-	while (i < body.length) {
-		i = skipWhitespaceAndComments(body, i)
-		if (body[i] === ",") {
-			i++
-			continue
-		}
-		const property = parsePropertyName(body, i)
-		if (!property) {
-			i = skipObjectPropertyValue(body, i)
-			continue
-		}
-		i = skipWhitespaceAndComments(body, property.end)
-		if (body[i] !== ":") {
-			i = skipObjectPropertyValue(body, i)
-			continue
-		}
-		i = skipWhitespaceAndComments(body, i + 1)
-		const value = parseJsStringLiteral(body, i)
-		if (property.name === name && value) return value.value
-		i = skipObjectPropertyValue(body, value?.end ?? i)
-	}
-	return undefined
-}
-
-export function parsePreviewModuleMetadata(text) {
-	const body = exportDefaultObjectBody(String(text ?? ""))
-	if (!body) return {}
-	const description = cleanDescription(objectStringProperty(body, "description"))
-	let healthPath = DEFAULT_PREVIEW_HEALTH_PATH
-	try {
-		healthPath = cleanHealthPath(objectStringProperty(body, "healthPath"), "preview metadata")
-	} catch {}
-	return {
-		...(description ? { description } : {}),
-		healthPath,
-	}
-}
-
-function previewModuleRunnerCommand(path) {
-	const script = [
-		"const signalExitCode = (signal) => signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 1",
-		"const requiredEnv = (name) => { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }",
-		"const runShellExec = async (command) => {",
-		"	const { spawn } = await import('node:child_process')",
-		"	const child = spawn('/bin/sh', ['-lc', command], { stdio: 'inherit', env: process.env })",
-		"	const forward = (signal) => { if (!child.killed) child.kill(signal) }",
-		"	process.once('SIGINT', () => forward('SIGINT'))",
-		"	process.once('SIGTERM', () => forward('SIGTERM'))",
-		"	await new Promise((resolve, reject) => {",
-		"		child.once('error', reject)",
-		"		child.once('exit', (code, signal) => { process.exitCode = signal ? signalExitCode(signal) : code ?? 0; resolve() })",
-		"	})",
-		"}",
-		"const runFunctionExec = async (exec) => {",
-		"	const controller = new AbortController()",
-		"	const abort = () => controller.abort()",
-		"	process.once('SIGINT', abort)",
-		"	process.once('SIGTERM', abort)",
-		"	await exec({",
-		"		host: requiredEnv('CEREX_HOST'),",
-		"		port: Number(requiredEnv('CEREX_PORT')),",
-		"		publicUrl: process.env.CEREX_PUBLIC_URL || '',",
-		"		logPath: process.env.CEREX_PREVIEW_LOG || '',",
-		"		signal: controller.signal,",
-		"		env: process.env,",
-		"	})",
-		"}",
-		"const { pathToFileURL } = await import('node:url')",
-		"const url = new URL(pathToFileURL(process.argv[1]).href)",
-		`url.searchParams.set(${JSON.stringify(PREVIEW_MODULE_TAG)}, '1')`,
-		"const module = await import(url.href)",
-		"const exec = module.default?.exec",
-		"if (typeof exec === 'string') {",
-		"	const command = exec.trim()",
-		"	if (!command) throw new Error('preview module exec string must not be empty')",
-		"	await runShellExec(command)",
-		"} else if (typeof exec === 'function') {",
-		"	await runFunctionExec(exec)",
-		"} else {",
-		"	throw new Error('preview module default export must include exec as a shell command string or function')",
-		"}",
-	].join("\n")
-	const command = `exec node --import ${shellQuote(PREVIEW_MODULE_REGISTER_URL)} --input-type=module --eval ${shellQuote(script)} ${shellQuote(path)}`
-	if (command.length > MAX_PREVIEW_COMMAND_LENGTH) throw new Error(`preview command is too long: ${path}`)
-	return command
-}
-
-function sourceFileMetadata(path, info) {
-	return { path, size: info.size, mtimeMs: Math.floor(info.mtimeMs) }
 }
 
 function previewNameFromFilename(filename) {
@@ -465,8 +202,7 @@ export function sourcePreviewScopeId(path) {
 
 export function sourcePreviewName(path) {
 	const filename = basename(path)
-	const suffix = [PREVIEW_FILE_SUFFIX, STATIC_PREVIEW_FILE_SUFFIX].find((candidate) => filename.endsWith(candidate))
-	const stem = suffix ? filename.slice(0, -suffix.length) : filename
+	const stem = filename.endsWith(PREVIEW_FILE_SUFFIX) ? filename.slice(0, -PREVIEW_FILE_SUFFIX.length) : filename
 	const hash = sourcePreviewScopeId(path).slice(0, 8)
 	const maxBaseLength = Math.max(1, MAX_PREVIEW_NAME_LENGTH - hash.length - 1)
 	const base = previewNamePart(stem).slice(0, maxBaseLength).replace(/-+$/g, "") || "preview"
@@ -475,28 +211,67 @@ export function sourcePreviewName(path) {
 
 export async function previewFileDefinitionFromPath(path, options = {}) {
 	const resolvedPath = resolve(path)
-	if (!basename(resolvedPath).endsWith(PREVIEW_FILE_SUFFIX)) throw new Error(`preview source file must end with ${PREVIEW_FILE_SUFFIX}`)
+	if (!basename(resolvedPath).endsWith(PREVIEW_FILE_SUFFIX)) throw new Error(`preview definition must end with ${PREVIEW_FILE_SUFFIX}`)
 	const info = await stat(resolvedPath)
-	if (!info.isFile()) throw new Error(`preview source is not a file: ${resolvedPath}`)
-	const text = await readFile(resolvedPath, "utf-8").catch(() => "")
-	const metadata = parsePreviewModuleMetadata(text)
+	if (!info.isFile()) throw new Error(`preview definition is not a file: ${resolvedPath}`)
+	const projectDir = resolve(options.projectDir ?? options.baseDir ?? dirname(resolvedPath))
+	if (!isProperPathWithin(projectDir, resolvedPath)) throw new Error("preview definition must be within its project or session directory")
+	let config
+	try {
+		config = JSON.parse(await readFile(resolvedPath, "utf-8"))
+	} catch (err) {
+		throw Object.assign(new Error(`Invalid preview definition ${resolvedPath}: ${err?.message ?? err}`), { cause: err })
+	}
 	const name = cleanPreviewName(options.name ?? sourcePreviewName(resolvedPath))
+	if (name === STATIC_PREVIEW_NAME) throw new Error(`${basename(resolvedPath)} uses the reserved built-in preview name ${STATIC_PREVIEW_NAME}`)
+	const context = `preview ${name}`
+	if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error(`${context} must be a JSON object`)
+	assertOnlyProperties(config, new Set(["description", "target", "routeSourceMap"]), context)
+	if (!config.target || typeof config.target !== "object" || Array.isArray(config.target)) throw new Error(`${context} target must be an object`)
+	if (config.target.kind !== "process" && config.target.kind !== "static") throw new Error(`${context} target.kind must be process or static`)
+	const description = cleanDescription(config.description, context)
+	if (config.target.kind === "static") {
+		if (config.routeSourceMap !== undefined) throw new Error(`${context} routeSourceMap is implicit for a static target`)
+		const target = cleanStaticTarget(config.target, projectDir, context)
+		return staticPreviewDefinition(target.rootPath, {
+			name,
+			description,
+			entryPath: target.entryPath,
+			configPath: resolvedPath,
+			projectDir,
+		})
+	}
+	const target = cleanProcessTarget(config.target, context)
 	return {
 		name,
-		command: previewModuleRunnerCommand(resolvedPath),
-		...(metadata.description ? { description: metadata.description } : {}),
-		healthPath: metadata.healthPath ?? DEFAULT_PREVIEW_HEALTH_PATH,
-		source: { kind: "preview-js", ...sourceFileMetadata(resolvedPath, info) },
+		kind: "process",
+		...target,
+		...(description ? { description } : {}),
+		configPath: resolvedPath,
+		projectDir,
+		...(config.routeSourceMap !== undefined ? { routeSourceMap: cleanRouteSourceMap(config.routeSourceMap, projectDir, context) } : {}),
+		source: {
+			kind: "preview-json",
+			path: resolvedPath,
+			configPath: resolvedPath,
+			size: info.size,
+			mtimeMs: Math.floor(info.mtimeMs),
+		},
 	}
 }
 
-async function previewFileEntryDefinition(previewsDir, entry) {
+export async function staticPreviewFileDefinitionFromPath(path, options = {}) {
+	const definition = await previewFileDefinitionFromPath(path, options)
+	if (definition.kind !== "static") throw new Error(`preview ${definition.name} does not have a static target`)
+	return definition
+}
+
+async function previewFileEntryDefinition(previewsDir, entry, options) {
 	if (!entry.isFile()) return undefined
 	const name = previewNameFromFilename(entry.name)
 	if (!name) return undefined
-	const path = join(previewsDir, entry.name)
 	try {
-		return await previewFileDefinitionFromPath(path, { name })
+		return await previewFileDefinitionFromPath(join(previewsDir, entry.name), { ...options, name })
 	} catch (err) {
 		if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return undefined
 		throw err
@@ -513,15 +288,14 @@ export async function readPreviewDirectory(previewsDir, options = {}) {
 	}
 	const previews = {}
 	for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-		const definition = await previewFileEntryDefinition(previewsDir, entry)
-			?? (options.projectDir ? await staticPreviewEntryDefinition(options.projectDir, previewsDir, entry) : undefined)
+		const definition = await previewFileEntryDefinition(previewsDir, entry, options)
 		if (!definition) continue
 		if (previews[definition.name]) throw new Error(`Duplicate preview name: ${definition.name}`)
 		previews[definition.name] = definition
 	}
 	const staticRoots = new Map()
 	for (const definition of Object.values(previews)) {
-		if (definition.source?.kind !== "static-directory") continue
+		if (definition.kind !== "static") continue
 		const existing = staticRoots.get(definition.source.path)
 		if (existing) throw new Error(`Static previews ${existing} and ${definition.name} use the same root`)
 		staticRoots.set(definition.source.path, definition.name)
@@ -530,8 +304,8 @@ export async function readPreviewDirectory(previewsDir, options = {}) {
 }
 
 export async function readSessionPreviewDefinitions(sessionDir) {
-	const { manifest: directory } = await readPreviewDirectory(sessionPreviewDirectory(sessionDir))
-	return directory
+	const { manifest } = await readPreviewDirectory(sessionPreviewDirectory(sessionDir), { baseDir: sessionDir })
+	return manifest
 }
 
 export function sessionPreviewDirectory(sessionDir) {
@@ -547,7 +321,7 @@ function legacyProjectPreviewDirectory(projectDir) {
 }
 
 export function projectPreviewLogPath(projectDir, name) {
-	return join(projectDir, PROJECT_STATE_DIRNAME, PROJECT_PREVIEW_LOG_DIRNAME, `${cleanPreviewName(name)}.log`)
+	return join(projectPreviewDirectory(projectDir), PREVIEW_LOG_DIRECTORY_NAME, `${cleanPreviewName(name)}.log`)
 }
 
 async function directoryExists(path) {
@@ -569,11 +343,11 @@ async function migrateLegacyProjectPreviewsOnce(projectDir) {
 	if (canonicalExists) throw new Error(`Project previews exist at both ${canonical} and legacy ${legacy}. Remove or reconcile one directory.`)
 	await ensureProjectStateDirectoryIgnored(projectDir)
 	await rename(legacy, canonical)
+	await initializeProjectPreviewDirectoryIgnore(projectDir)
 	await cleanupLegacyProjectStateDirectory(projectDir)
 	return true
 }
 
-/** Move legacy project preview definitions into `.cerex` before use. @param {string} projectDir */
 export async function migrateLegacyProjectPreviews(projectDir) {
 	const root = resolve(projectDir)
 	const pending = projectPreviewMigrations.get(root)
@@ -597,19 +371,21 @@ export async function ensureProjectPreviewDirectory(projectDir) {
 	await migrateLegacyProjectPreviews(projectDir)
 	await ensureProjectStateDirectoryIgnored(projectDir)
 	const directory = projectPreviewDirectory(projectDir)
+	let created = false
 	try {
 		await mkdir(directory)
+		created = true
 	} catch (err) {
 		if (err?.code !== "EEXIST" || !(await stat(directory)).isDirectory()) throw err
 	}
+	if (created) await initializeProjectPreviewDirectoryIgnore(projectDir)
 }
 
 export function previewDefinitionKey(definition) {
 	return JSON.stringify({
 		command: definition.command,
-		entryPath: definition.entryPath,
+		cwd: definition.cwd,
 		healthPath: definition.healthPath,
-		source: definition.source,
 	})
 }
 
@@ -667,8 +443,11 @@ export function staticPreviewScopeId(rootPath) {
 export function staticPreviewDefinition(rootPath, options = {}) {
 	return {
 		name: cleanPreviewName(options.name ?? STATIC_PREVIEW_NAME),
+		kind: "static",
 		...(options.description ? { description: options.description } : {}),
 		...(options.entryPath ? { entryPath: options.entryPath } : {}),
+		...(options.configPath ? { configPath: resolve(options.configPath) } : {}),
+		...(options.projectDir ? { projectDir: resolve(options.projectDir) } : {}),
 		source: {
 			kind: "static-directory",
 			path: resolve(rootPath),
@@ -726,9 +505,7 @@ export function previewPublicUrl({ publicUrl, name, scopeId, routingSlug, path =
 
 export function previewPublicUrlPattern({ publicUrl, scopeId, routingSlug, name = "PREVIEW_NAME" }) {
 	const base = new URL(publicUrl)
-	const scope = scopeId === undefined
-		? "PREVIEW_SCOPE"
-		: cleanPreviewScopeId(scopeId)
+	const scope = scopeId === undefined ? "PREVIEW_SCOPE" : cleanPreviewScopeId(scopeId)
 	const route = routingSlug === "PREVIEW_ROUTING" ? routingSlug : cleanPreviewRoutingSlug(routingSlug)
 	return `${base.protocol}//${name}--${scope}--${route}.${PREVIEW_PUBLIC_HOST_LABEL}.${base.host}/`
 }
@@ -741,7 +518,7 @@ export function previewPublicUrlFromSettings(settings) {
 
 export function previewLogPath(sessionDir, name) {
 	if (typeof sessionDir !== "string" || !sessionDir) return undefined
-	return join(sessionDir, PREVIEW_LOG_DIRNAME, `${cleanPreviewName(name)}.log`)
+	return join(sessionPreviewDirectory(sessionDir), PREVIEW_LOG_DIRECTORY_NAME, `${cleanPreviewName(name)}.log`)
 }
 
 export function previewBasePublicUrl(publicUrl) {
@@ -774,20 +551,11 @@ export function matchPreviewHost(hostHeader, publicUrl) {
 	if (scopeSeparator <= 0) return undefined
 	const name = scoped.slice(0, scopeSeparator)
 	const scopeId = scoped.slice(scopeSeparator + 2)
-	if (
-		prefix.length > 63
-		|| name.length > MAX_PREVIEW_NAME_LENGTH
-		|| !PREVIEW_NAME_RE.test(name)
-		|| !/^[a-z0-9]{16}$/.test(scopeId)
-	) return undefined
+	if (prefix.length > 63 || name.length > MAX_PREVIEW_NAME_LENGTH || !PREVIEW_NAME_RE.test(name) || !/^[a-z0-9]{16}$/.test(scopeId)) return undefined
 	try {
 		cleanPreviewRoutingSlug(routingSlug)
 	} catch {
 		return undefined
 	}
-	return {
-		name,
-		scopeId,
-		routingSlug,
-	}
+	return { name, scopeId, routingSlug }
 }

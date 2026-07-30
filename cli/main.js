@@ -357,6 +357,8 @@ async function main() {
 		console.log(await packageVersion())
 		return
 	}
+	const { configureCredentialStoresFromEnvironment } = await import("../packages/server/src/app/auth/credentials.js")
+	configureCredentialStoresFromEnvironment()
 	await autoInstallBundledBubblewrapForStartup(args)
 
 	const [

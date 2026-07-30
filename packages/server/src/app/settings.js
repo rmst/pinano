@@ -62,7 +62,7 @@ import { normalizeStateMount } from "./workers/tool/state-mounts.js"
  * @property {string} [modelIoLogDb]
  * @property {string} [token]
  * @property {string} [workspaceRoot]
- * @property {{ host?: string, port?: number | string, token?: string, publicUrl?: string, initialRoute?: string, previewRoutingSlug?: string, routingSlug?: string, dev?: boolean, idleKeepAlive?: boolean, showProjectRootPath?: boolean, codeMirrorEditor?: boolean, auth?: false | { type?: "password", users?: Record<string, string> } }} [web]
+ * @property {{ host?: string, port?: number | string, token?: string, publicUrl?: string, initialRoute?: string, previewRoutingSlug?: string, routingSlug?: string, dev?: boolean, idleKeepAlive?: boolean, showProjectRootPath?: boolean, codeMirrorEditor?: boolean, modelCredentials?: boolean, auth?: false | { type?: "password", users?: Record<string, string> } }} [web]
  * @property {boolean | string | Record<string, unknown>} [diagnostics]
  * @property {boolean | string | Record<string, unknown>} [debug]
  */
@@ -343,6 +343,7 @@ function cleanServiceSettings(value) {
 		if (typeof web.idleKeepAlive === "boolean") out.web.idleKeepAlive = web.idleKeepAlive
 		if (typeof web.showProjectRootPath === "boolean") out.web.showProjectRootPath = web.showProjectRootPath
 		if (typeof web.codeMirrorEditor === "boolean") out.web.codeMirrorEditor = web.codeMirrorEditor
+		if (typeof web.modelCredentials === "boolean") out.web.modelCredentials = web.modelCredentials
 		const auth = cleanWebAuthSettings(web.auth)
 		if (auth !== undefined) out.web.auth = auth
 	}

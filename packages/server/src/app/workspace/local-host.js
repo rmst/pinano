@@ -7,8 +7,9 @@ import { loadContextFilesForPath, loadProjectContextFiles } from "../context/fil
 import { loadSkillsForCwd, projectSkillRoots } from "../context/skills.js"
 import { dataRoot } from "../paths.js"
 import { projectDocumentsDirectory, projectDocumentsIndexPath } from "../project/documents.js"
-import { projectInfoForCwd, setProjectNameForCwd } from "../project/labels.js"
-import { STATIC_PREVIEW_FILE_SUFFIX, ensureProjectPreviewDirectory, previewFileDefinitionFromPath, projectPreviewDirectory, projectPreviewLogPath, readProjectPreviewDefinitions, staticPreviewDefinition, staticPreviewFileDefinitionFromPath } from "../preview/manifest.js"
+import { ensureProjectIdentityForCwd, projectIdentityForCwd, projectInfoForCwd, setProjectNameForCwd } from "../project/labels.js"
+import { PREVIEW_FILE_SUFFIX, ensureProjectPreviewDirectory, previewFileDefinitionFromPath, projectPreviewDirectory, projectPreviewLogPath, readProjectPreviewDefinitions, staticPreviewDefinition } from "../preview/manifest.js"
+import { previewDefinitionForSource, previewEntryPathForSource } from "../preview/source-mapping.js"
 import { createWorkspaceRootPolicy } from "../sandbox/workspace-root-policy.js"
 import { pathIsWithin } from "../sandbox/paths.js"
 import {
@@ -23,7 +24,7 @@ import {
 	sourceControlSync,
 	sourceControlUnstage,
 } from "../source-control/repository.js"
-import { closeGitWorktreeRecords, cleanupGitWorktreeRecords, gitWorktreeStatusesFromRecords, isLinkedGitWorktree } from "../source-control/worktree-events.js"
+import { closeGitWorktreeRecords, cleanupGitWorktreeRecords, gitWorktreeLocation, gitWorktreeStatusesFromRecords, isLinkedGitWorktree } from "../source-control/worktree-events.js"
 import { ToolExecutorRuntime } from "../workers/tool/executor-runtime.js"
 import { createWorkspaceClient } from "./client.js"
 import { captureLocalWorkspaceFile, restoreLocalWorkspaceFile } from "./local-files.js"
@@ -31,7 +32,7 @@ import { createLocalPreviewTransport } from "./local-preview-transport.js"
 
 /**
  * Create the trusted in-process workspace host. Its dispatcher is transport-neutral; the default client uses direct calls and performs no serialization or IPC.
- * @param {{ workspaceRoot?: string, workspacePolicy?: any, createToolExecutor?: (options: any) => any, createProjectWorkspace?: (options: any) => Promise<any> }} [options]
+ * @param {{ workspaceRoot?: string, workspacePolicy?: any, createToolExecutor?: (options: any) => any, createPreviewExecutor?: (options: any) => any, createProjectWorkspace?: (options: any) => Promise<any>, environmentRegistry?: () => any, getSettings?: () => any, previewAccessToken?: string }} [options]
  */
 export async function createLocalWorkspaceHost(options = {}) {
 	const policy = options.workspacePolicy ?? await createWorkspaceRootPolicy(options.workspaceRoot)
@@ -118,12 +119,28 @@ export async function createLocalWorkspaceHost(options = {}) {
 	}
 	const resolvedPreviewSource = async (path, projectDir = undefined) => {
 		const sourcePath = await allowedFilePath(path, "preview source file")
-		const definition = sourcePath.endsWith(STATIC_PREVIEW_FILE_SUFFIX)
-			? await staticPreviewFileDefinitionFromPath(sourcePath, {
-				projectDir: await normalizeStoredCwd(projectDir, "preview project directory"),
-			})
-			: await previewFileDefinitionFromPath(sourcePath)
-		return { path: sourcePath, definition }
+		const root = await normalizeStoredCwd(projectDir, "preview project directory")
+		const manifest = await readProjectPreviewDefinitions(root)
+		const definitions = Object.values(manifest.previews)
+		let definition
+		let configured = true
+		if (sourcePath.endsWith(PREVIEW_FILE_SUFFIX)) {
+			definition = definitions.find((candidate) => candidate.configPath && resolve(candidate.configPath) === sourcePath)
+			if (!definition) {
+				definition = await previewFileDefinitionFromPath(sourcePath, { projectDir: root })
+				configured = false
+			}
+		} else {
+			definition = previewDefinitionForSource(definitions, sourcePath)
+		}
+		if (!definition) throw Object.assign(new Error("No preview is associated with this source file"), { status: 404 })
+		return {
+			path: definition.configPath ?? definition.source.configPath ?? sourcePath,
+			sourcePath,
+			entryPath: previewEntryPathForSource(definition, sourcePath),
+			configured,
+			definition,
+		}
 	}
 	const readTextTail = async (path, maxBytes) => {
 		try {
@@ -181,10 +198,27 @@ export async function createLocalWorkspaceHost(options = {}) {
 		},
 		"project.info": async ({ cwd }) => projectInfoForCwd(await normalizeStoredCwd(cwd, "project cwd")),
 		"project.setName": async ({ cwd, name }) => setProjectNameForCwd(await normalizeStoredCwd(cwd, "project cwd"), name),
+		"project.readIdentity": async ({ cwd }) => projectIdentityForCwd(await normalizeStoredCwd(cwd, "project cwd")),
+		"project.ensureIdentity": async ({ cwd, id, replace }) => ensureProjectIdentityForCwd(
+			await normalizeStoredCwd(cwd, "project cwd"),
+			{ ...(id ? { id } : {}), replace: replace === true },
+		),
 		"project.resolveRoot": async ({ baseRoot, requestedRoot }) => {
 			const base = await resolveDirectory(baseRoot, "project discovery root")
 			const root = await (await projectWorkspaceBackend()).resolveProjectRoot(base, requestedRoot)
 			return resolveDirectory(root, "project discovery root")
+		},
+		"project.rename": async ({ root, input }) => {
+			const allowedRoot = await resolveDirectory(root, "project discovery root")
+			const result = await (await projectWorkspaceBackend()).renameProject(allowedRoot, input)
+			return {
+				...result,
+				path: await resolveDirectory(result.path, "renamed project directory"),
+				project: {
+					...result.project,
+					path: await resolveDirectory(result.project.path, "renamed project directory"),
+				},
+			}
 		},
 		"project.discover": async ({ root }) => (await projectWorkspaceBackend()).discoverProjects(await resolveDirectory(root, "project discovery root")),
 		"project.add": async ({ root, input }) => {
@@ -197,6 +231,10 @@ export async function createLocalWorkspaceHost(options = {}) {
 					path: await resolveDirectory(result.project.path, "created project directory"),
 				},
 			}
+		},
+		"project.delete": async ({ root, input }) => {
+			const allowedRoot = await resolveDirectory(root, "project discovery root")
+			return (await projectWorkspaceBackend()).deleteProject(allowedRoot, input)
 		},
 		"preview.projectManifest": ({ projectDir }) => projectManifest(projectDir),
 		"preview.ensureProject": async ({ projectDir }) => {
@@ -238,6 +276,7 @@ export async function createLocalWorkspaceHost(options = {}) {
 		"sourceControl.createCommit": (params) => sourceControlCreateCommit(sourceControlOptions(params)),
 		"sourceControl.sync": (params) => sourceControlSync(sourceControlOptions(params)),
 		"worktree.isLinked": async ({ path }) => isLinkedGitWorktree(policy ? await normalizeStoredCwd(path, "worktree path") : await localDirectoryPath(path, "worktree path")),
+		"worktree.location": async ({ path }) => (await gitWorktreeLocation(policy ? await normalizeStoredCwd(path, "worktree path") : await localDirectoryPath(path, "worktree path"))) ?? null,
 		"worktree.statuses": async ({ records, limit }) => gitWorktreeStatusesFromRecords(await allowedWorktreeRecords(records), { limit }),
 		"worktree.cleanup": async ({ records }) => cleanupGitWorktreeRecords(await allowedWorktreeRecords(records)),
 		"worktree.close": async ({ records, payload, workerContext }) => (await closeGitWorktreeRecords(await allowedWorktreeRecords(records), payload, { workerContext })) ?? null,
@@ -245,8 +284,31 @@ export async function createLocalWorkspaceHost(options = {}) {
 	const dispatcher = createContractDispatcher(workspaceContract, implementation)
 	const peer = createDirectContractPeer([dispatcher])
 	const localPreviewTransport = createLocalPreviewTransport()
+	let client
+	let previewExecutor
+	const processExecutor = () => {
+		previewExecutor ??= (options.createPreviewExecutor ?? ((executorOptions) => new ToolExecutorRuntime(executorOptions)))({
+			cwd: policy?.root ?? process.cwd(),
+			environmentRegistry: options.environmentRegistry,
+			getSettings: options.getSettings,
+			previewAccessToken: options.previewAccessToken,
+			workspace: client,
+		})
+		return previewExecutor
+	}
+	const previewExecutionRoot = (path) => normalizeStoredCwd(path, "preview execution root")
 	const previewTransport = Object.freeze({
 		...localPreviewTransport,
+		async describeProcess(executionRoot, cwd) {
+			return processExecutor().describePreviewProcess(await previewExecutionRoot(executionRoot), cwd)
+		},
+		async startProcess(id, params) {
+			const executionRoot = await previewExecutionRoot(params.executionRoot)
+			const logPath = await allowedFilePath(params.logPath, "preview log", { followLeaf: false })
+			return processExecutor().startPreviewProcess(id, { ...params, executionRoot, logPath })
+		},
+		touchProcess: (id) => processExecutor().touchPreviewProcess(id),
+		stopProcess: (id) => processExecutor().stopPreviewProcess(id),
 		async serveStatic(request, target, serveOptions = {}) {
 			const rootPath = await normalizeStoredCwd(target.rootPath, "static preview root")
 			return localPreviewTransport.serveStatic(request, { ...target, rootPath }, serveOptions)
@@ -310,7 +372,6 @@ export async function createLocalWorkspaceHost(options = {}) {
 			}
 		},
 	}
-	let client
 	const openToolExecutor = options.createToolExecutor ?? ((executorOptions) => new ToolExecutorRuntime({ ...executorOptions, workspace: client }))
 	client = createWorkspaceClient(peer, { ...description, openToolExecutor, previewTransport, projectWorkspace })
 	return Object.freeze({
@@ -320,6 +381,7 @@ export async function createLocalWorkspaceHost(options = {}) {
 		peer,
 		client,
 		async close() {
+			await previewExecutor?.dispose?.()
 			const backend = await projectWorkspacePromise
 			await backend?.close?.()
 		},

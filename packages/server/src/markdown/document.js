@@ -2,6 +2,7 @@ import { basename } from "node:path"
 
 import { Parser, Renderer } from "../vendor/marked/marked.js"
 import { parseMarkdown } from "./parser.js"
+import { annotateFirstHtmlElement, SOURCE_LINE_ATTRIBUTE, SOURCE_LINE_COUNT_ATTRIBUTE } from "../app/preview/source-anchors.js"
 
 const escapeHtml = (value) => String(value ?? "")
 	.replaceAll("&", "&amp;")
@@ -39,7 +40,10 @@ function renderMarkdownBody(parsed) {
 		math_source: (token) => escapeHtml(token.raw || token.text),
 	}
 	const options = { renderer: new DocumentMarkdownRenderer(), extensions: { renderers } }
-	const body = Parser.parse(parsed.tokens, options)
+	const body = parsed.tokens.map((token) => annotateFirstHtmlElement(
+		Parser.parse([token], options),
+		[[SOURCE_LINE_ATTRIBUTE, token.sourceLine]],
+	)).join("")
 	if (!parsed.footnotes.length) return body
 	const items = parsed.footnotes.map((footnote) => {
 		const backlinks = footnote.references.map((reference) => `<a aria-label="Back to reference" href="#${footnotePrefix}-fnref-${reference}">↩</a>`).join(" ")
@@ -70,7 +74,7 @@ export function renderMarkdownDocument(source, filePath = "document.md") {
 	const heading = parsed.tokens.find((token) => token.type === "heading")
 	const title = heading?.text?.trim() || basename(filePath, ".md") || "Document"
 	return `<!doctype html>
-<html lang="en">
+<html lang="en" ${SOURCE_LINE_COUNT_ATTRIBUTE}="${parsed.sourceLineCount}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

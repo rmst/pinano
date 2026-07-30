@@ -7,6 +7,7 @@ import { projectFileForRoot, projectRoute, routeToArg } from "../navigation/rout
 import { PROJECT_DOCUMENT_INDEX_FILENAMES } from "../project/documents.js"
 import { renderMarkdownDocument } from "../../markdown/document.js"
 import { injectPreviewFrameBridge } from "./shell.js"
+import { annotateHtmlSource } from "./source-anchors.js"
 
 const STATIC_PREVIEW_CSP = [
 	"default-src 'self'",
@@ -219,15 +220,16 @@ async function staticDocumentResponse(file, options) {
 	let contentType
 	if (ext === ".md") {
 		body = renderMarkdownDocument(source, file.path)
-		variant = "markdown-document-v1"
+		variant = "markdown-document-v2"
 		contentType = "text/html; charset=utf-8"
 	} else {
 		body = source
-		variant = "html-document-v1"
+		variant = "html-document-v2"
 		contentType = "text/html; charset=utf-8"
 	}
 
 	if (shouldInjectStaticPreviewBridge(file.path, options)) {
+		if (/^\.html?$/.test(ext)) body = annotateHtmlSource(body)
 		const documentPath = relative(options.rootPath, file.path).split(sep).join("/")
 		body = injectPreviewFrameBridge(body, {
 			scriptUrl: options.bridgeScriptPath,

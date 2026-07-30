@@ -15,6 +15,7 @@ import { executeResponsesRequest, firstStreamEventTimeoutMs, streamEventInactivi
 import { sanitizeSurrogates } from "../sanitize-unicode.js"
 import { buildAssistantAuth, emptyUsage } from "../usage.js"
 import { convertResponsesMessages, convertResponsesTools } from "./responses-shared.js"
+import { requestCodexUsage } from "./usage.js"
 import {
 	codexWebSocketConnectTimeoutMs,
 	codexWebSocketConnectionIdentity,
@@ -29,6 +30,8 @@ const JWT_CLAIM_PATH = "https://api.openai.com/auth"
 const REMOTE_COMPACTION_BETA = "remote_compaction_v2"
 const WEBSOCKET_BETA = "responses_websockets=2026-02-06"
 const WEBSOCKET_CONNECTION_LIMIT_CODE = "websocket_connection_limit_reached"
+const CODEX_PLAN_LOOKUP_TIMEOUT_MS = 2_000
+const UNSUPPORTED_CHATGPT_ACCOUNT_MESSAGE = /^The '[^'\r\n]+' model is not supported when using Codex with a ChatGPT account\.$/
 
 function decodeJwt(token) {
 	try {
@@ -154,7 +157,38 @@ function buildBody(model, context, options) {
 	return body
 }
 
-async function parseErrorResponse(rawText, status) {
+function codexPlanLabel(value) {
+	if (typeof value !== "string") return undefined
+	const normalized = value.trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ")
+	if (!normalized || normalized.length > 64 || !/^[a-zA-Z0-9 ]+$/.test(normalized)) return undefined
+	return normalized.split(" ").map((word) => `${word[0].toUpperCase()}${word.slice(1).toLowerCase()}`).join(" ")
+}
+
+async function currentCodexPlanLabel(context) {
+	if (!context?.access || context.signal?.aborted) return undefined
+	const timeoutSignal = AbortSignal.timeout(CODEX_PLAN_LOOKUP_TIMEOUT_MS)
+	const signal = context.signal ? AbortSignal.any([context.signal, timeoutSignal]) : timeoutSignal
+
+	try {
+		const usage = await requestCodexUsage({
+			baseUrl: context.baseUrl,
+			access: context.access,
+			accountId: context.accountId,
+			signal,
+		})
+		return codexPlanLabel(usage?.plan_type)
+	} catch {
+		return undefined
+	}
+}
+
+async function enrichUnsupportedChatGptAccountMessage(message, context) {
+	if (!UNSUPPORTED_CHATGPT_ACCOUNT_MESSAGE.test(message)) return message
+	const plan = await currentCodexPlanLabel(context)
+	return plan ? message.replace("a ChatGPT account.", `a ChatGPT ${plan} account.`) : message
+}
+
+async function parseErrorResponse(rawText, status, errorContext) {
 	let message = rawText || `HTTP ${status}`
 	let friendly
 	let code
@@ -193,6 +227,7 @@ async function parseErrorResponse(rawText, status) {
 			message = parsed.message
 		}
 	} catch {}
+	message = await enrichUnsupportedChatGptAccountMessage(message, errorContext)
 	return { message, friendly, code, type, retryable }
 }
 
@@ -256,14 +291,14 @@ function retryableWebSocketFailure(error, started) {
 // Map raw Codex Responses events into the shape processResponsesStream expects.
 // Codex emits `response.done` and `response.incomplete` where the standard
 // Responses API would emit `response.completed`; rename for uniformity.
-async function* mapCodexEvents(events) {
+async function* mapCodexEvents(events, errorContext) {
 	for await (const event of events) {
 		const type = typeof event.type === "string" ? event.type : undefined
 		if (!type) continue
 
 		if (type === "error") {
 			const info = codexErrorInfo(event)
-			const message = info.message || info.code || JSON.stringify(event)
+			let message = info.message || info.code || JSON.stringify(event)
 			if (retryableCodexStreamError(info)) {
 				throw markCodexApiError(new RetryableModelError(`Codex temporarily unavailable: ${message}`, {
 					code: info.code || undefined,
@@ -271,13 +306,14 @@ async function* mapCodexEvents(events) {
 					cause: info.raw,
 				}))
 			}
+			message = await enrichUnsupportedChatGptAccountMessage(message, errorContext)
 			const error = new Error(`Codex error: ${message}`)
 			error.code = info.code || undefined
 			throw markCodexApiError(error)
 		}
 		if (type === "response.failed") {
 			const info = codexErrorInfo(event.response ?? event)
-			const msg = info.message || event.response?.error?.message || "Codex response failed"
+			let msg = info.message || event.response?.error?.message || "Codex response failed"
 			if (retryableCodexStreamError(info)) {
 				throw markCodexApiError(new RetryableModelError(`Codex temporarily unavailable: ${msg}`, {
 					code: info.code || undefined,
@@ -285,6 +321,7 @@ async function* mapCodexEvents(events) {
 					cause: event,
 				}))
 			}
+			msg = await enrichUnsupportedChatGptAccountMessage(msg, errorContext)
 			const error = new Error(msg)
 			error.code = info.code || undefined
 			throw markCodexApiError(error)
@@ -327,6 +364,8 @@ export function streamCodex(model, context, options) {
 			if (!apiKey) throw new Error("Codex requires an OAuth access token via options.apiKey")
 
 			const accountId = extractAccountId(apiKey)
+			const errorContext = { baseUrl: model.baseUrl, access: apiKey, accountId, signal: options?.signal }
+			const mapEvents = (events) => mapCodexEvents(events, errorContext)
 			output.auth = buildAssistantAuth(model, options, { accountId })
 			let body = buildBody(model, context, options)
 			if (options?.onPayload) {
@@ -370,7 +409,7 @@ export function streamCodex(model, context, options) {
 								signal: options?.signal,
 								sessionId: options?.sessionId,
 								cacheContext: true,
-								mapEvents: mapCodexEvents,
+								mapEvents,
 								modelLog,
 								attemptIndex: nextAttemptIndex++,
 								onStart: () => {
@@ -416,8 +455,8 @@ export function streamCodex(model, context, options) {
 				model,
 				signal: options?.signal,
 				onResponse: options?.onResponse,
-				mapEvents: mapCodexEvents,
-				parseError: parseErrorResponse,
+				mapEvents,
+				parseError: (rawText, status) => parseErrorResponse(rawText, status, errorContext),
 				modelLog,
 				pricingContext: { serviceTier: options?.serviceTier },
 				responseHeaderTimeoutMs: options?.responseHeaderTimeoutMs,

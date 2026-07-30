@@ -27,6 +27,9 @@ Global helpers:
 - \`setTimeout(callback, delayMs?)\` and \`clearTimeout(id)\` provide timers.
 - \`ALL_TOOLS\` contains \`{ name, description }\` metadata for the nested tools.`
 
+const DEFERRED_NESTED_TOOLS_GUIDANCE = `Some deferred nested tools may be omitted from this description. They are still available on the global \`tools\` object and listed in \`ALL_TOOLS\`.
+To find one, filter \`ALL_TOOLS\` by \`name\` and \`description\`.`
+
 const WAIT_DESCRIPTION = `Waits on a running \`exec\` cell and returns new output or completion.
 
 - Use \`wait\` only after \`exec\` returns a running cell ID.
@@ -95,18 +98,26 @@ function schemaType(schema, depth = 0) {
 	}
 }
 
-function toolReference(tool) {
+function toolDescription(tool) {
 	const name = identifierFor(tool.name)
 	const argumentName = tool.kind === "custom" ? "input" : "args"
 	const inputType = tool.kind === "custom" ? "string" : schemaType(tool.parameters)
 	const outputType = tool.codeMode?.outputSchema ? schemaType(tool.codeMode.outputSchema) : "CodeModeToolResult"
+	const declaration = [
+		"exec tool declaration:",
+		"```ts",
+		`declare const tools: { ${name}(${argumentName}: ${inputType}): Promise<${outputType}>; };`,
+		"```",
+	].join("\n")
+	return [tool.description?.trim() ?? "", declaration].filter(Boolean).join("\n\n")
+}
+
+function toolReference(tool) {
+	const name = identifierFor(tool.name)
 	return [
 		`### \`tools.${name}\`${name === tool.name ? "" : ` (tool name: \`${tool.name}\`)`}`,
-		tool.description?.trim() ?? "",
-		"```ts",
-		`declare const tools: { ${name}(${argumentName}: ${inputType}): Promise<${outputType}> }`,
-		"```",
-	].filter(Boolean).join("\n")
+		toolDescription(tool),
+	].join("\n")
 }
 
 function assertDistinctToolIdentifiers(tools) {
@@ -155,6 +166,8 @@ export function parseExecSource(input) {
 
 export function createCodeModeToolDefinitions(tools) {
 	assertDistinctToolIdentifiers(tools)
+	const promptTools = tools.filter((tool) => tool.exposure !== "deferred")
+	const hasDeferredTools = promptTools.length !== tools.length
 	const resultType = `type CodeModeToolResult =
 	| string
 	| {
@@ -164,8 +177,9 @@ export function createCodeModeToolDefinitions(tools) {
 	};`
 	const description = [
 		EXEC_PREAMBLE,
+		...(hasDeferredTools ? [DEFERRED_NESTED_TOOLS_GUIDANCE] : []),
 		resultType,
-		...tools.map(toolReference),
+		...promptTools.map(toolReference),
 	].join("\n\n")
 	return [
 		{
@@ -203,9 +217,9 @@ export function createCodeModeToolDefinitions(tools) {
 export function codeModeToolMetadata(tools) {
 	assertDistinctToolIdentifiers(tools)
 	return tools.map((tool) => ({
-		name: tool.name,
+		toolName: tool.name,
 		globalName: identifierFor(tool.name),
-		description: tool.description ?? "",
+		description: toolDescription(tool),
 		kind: tool.kind === "custom" ? "custom" : "function",
 	}))
 }

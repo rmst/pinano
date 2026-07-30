@@ -18,23 +18,12 @@ import {
 import { contextLoadDisplayMessage } from "./context-display.js"
 import { contextFileIdentityPath } from "./context-identity.js"
 import { PLAN_UPDATE_CUSTOM_TYPE, planUpdateDisplayMessageForEntry } from "./plan-update-entry.js"
+import { PROJECT_LOCATION_CUSTOM_TYPE, applyProjectLocationToConfig, projectLocationChangeFromEntry, projectLocationDisplayMessageForEntry, projectLocationModelMessageForEntry } from "./project-location-entry.js"
 
 /** @typedef {import("./types.js").SessionEntry} SessionEntry */
 /** @typedef {import("../agent-core/types.js").AgentMessage} AgentMessage */
 
 const SESSION_GLOBAL_CONFIG_CUSTOM_TYPE = "session_global_config"
-
-function toolExecutionMessage(entry) {
-	if (entry.type !== "custom" || entry.customType !== "tool_execution") return undefined
-	const data = entry.data ?? {}
-	if ((data.phase !== "ended" && data.phase !== "recovered_unknown") || !data.message) return undefined
-	return data.message
-}
-
-function toolExecutionCallId(entry) {
-	if (entry.type !== "custom" || entry.customType !== "tool_execution") return undefined
-	return entry.data?.toolCallId
-}
 
 function assistantToolCallOrder(message) {
 	if (message?.role !== "assistant" || !Array.isArray(message.content)) return undefined
@@ -107,6 +96,7 @@ export class Session {
 	constructor(storage) {
 		this.storage = storage
 		this.mutationRunId = null
+		this.mutationQueue = Promise.resolve()
 	}
 
 	getMetadata() {
@@ -131,6 +121,13 @@ export class Session {
 
 	mutationOptions(options = {}) {
 		return { ...options, runId: options.runId ?? this.mutationRunId ?? undefined }
+	}
+
+	mutate(operation) {
+		if (this.storage.asyncMutations !== true) return operation()
+		const mutation = this.mutationQueue.then(operation)
+		this.mutationQueue = mutation.then(() => undefined, () => undefined)
+		return mutation
 	}
 
 	getEntry(id) {
@@ -190,13 +187,6 @@ export class Session {
 	 *     provider-native checkpoints preserved verbatim; `mementoCount` is
 	 *     retained real user messages.
 	 *
-	 * Legacy `tool_execution` custom entries with `phase: "ended"` may carry a
-	 * durable toolResult message for crash recovery. New completed-tool markers
-	 * point at the real persisted toolResult instead and are not replayed. A
-	 * `phase: "recovered_unknown"` entry still carries an explicit error
-	 * toolResult synthesized after restart for a tool that had started but whose
-	 * outcome was not durably known.
-	 *
 	 * If a compaction entry's `cutEntryId` isn't found in the current logical list
 	 * (corrupted state, manual edit), the patch is skipped defensively — replay
 	 * continues with the un-elided view.
@@ -213,29 +203,11 @@ export class Session {
 	 */
 	projectEntries(fromId, options) {
 		const branch = this.getBranch(fromId)
-		const realToolResultCallIds = new Set(branch
-			.filter((entry) => entry.type === "message" && entry.message?.role === "toolResult" && entry.message.toolCallId)
-			.map((entry) => entry.message.toolCallId))
 		/** @type {Array<{ message: any, entryId: string }>} */
 		let projected = []
-		const syntheticToolResultByCallId = new Map()
-		const shiftSyntheticToolResultIndices = (startIdx, delta) => {
-			for (const [id, idx] of syntheticToolResultByCallId) {
-				if (idx >= startIdx) syntheticToolResultByCallId.set(id, idx + delta)
-			}
-		}
-		const removeSyntheticToolResult = (toolCallId) => {
-			const idx = syntheticToolResultByCallId.get(toolCallId)
-			if (idx === undefined) return
-			projected.splice(idx, 1)
-			syntheticToolResultByCallId.delete(toolCallId)
-			shiftSyntheticToolResultIndices(idx + 1, -1)
-		}
 		for (const entry of branch) {
 			if (entry.type === "message") {
-				const message = entry.message
-				if (message?.role === "toolResult") removeSyntheticToolResult(message.toolCallId)
-				projected.push({ message, entryId: entry.id })
+				projected.push({ message: entry.message, entryId: entry.id })
 			} else if (entry.type === "custom" && entry.customType === BASH_SHORTCUT_CUSTOM_TYPE) {
 				const message = options.applyCompaction
 					? bashShortcutModelMessageForEntry(entry)
@@ -246,12 +218,17 @@ export class Session {
 					const message = planUpdateDisplayMessageForEntry(entry)
 					if (message) projected.push({ message, entryId: entry.id })
 				}
+			} else if (entry.type === "custom" && entry.customType === PROJECT_LOCATION_CUSTOM_TYPE) {
+				const message = options.applyCompaction
+					? projectLocationModelMessageForEntry(entry)
+					: projectLocationDisplayMessageForEntry(entry)
+				if (message) projected.push({ message, entryId: entry.id })
 			} else if (entry.type === "custom" && entry.customType === "compaction") {
 				const data = /** @type {any} */ (entry.data) ?? {}
 				const cutEntryId = data.cutEntryId
 				const replacementMessages = replacementMessagesForCompactionEntry(entry)
 				const displayMessage = displayMessageForCompactionEntry(entry)
-				if (!cutEntryId || replacementMessages.length === 0 || !displayMessage) continue
+				if (!cutEntryId || !displayMessage || (options.applyCompaction && replacementMessages.length === 0)) continue
 				const cutIdx = options.applyCompaction
 					? findLastEntryIndex(projected, cutEntryId)
 					: projected.findIndex((e) => e.entryId === cutEntryId)
@@ -264,24 +241,14 @@ export class Session {
 						})),
 						...projected.slice(cutIdx + 1),
 					]
-					syntheticToolResultByCallId.clear()
 				} else {
 					const markerIdx = cutIdx + 1
 					projected.splice(markerIdx, 0, { message: displayMessage, entryId: entry.id })
-					shiftSyntheticToolResultIndices(markerIdx, 1)
 				}
 			} else if (entry.type === "context") {
 				if (!options.applyCompaction) {
 					const message = contextLoadDisplayMessage({ contextLoad: entry.contextLoad, timestamp: entry.timestamp })
 					if (message) projected.push({ message, entryId: entry.id })
-				}
-			} else {
-				const toolCallId = toolExecutionCallId(entry)
-				if (toolCallId && realToolResultCallIds.has(toolCallId)) continue
-				const message = toolExecutionMessage(entry)
-				if (message?.role === "toolResult" && !syntheticToolResultByCallId.has(message.toolCallId)) {
-					syntheticToolResultByCallId.set(message.toolCallId, projected.length)
-					projected.push({ message, entryId: entry.id })
 				}
 			}
 		}
@@ -289,8 +256,10 @@ export class Session {
 	}
 
 	getSessionConfig() {
-		const entries = this.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "config")
-		const branchConfig = entries.reduce((config, entry) => ({ ...config, ...(entry.data ?? {}) }), {})
+		const branchConfig = this.getBranch().reduce((config, entry) => {
+			if (entry.type === "custom" && entry.customType === "config") return { ...config, ...(entry.data ?? {}) }
+			return applyProjectLocationToConfig(config, projectLocationChangeFromEntry(entry))
+		}, {})
 		return { ...branchConfig, ...this.getGlobalSessionConfig() }
 	}
 
@@ -307,22 +276,25 @@ export class Session {
 			.filter(Boolean)
 	}
 
-	async appendContextLoad(load, options = {}) {
-		const entry = {
-			type: "context",
-			id: this.storage.createEntryId(),
-			parentId: this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
-			contextLoad: {
-				source: load.source ?? "unknown",
-				...(load.cwd ? { cwd: load.cwd } : {}),
-				loadedAt: load.loadedAt ?? new Date().toISOString(),
-				disabled: load.disabled === true,
-				files: (load.files ?? []).map(normalizeContextFile),
-			},
-		}
-		await this.storage.appendEntry(entry, this.mutationOptions(options))
-		return entry.id
+	appendContextLoad(load, options = {}) {
+		const mutationOptions = this.mutationOptions(options)
+		return this.mutate(async () => {
+			const entry = {
+				type: "context",
+				id: this.storage.createEntryId(),
+				parentId: this.storage.getLeafId(),
+				timestamp: new Date().toISOString(),
+				contextLoad: {
+					source: load.source ?? "unknown",
+					...(load.cwd ? { cwd: load.cwd } : {}),
+					loadedAt: load.loadedAt ?? new Date().toISOString(),
+					disabled: load.disabled === true,
+					files: (load.files ?? []).map(normalizeContextFile),
+				},
+			}
+			await this.storage.appendEntry(entry, mutationOptions)
+			return entry.id
+		})
 	}
 
 	async appendConfigPatch(data, options = {}) {
@@ -333,43 +305,52 @@ export class Session {
 		return this.appendCustomEntry(SESSION_GLOBAL_CONFIG_CUSTOM_TYPE, data, options)
 	}
 
-	async appendMessage(message, options = {}) {
-		const entry = {
-			type: "message",
-			id: this.storage.createEntryId(),
-			parentId: this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
-			message,
-		}
-		await this.storage.appendEntry(entry, this.mutationOptions(options))
-		return entry.id
+	appendMessage(message, options = {}) {
+		const mutationOptions = this.mutationOptions(options)
+		return this.mutate(async () => {
+			const entry = {
+				type: "message",
+				id: this.storage.createEntryId(),
+				parentId: this.storage.getLeafId(),
+				timestamp: new Date().toISOString(),
+				message,
+			}
+			await this.storage.appendEntry(entry, mutationOptions)
+			return entry.id
+		})
 	}
 
-	async appendLabel(targetId, label, options = {}) {
-		if (!this.storage.getEntry(targetId)) throw new Error(`Entry ${targetId} not found`)
-		const entry = {
-			type: "label",
-			id: this.storage.createEntryId(),
-			parentId: this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
-			targetId,
-			label,
-		}
-		await this.storage.appendEntry(entry, this.mutationOptions(options))
-		return entry.id
+	appendLabel(targetId, label, options = {}) {
+		const mutationOptions = this.mutationOptions(options)
+		return this.mutate(async () => {
+			if (!this.storage.getEntry(targetId)) throw new Error(`Entry ${targetId} not found`)
+			const entry = {
+				type: "label",
+				id: this.storage.createEntryId(),
+				parentId: this.storage.getLeafId(),
+				timestamp: new Date().toISOString(),
+				targetId,
+				label,
+			}
+			await this.storage.appendEntry(entry, mutationOptions)
+			return entry.id
+		})
 	}
 
-	async appendCustomEntry(customType, data, options = {}) {
-		const entry = {
-			type: "custom",
-			id: this.storage.createEntryId(),
-			parentId: this.storage.getLeafId(),
-			timestamp: new Date().toISOString(),
-			customType,
-			data,
-		}
-		await this.storage.appendEntry(entry, this.mutationOptions(options))
-		return entry.id
+	appendCustomEntry(customType, data, options = {}) {
+		const mutationOptions = this.mutationOptions(options)
+		return this.mutate(async () => {
+			const entry = {
+				type: "custom",
+				id: this.storage.createEntryId(),
+				parentId: this.storage.getLeafId(),
+				timestamp: new Date().toISOString(),
+				customType,
+				data,
+			}
+			await this.storage.appendEntry(entry, mutationOptions)
+			return entry.id
+		})
 	}
 
 	/**
@@ -377,6 +358,7 @@ export class Session {
 	 * branch off from there.
 	 */
 	moveTo(entryId, options = {}) {
-		this.storage.setLeafId(entryId, this.mutationOptions(options))
+		const mutationOptions = this.mutationOptions(options)
+		return this.mutate(() => this.storage.setLeafId(entryId, mutationOptions))
 	}
 }

@@ -21,6 +21,16 @@ export function gitProviderForHost(host) {
 	return "git"
 }
 
+function gitStoreWithoutLegacyAgentAccess(store) {
+	const { githubAgentAccess: _legacyAgentAccess, ...rest } = store ?? {}
+	return rest
+}
+
+/** Whether a repository host can use the github.com CLI proxy. */
+export function isGithubCredentialHost(host) {
+	return lower(host) === "github.com"
+}
+
 /** @param {string} host */
 export function gitTokenUsernameForHost(host) {
 	const provider = gitProviderForHost(host)
@@ -36,9 +46,72 @@ export function gitCredentialScopeKey(scope) {
 	return `${lower(scope.host)}/${scope.path}`
 }
 
+/** @param {string} value */
+export function normalizeGitRemoteRepo(value) {
+	const raw = typeof value === "string" ? value.trim() : ""
+	if (!raw) return ""
+	const stripRepoSuffix = (path) => path.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "")
+	const scp = !raw.includes("://") ? raw.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/) : null
+	if (scp) {
+		const path = stripRepoSuffix(scp[2])
+		return path ? `${scp[1]}/${path}` : ""
+	}
+	try {
+		const url = new URL(raw)
+		if (url.protocol === "file:") return ""
+		const path = stripRepoSuffix(url.pathname)
+		return url.host && path ? `${url.host}/${path}` : ""
+	} catch {}
+	const hostPath = raw.match(/^([A-Za-z0-9.-]+\.[A-Za-z0-9.-]+)\/(.+)$/)
+	if (hostPath) {
+		const path = stripRepoSuffix(hostPath[2])
+		return path ? `${hostPath[1]}/${path}` : ""
+	}
+	return ""
+}
+
+/** @param {string} value */
+export function gitCredentialScopeFromRemote(value) {
+	const normalized = normalizeGitRemoteRepo(value)
+	const [host = "", ...pathParts] = normalized.split("/").filter(Boolean)
+	const path = pathParts.join("/")
+	return host && path ? { host: lower(host), path, normalized } : undefined
+}
+
+function gitEntriesWithExplicitAgentAccess(store) {
+	const legacyGithubAccess = store?.githubAgentAccess === true
+	return Object.fromEntries(Object.entries(store?.entries ?? {}).map(([key, entry]) => [
+		key,
+		entry?.kind === "token" && isGithubCredentialHost(entry.host)
+			? { ...entry, agentAccess: entry.agentAccess === true || (entry.agentAccess === undefined && legacyGithubAccess) }
+			: entry,
+	]))
+}
+
+/** @returns {Promise<Array<{ key: string, kind: "token", host: string, path: string, username: string, token: string, agentAccess: boolean, createdAt: number, updatedAt: number }>>} */
+export async function listGitTokenCredentials() {
+	const store = await getCredential(GIT_AUTH_CREDENTIAL_PROVIDER)
+	if (store?.kind !== "git" || !store.entries || typeof store.entries !== "object") return []
+	return Object.entries(gitEntriesWithExplicitAgentAccess(store))
+		.filter(([, entry]) => entry?.kind === "token" && entry.token)
+		.map(([key, entry]) => ({ ...entry, agentAccess: entry.agentAccess === true, key }))
+		.sort((a, b) => a.key.localeCompare(b.key))
+}
+
+/**
+ * Return credentials that may authenticate a repository, preferring the credential saved for that exact repository. Tokens are capabilities in their own right, so a same-host token may cover repositories beyond the one where it was first entered.
+ * @param {{ host: string, path: string }} scope
+ */
+export async function gitTokenCredentialCandidates(scope) {
+	const exactKey = gitCredentialScopeKey(scope)
+	const host = lower(scope.host)
+	const entries = (await listGitTokenCredentials()).filter((entry) => lower(entry.host) === host)
+	return entries.sort((a, b) => Number(b.key === exactKey) - Number(a.key === exactKey))
+}
+
 /**
  * @param {{ host: string, path: string }} scope
- * @returns {Promise<{ username: string, token: string, host: string, path: string } | undefined>}
+ * @returns {Promise<{ username: string, token: string, host: string, path: string, createdAt: number, updatedAt: number } | undefined>}
  */
 export async function getGitTokenCredential(scope) {
 	const store = await getCredential(GIT_AUTH_CREDENTIAL_PROVIDER)
@@ -50,13 +123,15 @@ export async function getGitTokenCredential(scope) {
 		token: entry.token,
 		host: entry.host || lower(scope.host),
 		path: entry.path || scope.path,
+		createdAt: entry.createdAt,
+		updatedAt: entry.updatedAt,
 	}
 }
 
 /**
  * @param {{ host: string, path: string }} scope
  * @param {string} token
- * @param {{ username?: string }} [options]
+ * @param {{ username?: string, agentAccess?: boolean }} [options]
  */
 export async function saveGitTokenCredential(scope, token, options = {}) {
 	const cleanToken = typeof token === "string" ? token.trim() : ""
@@ -66,17 +141,21 @@ export async function saveGitTokenCredential(scope, token, options = {}) {
 	const username = options.username || gitTokenUsernameForHost(scope.host)
 	await updateCredential(GIT_AUTH_CREDENTIAL_PROVIDER, (current) => {
 		const previous = current?.kind === "git" ? current : undefined
-		const previousEntry = previous?.entries?.[key]
+		const entries = gitEntriesWithExplicitAgentAccess(previous)
+		const previousEntry = entries[key]
+		const agentAccess = typeof options.agentAccess === "boolean" ? options.agentAccess : previousEntry?.agentAccess === true
 		return {
+			...gitStoreWithoutLegacyAgentAccess(previous),
 			kind: "git",
 			entries: {
-				...(previous?.entries ?? {}),
+				...entries,
 				[key]: {
 					kind: "token",
 					host: lower(scope.host),
 					path: scope.path,
 					username,
 					token: cleanToken,
+					...(isGithubCredentialHost(scope.host) ? { agentAccess } : {}),
 					createdAt: previousEntry?.createdAt ?? now,
 					updatedAt: now,
 				},
@@ -84,6 +163,41 @@ export async function saveGitTokenCredential(scope, token, options = {}) {
 			createdAt: previous?.createdAt ?? now,
 			updatedAt: now,
 		}
+	}, { waitMs: 5000 })
+}
+
+/** @param {{ host: string, path: string }} scope @param {boolean} allowed */
+export async function setGitTokenCredentialAgentAccess(scope, allowed) {
+	if (!isGithubCredentialHost(scope.host)) throw new Error("Agent access is only supported for GitHub credentials")
+	const key = gitCredentialScopeKey(scope)
+	await updateCredential(GIT_AUTH_CREDENTIAL_PROVIDER, (current) => {
+		if (current?.kind !== "git" || current.entries?.[key]?.kind !== "token") {
+			throw Object.assign(new Error("GitHub credential not found"), { status: 404 })
+		}
+		const entries = gitEntriesWithExplicitAgentAccess(current)
+		return {
+			...gitStoreWithoutLegacyAgentAccess(current),
+			kind: "git",
+			entries: {
+				...entries,
+				[key]: { ...entries[key], agentAccess: allowed },
+			},
+			createdAt: current.createdAt,
+			updatedAt: Date.now(),
+		}
+	}, { waitMs: 5000 })
+}
+
+/** @param {{ host: string, path: string }} scope */
+export async function deleteGitTokenCredential(scope) {
+	const key = gitCredentialScopeKey(scope)
+	await updateCredential(GIT_AUTH_CREDENTIAL_PROVIDER, (current) => {
+		if (current?.kind !== "git" || current.entries?.[key]?.kind !== "token") {
+			throw Object.assign(new Error("Git credential not found"), { status: 404 })
+		}
+		const entries = gitEntriesWithExplicitAgentAccess(current)
+		delete entries[key]
+		return { ...gitStoreWithoutLegacyAgentAccess(current), kind: "git", entries, updatedAt: Date.now() }
 	}, { waitMs: 5000 })
 }
 

@@ -1,29 +1,21 @@
 import {
-	SESSION_ATTACHMENT_KIND_IMAGE,
 	SESSION_ATTACHMENT_VARIANT_DISPLAY,
 	SESSION_ATTACHMENT_VARIANT_ORIGINAL,
 } from "../session/attachments.js"
 
-export function nextImageAttachmentNumber(db, sessionId, minimumNumber = 1) {
-	const row = db.prepare(`
-		SELECT COALESCE(MAX(number) + 1, 1) AS next
-		FROM (
-			SELECT number
-			FROM session_attachments
-			WHERE session_id = ? AND kind = ?
-			UNION ALL
-			SELECT mb.image_number AS number
-			FROM session_entry_refs ser
-			JOIN entry_message_blocks mb ON mb.global_id = ser.global_id
-			WHERE ser.session_id = ?
-				AND mb.type = 'image'
-				AND mb.image_number IS NOT NULL
-		)
-	`).get(sessionId, SESSION_ATTACHMENT_KIND_IMAGE, sessionId)
-	return Math.max(Number(row?.next ?? 1), minimumNumber)
+export function nextImageAttachmentNumber(db, sessionId, minimumNumber) {
+	const attachmentRow = db.prepare(`
+		SELECT MAX(number) + 1 AS next
+		FROM session_attachments
+		WHERE session_id = ?
+	`).get(sessionId)
+	const attachmentNext = Number(attachmentRow?.next)
+	return Number.isInteger(attachmentNext) && attachmentNext > 0
+		? Math.max(attachmentNext, minimumNumber)
+		: minimumNumber
 }
 
-export function insertSessionAttachmentRows(db, attachment, variants) {
+export function insertSessionAttachmentRow(db, attachment) {
 	db.prepare(`
 		INSERT INTO session_attachments (id, session_id, kind, number, label, detail, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -36,6 +28,9 @@ export function insertSessionAttachmentRows(db, attachment, variants) {
 		attachment.detail ?? null,
 		attachment.createdAt,
 	)
+}
+
+export function insertSessionAttachmentVariantRows(db, attachmentId, variants) {
 	const insertVariant = db.prepare(`
 		INSERT INTO session_attachment_variants (
 			attachment_id,
@@ -54,7 +49,7 @@ export function insertSessionAttachmentRows(db, attachment, variants) {
 	`)
 	for (const variant of variants.filter(Boolean)) {
 		insertVariant.run(
-			attachment.id,
+			attachmentId,
 			variant.variant,
 			variant.storageBackend,
 			variant.storageKey,

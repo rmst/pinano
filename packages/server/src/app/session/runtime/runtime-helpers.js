@@ -1,6 +1,6 @@
 // Shared helpers for session runtime orchestration and session list projection.
 
-import { isAbsolute, join, resolve } from "node:path"
+import { join, resolve } from "node:path"
 
 import { normalizeReasoningLevel } from "../../../../../protocol/src/reasoning.js"
 import { productErrorCodeMatches } from "../../../../../protocol/src/product.js"
@@ -13,6 +13,7 @@ import { optionalSessionWorkspacesRoot, sessionWorkspacePath } from "../../paths
 import { stateMountFromSettings } from "../../settings.js"
 import { sessionSandboxBaseWd, sessionSandboxMounts } from "../config.js"
 import { pathIsWithin } from "../../sandbox/paths.js"
+import { applyProjectLocationToConfig, projectLocationChangeFromEntry } from "../../../session-manager/project-location-entry.js"
 import { subSessionOpenCommand } from "../sub-sessions.js"
 import { internalHttpRequestBodyText } from "../../workers/internal-http.js"
 import { isPromptImageMarkerText } from "../../../../../protocol/src/prompt-images.js"
@@ -39,7 +40,7 @@ export const DEFAULT_MAX_IDLE_RUNTIMES = 8
 export const LEGACY_AGENT_VIEW_COMPLETION_WINDOW_MS = 48 * 60 * 60 * 1000
 export const UNKNOWN_TOOL_RECOVERY_MAX_ATTEMPTS = 3
 export const SESSION_ACTIVITY_TEXT_MAX = 160
-export const PROJECT_MAINTENANCE_SESSION_TITLE = "Project maintenance"
+export const PROJECT_MAINTENANCE_SESSION_TITLE = "Project setup"
 
 /** @param {any} err */
 export function isSessionNotFoundError(err) {
@@ -265,12 +266,6 @@ export function fallbackAgentViewState(entry, preview, now) {
 }
 
 /** @param {any} entry @param {string | undefined} cwd */
-export function sessionMatchesDirectoryFilter(entry, cwd) {
-	if (!cwd) return true
-	const initialWd = typeof entry.initialWd === "string" && entry.initialWd ? entry.initialWd : entry.cwd
-	return typeof initialWd === "string" && initialWd ? pathIsWithin(resolve(cwd), resolve(initialWd)) : false
-}
-
 /** @param {any} entry */
 export function autoResumableWorkerCrash(entry) {
 	return entry.runStatus === "failed"
@@ -339,8 +334,10 @@ export function cwdIsInsideSessionWorkspacesRoot(cwd) {
 }
 
 export async function initialProjectDirForCwd(cwd, workspace) {
+	const checkoutRoot = await workspace.paths.normalizeStoredCwd(cwd, "project cwd")
+	const location = await workspace.worktrees.location(checkoutRoot)
+	const root = location?.linked ? location.repositoryRoot : checkoutRoot
 	try {
-		const root = await workspace.paths.normalizeStoredCwd(cwd, "project cwd")
 		const project = await workspace.project.info(root)
 		return await shouldAutoRegisterProjectRoot(root, project, workspace) ? root : undefined
 	} catch {
@@ -369,102 +366,11 @@ export function sessionConfigForAgent(agent, extra = {}) {
 }
 
 export function sessionConfigAt(session, fromId = undefined) {
-	const branchConfig = session.getBranch(fromId)
-		.filter((entry) => entry.type === "custom" && entry.customType === "config")
-		.reduce((config, entry) => ({ ...config, ...(entry.data ?? {}) }), {})
+	const branchConfig = session.getBranch(fromId).reduce((config, entry) => {
+		if (entry.type === "custom" && entry.customType === "config") return { ...config, ...(entry.data ?? {}) }
+		return applyProjectLocationToConfig(config, projectLocationChangeFromEntry(entry))
+	}, {})
 	return { ...branchConfig, ...(session.getGlobalSessionConfig?.() ?? {}) }
-}
-
-/** @param {any} mount */
-export function sandboxMountSource(mount) {
-	if (typeof mount === "string") return mount
-	if (mount && typeof mount === "object" && typeof mount.from === "string") return mount.from
-	return undefined
-}
-
-/** @param {string | undefined} path */
-export function localAbsolutePath(path) {
-	const text = typeof path === "string" ? path.trim() : ""
-	return text && isAbsolute(text) ? resolve(text) : undefined
-}
-
-/** @param {Array<{ label: string, path: string | undefined }>} candidates */
-export function uniqueLocalPathChecks(candidates) {
-	const byPath = new Map()
-	for (const candidate of candidates) {
-		const path = localAbsolutePath(candidate.path)
-		if (!path) continue
-		const existing = byPath.get(path)
-		if (existing) existing.labels.push(candidate.label)
-		else byPath.set(path, { path, labels: [candidate.label] })
-	}
-	return [...byPath.values()]
-}
-
-/** @param {any} props @param {any} config @param {string} fallbackCwd */
-export function staleToolCwdPathChecks(props, config, fallbackCwd) {
-	const currentCwd = typeof props?.cwd === "string" && props.cwd ? props.cwd : fallbackCwd
-	const initialWd = typeof config?.initialWd === "string" && config.initialWd ? config.initialWd : undefined
-	const sandboxBaseWd = sessionSandboxBaseWd(config, fallbackCwd)
-	return uniqueLocalPathChecks([
-		{ label: "cwd", path: currentCwd },
-		{ label: "initialWd", path: initialWd },
-		{ label: "sandbox base", path: sandboxBaseWd },
-		...sessionSandboxMounts(config).map((mount, index) => ({ label: `sandboxMounts[${index}]`, path: sandboxMountSource(mount) })),
-	])
-}
-
-/** @param {any} props @param {ReturnType<typeof loadEnvironmentRegistry>} registry */
-export function sessionUsesLocalTarget(props, registry) {
-	const environmentId = resolveConfiguredEnvironmentId(props?.environmentId, registry)
-	const environment = getEnvironment(environmentId, registry)
-	return environment?.target?.type === "local"
-}
-
-/** @param {any} report */
-export function cwdFallbackNoticeText(report) {
-	const missing = report.missingPaths
-		.map((entry) => `- ${entry.labels.join(", ")}: ${entry.path}`)
-		.join("\n")
-	return [
-		"Cerex runtime notice: one or more previous local tool execution paths no longer exist.",
-		missing,
-		"",
-		`Tool execution cwd and session sandbox base were reset to the session workspace: ${report.sessionDir}`,
-		"Use `cerex session set cwd <absolute-path>` to choose a project cwd when ready.",
-	].join("\n")
-}
-
-/** @param {any} report */
-export function cwdFallbackNoticeMessage(report) {
-	return {
-		role: "developer",
-		content: [{ type: "text", text: cwdFallbackNoticeText(report) }],
-		timestamp: Date.now(),
-		hidden: true,
-		cwdFallbackNotice: true,
-		cwdFallback: {
-			version: 1,
-			previousCwd: report.previousCwd,
-			previousInitialWd: report.previousInitialWd,
-			previousSandboxMounts: report.previousSandboxMounts,
-			missingPaths: report.missingPaths,
-			sessionDir: report.sessionDir,
-		},
-	}
-}
-
-/** @param {any} message @param {any} report */
-export function cwdFallbackNoticeMatches(message, report) {
-	const fallback = message?.cwdFallback
-	return message?.cwdFallbackNotice === true
-		&& fallback?.previousCwd === report.previousCwd
-		&& fallback?.sessionDir === report.sessionDir
-}
-
-/** @param {any} session @param {any} report */
-export function sessionHasCwdFallbackNotice(session, report) {
-	return (session?.getBranch?.() ?? []).some((entry) => cwdFallbackNoticeMatches(entry.message, report))
 }
 
 /** @param {any[]} mounts @param {(path: string) => string | undefined} remapPath */
@@ -489,7 +395,7 @@ export function sessionWorkspacePathMappingsForEnvironment(sourceId, targetId, s
 	const registry = loadEnvironmentRegistry()
 	const environmentId = resolveConfiguredEnvironmentId(sourceProps.environmentId, registry)
 	const environment = getEnvironment(environmentId, registry)
-	const sandboxBaseWd = sessionSandboxBaseWd(sourceConfig, sourceRuntime.session.getMetadata?.()?.cwd ?? sourceRuntime.cwd)
+	const sandboxBaseWd = sessionSandboxBaseWd(sourceConfig, sourceProps.projectDir, sourceRuntime.session.getMetadata?.()?.cwd ?? sourceRuntime.cwd)
 	const sourceDir = sessionWorkspacePath(sourceId)
 	const targetDir = sessionWorkspacePath(targetId)
 	const stateMount = stateMountFromSettings(sourceRuntime.getSettings?.())

@@ -5,6 +5,7 @@ import { dirname } from "node:path"
 
 import { LEGACY_PREVIEW_ACCESS_TOKEN_ENV, PREVIEW_ACCESS_TOKEN_ENV } from "../../../../../protocol/src/internal-api-env.js"
 import { createDefaultTools } from "../../../tools/index.js"
+import { configureInternalProxyTools } from "../../../tools/internal-proxy-tools.js"
 import { processSessionManager } from "../../../tools/process-sessions.js"
 import { PreviewProcessManager } from "../../../tools/preview-processes.js"
 import { CodeModeCellManager } from "../../code-mode/cell-manager.js"
@@ -150,6 +151,7 @@ const rpc = new JsonLineRpc({
 	onRequest: async (method, params = {}) => {
 		if (method === "init") {
 			assertWorkerProtocolVersion(params.protocolVersion)
+			configureInternalProxyTools(params.proxyTools)
 			installPreviewAccessToken(params.previewAccessToken)
 			await ensureInternalApiBridge()
 			cwd = params.cwd ?? cwd

@@ -1,25 +1,11 @@
 import { getFreshCodexCredential } from "../model/auth.js"
 import { resolveModel } from "../model/registry.js"
-
-const DEFAULT_CODEX_BASE = "https://chatgpt.com/backend-api"
+import { codexUsageUrl, requestCodexUsage } from "../../ai-apis/codex/usage.js"
 
 /** @typedef {{ used_percent?: number, limit_window_seconds?: number, reset_after_seconds?: number, reset_at?: number }} UsageWindow */
 /** @typedef {{ allowed?: boolean, limit_reached?: boolean, primary_window?: UsageWindow | null, secondary_window?: UsageWindow | null }} UsageLimit */
 /** @typedef {{ plan_type?: string, rate_limit?: UsageLimit | null, credits?: { has_credits?: boolean, unlimited?: boolean, balance?: string | null } | null, additional_rate_limits?: Array<{ limit_name?: string, metered_feature?: string, rate_limit?: UsageLimit | null }> | null, rate_limit_reached_type?: { type?: string } | null }} CodexUsagePayload */
 /** @typedef {"normal" | "warn" | "error"} UsageTone */
-
-/**
- * @param {string | undefined} baseUrl
- * @returns {{ baseUrl: string, usageUrl: string }}
- */
-export function codexUsageUrl(baseUrl = DEFAULT_CODEX_BASE) {
-	let normalized = baseUrl.replace(/\/+$/, "")
-	if ((normalized.startsWith("https://chatgpt.com") || normalized.startsWith("https://chat.openai.com")) && !normalized.includes("/backend-api")) {
-		normalized = `${normalized}/backend-api`
-	}
-	const suffix = normalized.includes("/backend-api") ? "/wham/usage" : "/api/codex/usage"
-	return { baseUrl: normalized, usageUrl: `${normalized}${suffix}` }
-}
 
 /** @param {string} token */
 function decodeJwtPayload(token) {
@@ -42,6 +28,7 @@ function accountIdFromAccess(access) {
 }
 
 export { getFreshCodexCredential } from "../model/auth.js"
+export { codexUsageUrl } from "../../ai-apis/codex/usage.js"
 
 /** @param {import("../settings.js").Settings | undefined} settings */
 export function codexUsageBaseUrlFromSettings(settings) {
@@ -62,21 +49,7 @@ export function codexUsageBaseUrlForModel(model, settings) {
 export async function fetchCodexUsage(options = {}) {
 	const access = options.access ?? (await getFreshCodexCredential()).access
 	const accountId = options.accountId ?? accountIdFromAccess(access)
-	const { usageUrl } = codexUsageUrl(options.baseUrl)
-	const headers = {
-		Authorization: `Bearer ${access}`,
-		"User-Agent": "codex-cli",
-	}
-	if (accountId) headers["ChatGPT-Account-Id"] = accountId
-	const fetchFn = options.fetchFn ?? fetch
-	const response = await fetchFn(usageUrl, { method: "GET", headers, signal: options.signal })
-	const text = await response.text().catch(() => "")
-	if (!response.ok) throw new Error(`usage request failed: HTTP ${response.status}${text ? ` ${text}` : ""}`)
-	try {
-		return JSON.parse(text)
-	} catch (err) {
-		throw new Error(`usage request returned invalid JSON: ${err instanceof Error ? err.message : err}`)
-	}
+	return requestCodexUsage({ ...options, access, accountId })
 }
 
 const HOUR_SECONDS = 60 * 60

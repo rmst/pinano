@@ -13,10 +13,9 @@ import {
 	wrapTextWithAnsi,
 } from "../../../tui/index.js"
 import { loginCodex } from "../../../../../server/src/ai-apis/codex/index.js"
-import { API_KEY_PROVIDER_INFOS, deleteCredential, detectedEnvApiKeys, getCredential, listProviders, setCredential } from "../../../../../server/src/app/auth/credentials.js"
+import { API_KEY_PROVIDER_INFOS, credentialFilePath, credentialIsManaged, deleteCredential, detectedEnvApiKeys, getCredential, listProviders, setCredential } from "../../../../../server/src/app/auth/credentials.js"
 import { availableModelEntries, modelRef, modelRefMatches } from "../../../../../server/src/app/model/registry.js"
 import { loadSettings } from "../../../../../server/src/app/settings.js"
-import { authFilePath } from "../../../../../server/src/app/paths.js"
 import { pickFromOverlay } from "../../components/picker.js"
 import { promptForInput } from "../../components/prompt-input.js"
 import { theme } from "../../theme.js"
@@ -183,6 +182,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 		this.busy = false
 		this.onClose = undefined
 		this.stored = new Map()
+		this.managed = new Set()
 		this.envKeys = []
 		this.wheelDeltas = new MouseWheelDeltaTracker()
 	}
@@ -190,20 +190,30 @@ export class CredentialsSettingsModal extends RetainedComponent {
 	async reload() {
 		this.stored = new Map()
 		for (const provider of await listProviders()) this.stored.set(provider, await getCredential(provider))
+		this.managed = new Set([
+			"openai-codex",
+			...API_KEY_PROVIDER_INFOS.map((info) => info.provider),
+			...this.stored.keys(),
+		].filter((provider) => credentialIsManaged(provider)))
 		this.envKeys = detectedEnvApiKeys()
 		this.rebuildRows()
 	}
 
 	rebuildRows() {
 		const codex = this.stored.get("openai-codex")
+		const codexManaged = this.managed.has("openai-codex")
 		const envProviders = new Set(this.envKeys.map((candidate) => candidate.provider))
 		this.rows = [
 			{
 				id: "chatgpt",
-				kind: "chatgpt",
-				label: "Use your ChatGPT subscription",
-				value: codex?.kind === "codex" ? `connected${codex.accountId ? ` · ${codex.accountId}` : ""}` : "OAuth",
-				description: "Starts the OpenAI OAuth flow. Usage is subject to your ChatGPT plan and OpenAI's terms.",
+				kind: codexManaged ? "managed" : "chatgpt",
+				label: codexManaged ? "ChatGPT subscription" : "Use your ChatGPT subscription",
+				value: codexManaged
+					? `${codex?.kind === "codex" ? "connected" : "not configured"} · deployment managed`
+					: codex?.kind === "codex" ? `connected${codex.accountId ? ` · ${codex.accountId}` : ""}` : "OAuth",
+				description: codexManaged
+					? "This credential is provided by the Cerex deployment and cannot be replaced or removed here."
+					: "Starts the OpenAI OAuth flow. Usage is subject to your ChatGPT plan and OpenAI's terms.",
 			},
 			{ id: "spacer:api-keys", kind: "spacer", label: "", value: "" },
 			{ id: "section:api-keys", kind: "section", label: "API keys", value: "" },
@@ -212,15 +222,18 @@ export class CredentialsSettingsModal extends RetainedComponent {
 		if (this.envKeys.length > 0) {
 			this.rows.push(...this.envKeys.map((candidate) => {
 				const credential = this.stored.get(candidate.provider)
+				const managed = this.managed.has(candidate.provider)
 				const saved = credential?.kind === "apiKey"
 				const differs = saved && credential.apiKey !== candidate.apiKey
 				return {
 					id: `env:${candidate.provider}:${candidate.envVar}`,
-					kind: "env-api-key",
+					kind: managed ? "managed" : "env-api-key",
 					candidate,
-					label: `${saved ? differs ? "Update" : "Saved" : "Save"} ${candidate.envVar}`,
-					value: `${saved ? "[x]" : "[ ]"}${differs ? " env differs" : saved ? " saved" : ""}`,
-					description: saved
+					label: managed ? candidate.envVar : `${saved ? differs ? "Update" : "Saved" : "Save"} ${candidate.envVar}`,
+					value: managed ? "deployment managed" : `${saved ? "[x]" : "[ ]"}${differs ? " env differs" : saved ? " saved" : ""}`,
+					description: managed
+						? `${candidate.providerLabel} credentials are provided by the Cerex deployment and cannot be changed here.`
+						: saved
 						? differs
 							? `A different ${candidate.providerLabel} API key is saved. Space updates Cerex to the environment value (${maskSecret(candidate.apiKey)}). Select it again after updating to remove it.`
 							: `${candidate.providerLabel} API key is saved (${maskSecret(candidate.apiKey)}). Space removes it from Cerex.`
@@ -246,6 +259,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 		})
 
 		for (const [provider, credential] of this.stored) {
+			if (this.managed.has(provider)) continue
 			if (credential?.kind === "codex") this.rows.push({
 				id: `remove:${provider}`,
 				kind: "remove",
@@ -271,7 +285,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 	}
 
 	isSelectableRow(row) {
-		return row && row.kind !== "spacer" && row.kind !== "section" && row.kind !== "noop"
+		return row && row.kind !== "spacer" && row.kind !== "section" && row.kind !== "noop" && row.kind !== "managed"
 	}
 
 	isClickableRow(row) {
@@ -402,7 +416,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 				},
 			})
 			await saveCodexCredentials(credentials)
-			await this.afterCredentialChange(`Saved ChatGPT subscription credentials to ${authFilePath("openai-codex")}`)
+			await this.afterCredentialChange(`Saved ChatGPT subscription credentials to ${credentialFilePath("openai-codex")}`)
 			closeAfterOAuth = true
 		} catch (err) {
 			this.setStatus(controller.signal.aborted ? "ChatGPT login cancelled" : `ChatGPT login failed: ${err?.message ?? err}`)
@@ -417,9 +431,16 @@ export class CredentialsSettingsModal extends RetainedComponent {
 	}
 
 	async addManualApiKey() {
+		const providerOptions = API_KEY_PROVIDER_INFOS
+			.filter((info) => !credentialIsManaged(info.provider))
+			.map((info) => ({ value: info.provider, label: info.label }))
+		if (providerOptions.length === 0) {
+			this.setStatus("API key credentials are managed by this Cerex deployment")
+			return
+		}
 		const provider = await pickFromOverlay(
 			this.tui,
-			API_KEY_PROVIDER_INFOS.map((info) => ({ value: info.provider, label: info.label })),
+			providerOptions,
 			{
 				title: "Add a different API key",
 				subtitle: "Choose the provider this API key should be used with.",
@@ -441,7 +462,7 @@ export class CredentialsSettingsModal extends RetainedComponent {
 			return
 		}
 		await setCredential(provider, { kind: "apiKey", apiKey, createdAt: Date.now() })
-		await this.afterCredentialChange(`Saved ${providerLabel(provider)} API key to ${authFilePath(provider)}`)
+		await this.afterCredentialChange(`Saved ${providerLabel(provider)} API key to ${credentialFilePath(provider)}`)
 	}
 
 	async toggleEnvApiKey(candidate) {

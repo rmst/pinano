@@ -60,6 +60,17 @@ export class CerexClient {
 		this.#sessionListCwd = options.sessionListCwd
 	}
 
+	resolvePermission(id, toolCallId, decision, options = {}) {
+		return this.request(sessionPath(id, "/permissions"), requestOptions(options, {
+			method: "POST",
+			body: { toolCallId, decision, ...(options.input === undefined ? {} : { input: options.input }) },
+		}))
+	}
+
+	permissionRequest(id, toolCallId, options = {}) {
+		return this.request(sessionPath(id, `/permissions/${encodeURIComponent(toolCallId)}`), requestOptions(options))
+	}
+
 	/** Send an application-API-relative request with an optional structured JSON body. This is the extension point for API operations not yet represented by a named SDK method. */
 	request(path, options = {}) {
 		return this.#transport.request(apiPath(path), options)
@@ -118,9 +129,22 @@ export class CerexClient {
 		}))
 	}
 
+	renameProject(root, input, options = {}) {
+		return this.request("/projects/rename", requestOptions(options, {
+			method: "POST",
+			body: { root, path: input?.path, name: input?.name },
+		}))
+	}
+
+	deleteProject(root, input, options = {}) {
+		return this.request("/projects/delete", requestOptions(options, {
+			method: "POST",
+			body: { root, path: input?.path, confirmation: input?.confirmation },
+		}))
+	}
+
 	projectPreviews(projectDir, options = {}) {
 		const params = new URLSearchParams({ projectDir })
-		if (options.sessionId) params.set("sessionId", options.sessionId)
 		return this.request(queryPath("/projects/previews", params), requestControls(options))
 	}
 
@@ -262,7 +286,15 @@ export class CerexClient {
 		const params = new URLSearchParams()
 		if (options.includeSessions === true) params.set("includeSessions", "1")
 		if (options.includeContextMessages === true) params.set("includeContextMessages", "1")
+		if (options.transcriptMode === "deferred") params.set("transcript", "deferred")
 		return this.request(queryPath(sessionPath(id, "/snapshot"), params), requestControls(options))
+	}
+
+	hydrateTranscriptEntries(id, entryIds, options = {}) {
+		return this.request(sessionPath(id, "/transcript-entries"), requestOptions(options, {
+			method: "POST",
+			body: { entryIds },
+		}))
 	}
 
 	sessionStatus(id, options = {}) {

@@ -366,16 +366,17 @@ async function* parseWebSocket(socket, {
 			if (signal?.aborted) throw new Error("Request was aborted")
 			if (queue.length > 0) {
 				const text = await decodeWebSocketData(queue.shift())
-				onRawEvent?.({ data: text })
 				let event
 				try {
 					event = JSON.parse(text)
 				} catch (cause) {
+					onRawEvent?.({ data: text })
 					throw new CodexWebSocketProtocolError(`Invalid Codex WebSocket JSON: ${cause instanceof Error ? cause.message : String(cause)}`, {
 						payload: text,
 						cause,
 					})
 				}
+				onRawEvent?.({ data: text, parsed: event })
 				sawEvent = true
 				if (completionEvent(event)) sawCompletion = true
 				yield event

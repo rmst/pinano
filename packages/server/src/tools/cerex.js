@@ -6,11 +6,12 @@ import { pathToFileURL } from "node:url"
 import { INTERNAL_API_BASE_URL_ENV, INTERNAL_API_TOKEN_ENV, PREVIEW_ACCESS_TOKEN_ENV, SESSION_ID_ENV } from "../../../protocol/src/internal-api-env.js"
 import { applyProductEnvAliases, readProductEnv } from "../../../protocol/src/product.js"
 import { SESSION_BRIDGE_ROUTE } from "../app/session/bridge-protocol.js"
-import { PREVIEW_AUTHORIZATION_HEADER } from "../app/preview/manifest.js"
-import { CliError, postInternalEvent } from "./worktree-command-utils.js"
+import { DEFAULT_PREVIEW_STARTUP_TIMEOUT_MS, PREVIEW_AUTHORIZATION_HEADER, PREVIEW_RESTART_PATH } from "../app/preview/manifest.js"
+import { CliError, postInternalEvent, postJson } from "./worktree-command-utils.js"
 
 const VERSION = "cerex 0.1"
 const REQUEST_TIMEOUT_MS = 5000
+const PREVIEW_RESTART_REQUEST_TIMEOUT_MS = DEFAULT_PREVIEW_STARTUP_TIMEOUT_MS + REQUEST_TIMEOUT_MS
 const TRANSCRIPT_REQUEST_TIMEOUT_MS = 120000
 
 function usage() {
@@ -27,6 +28,7 @@ Usage:
   cerex project get
   cerex project set <name>
   cerex preview
+  cerex preview restart <definition.preview.json>
 
 Without --id, cerex session reads the target session id from $${SESSION_ID_ENV}.
 Lifecycle updates are current-session-only and are accepted only during automated worktree lifecycle maintenance.
@@ -34,27 +36,7 @@ cerex sessions lists visible sessions. cerex sessions cat concatenates visible t
 
 Project commands update project metadata for the current session's project directory.
 
-Always use cerex preview when trying to expose, inspect, or verify a web server, web app, docs server, or static HTML preview for the user. It prints configured preview names, scopes, concrete URLs, source files, and log paths; use the printed URLs instead of constructing preview hostnames.
-
-Static document sites:
-  - A project's .cerex/docs/ directory is the root of its built-in document site.
-  - Automatically listed static sites use .cerex/previews/<name>.preview.json with { "root": "project/relative/directory", "entry": "optional/start/path", "description": "optional text" }.
-  - A *.preview.json file elsewhere in the project can be empty or contain the same optional properties. root defaults to its containing directory when omitted; an explicit root is always project-relative.
-  - The filename supplies the automatically listed preview name. Static roots must be non-symlinked project subdirectories; entry defaults to the directory index.
-  - HTML is served directly, Markdown is rendered, and other files are served unchanged as assets.
-  - A supported index.html, index.htm, or index.md adds the docs project preview automatically; no preview module or process is required.
-  - Nested directories use the same index files. URLs otherwise map to exact files; bracketed names have no routing semantics.
-  - Local links within a static root stay in its site. Local links elsewhere in the project open in the workbench; local links outside the project are rejected.
-
-Preview modules:
-  - Project previews live under .cerex/previews/<name>.preview.js.
-  - Temporary session previews live under $CEREX_SESSION_DIR/previews/<name>.preview.js.
-  - Preview modules are ES modules that export default { exec, description?, healthPath? }.
-  - exec is required. It may be a shell command string or a JS function.
-  - Shell exec strings run in the owning session cwd with CEREX_HOST, CEREX_PORT, CEREX_PUBLIC_URL, and CEREX_PREVIEW_LOG.
-  - JS exec functions are called as exec({ host, port, publicUrl, logPath, signal, env }).
-  - The preview must listen on host:port or $CEREX_HOST:$CEREX_PORT.
-  - After writing a preview module, run cerex preview and give the printed URL to the user.
+Use cerex preview for web apps, docs servers, and static sites. It prints concrete URLs for configured previews. Run cerex preview --help for the .preview.json contract and access instructions.
 
 Properties:
   description  short stable UI label
@@ -81,37 +63,44 @@ function previewUsage() {
 
 Usage:
   cerex preview
+  cerex preview restart <definition.preview.json>
 
-Always use cerex preview when trying to expose, inspect, or verify a web server, web app, docs server, or static HTML preview for the user. It prints configured preview names, scopes, concrete URLs, source files, and log paths; use the printed URLs instead of constructing preview hostnames.
+Use cerex preview to list configured web app, docs, and static-site previews with their concrete URLs.
 
-Static document sites:
-  - A project's .cerex/docs/ directory is the root of its built-in document site.
-  - Automatically listed static sites use .cerex/previews/<name>.preview.json with { "root": "project/relative/directory", "entry": "optional/start/path", "description": "optional text" }.
-  - A *.preview.json file elsewhere in the project can be empty or contain the same optional properties. root defaults to its containing directory when omitted; an explicit root is always project-relative.
-  - The filename supplies the automatically listed preview name. Static roots must be non-symlinked project subdirectories; entry defaults to the directory index.
-  - HTML is served directly, Markdown is rendered, and other files are served unchanged as assets.
-  - A supported index.html, index.htm, or index.md adds the docs project preview automatically; no preview module or process is required.
-  - Nested directories use the same index files. URLs otherwise map to exact files; bracketed names have no routing semantics.
-  - Local links within a static root stay in its site. Local links elsewhere in the project open in the workbench; local links outside the project are rejected.
+Definitions are JSON objects with target plus optional description and routeSourceMap. Project definitions live at .cerex/previews/<name>.preview.json; temporary session definitions live at $CEREX_SESSION_DIR/previews/<name>.preview.json. The lowercase DNS label <name> becomes the preview name.
 
-Preview modules:
-  - Project previews live under .cerex/previews/<name>.preview.js.
-  - Temporary session previews live under $CEREX_SESSION_DIR/previews/<name>.preview.js.
-  - Preview modules are ES modules that export default { exec, description?, healthPath? }.
-  - exec is required. It may be a shell command string or a JS function.
-  - Shell exec strings run in the owning session cwd with CEREX_HOST, CEREX_PORT, CEREX_PUBLIC_URL, and CEREX_PREVIEW_LOG.
-  - JS exec functions are called as exec({ host, port, publicUrl, logPath, signal, env }).
-  - The preview must listen on host:port or $CEREX_HOST:$CEREX_PORT.
-  - Cerex starts each preview lazily on first request and writes stdout/stderr to CEREX_PREVIEW_LOG.
-  - After writing or changing a preview module, run cerex preview and give the printed URL to the user.
+Process target example:
+  {
+    "description": "Development app",
+    "target": {
+      "kind": "process",
+      "command": "jix run dev",
+      "cwd": ".",
+      "entry": "/",
+      "health": "/"
+    },
+    "routeSourceMap": [
+      { "route": "/blog/:slug", "source": "content/blog/{slug}.md" },
+      { "route": "/docs/*page", "source": "pages/docs/{page}/index.html" }
+    ]
+  }
 
-Output columns:
-  name<TAB>scope<TAB>url<TAB>source<TAB>log
+Process commands are POSIX shell strings executed independently in the configured default environment. cwd is relative to the preview scope root—the project/worktree root or session directory—and defaults to that root. entry and health default to /. The process listens on $CEREX_PREVIEW_HOST:$CEREX_PREVIEW_PORT.
 
-Preview access:
-  - To inspect a printed preview URL yourself from a Cerex tool session, request it with Authorization: Bearer $${PREVIEW_ACCESS_TOKEN_ENV}.
-  - If the previewed app itself needs an Authorization header, send that app header as ${PREVIEW_AUTHORIZATION_HEADER}; Cerex forwards it after preview access is authenticated.
-  - This token is only for Cerex preview access; do not print its value, write it into files, or include it in user-facing messages.
+routeSourceMap links preview routes to page source files so that the preview page and source file can be viewed side-by-side. Routes support :name for one segment and a final *name for the remaining path, with captured values inserted into source as {name}. Prefer parameterized mappings for repeated layouts.
+
+Static target example:
+  {
+    "description": "Built documentation",
+    "target": { "kind": "static", "root": "dist" }
+  }
+
+Static root is relative to the preview scope root. URL paths map to files; directories use index.html, index.htm, or index.md. Markdown is rendered and other files are served directly. Optional entry is relative to root.
+
+Run cerex preview after writing a definition. Use cerex preview restart <definition.preview.json> after changing a process preview; it waits for health and prints the URL. Fetch the printed URL before visual browser work. Startup errors report the command, default environment, working directory, exit reason, log path, and recent output.
+
+Agent access:
+  Request printed URLs with Authorization: Bearer $${PREVIEW_ACCESS_TOKEN_ENV}. Send an app-specific Authorization value as ${PREVIEW_AUTHORIZATION_HEADER}. Keep the preview token private and out of files and user-facing messages.
 
 Options:
   -h, --help  show this help
@@ -343,8 +332,11 @@ export function parseArgs(args) {
 	}
 	if (args[0] === "preview") {
 		if (args[1] === "-h" || args[1] === "--help") return { help: true, helpTopic: "preview" }
-		if (args.length > 1) throw new CliError("cerex preview does not take arguments", 2)
-		return { namespace: "preview", operation: "list" }
+		if (args.length === 1) return { namespace: "preview", operation: "list" }
+		if (args[1] !== "restart") throw new CliError(`unknown preview command: ${args[1]}`, 2)
+		if (args[2] === "-h" || args[2] === "--help") return { help: true, helpTopic: "preview" }
+		if (args.length !== 3) throw new CliError("preview restart requires <definition.preview.json>", 2)
+		return { namespace: "preview", operation: "restart", definitionPath: args[2] }
 	}
 	if (args[0] === "sessions") {
 		const command = args[1] === "cat" ? "cat" : "list"
@@ -389,6 +381,16 @@ export function parseArgs(args) {
 		}
 	}
 	throw new CliError(`unknown session command: ${command || ""}`.trim(), 2)
+}
+
+function configuredPreviewForPath(body, value) {
+	const definitionPath = resolve(value)
+	const preview = (Array.isArray(body.previews) ? body.previews : [])
+		.find((candidate) => typeof candidate?.configPath === "string" && resolve(candidate.configPath) === definitionPath)
+	if (!preview) throw new CliError(`No configured preview found for ${definitionPath}`, 2)
+	if (preview.kind !== "process") throw new CliError(`Preview definition is not a process preview: ${definitionPath}`, 2)
+	if (typeof preview.publicUrl !== "string" || !preview.publicUrl) throw new CliError(`Preview has no public URL: ${definitionPath}`)
+	return preview
 }
 
 function responseError(response) {
@@ -448,7 +450,10 @@ function formatPreviewListResult(body = {}) {
 		preview.name ?? "?",
 		preview.scope ?? "?",
 		preview.publicUrl ?? "(no public URL)",
-		preview.source?.path ?? "",
+		preview.configPath ?? preview.source?.path ?? "",
+		preview.executionRoot ?? "",
+		preview.environmentId ?? "",
+		preview.cwd ?? "",
 		preview.logPath ?? "",
 	].join("\t")).join("\n")}\n`
 }
@@ -549,6 +554,15 @@ export async function runAgentCommand(config, options = {}) {
 			operation: "preview.list",
 			sessionId,
 		})
+		if (config.operation === "restart") {
+			const preview = configuredPreviewForPath(body, config.definitionPath)
+			const accessToken = env[PREVIEW_ACCESS_TOKEN_ENV]
+			if (!accessToken) throw new CliError(`${PREVIEW_ACCESS_TOKEN_ENV} is not set`)
+			const response = await postJson(new URL(PREVIEW_RESTART_PATH, preview.publicUrl), accessToken, {}, { timeoutMs: PREVIEW_RESTART_REQUEST_TIMEOUT_MS })
+			if (!response.ok) throw new CliError(responseError(response), response.status >= 400 && response.status < 500 ? 2 : 1)
+			await writeStdout(`${preview.publicUrl}\n`)
+			return { ...body, preview, restart: response.body }
+		}
 		await writeStdout(formatPreviewListResult(body))
 		await writeStderr(previewAccessInstructions())
 		return body

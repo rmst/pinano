@@ -79,6 +79,7 @@ export const disabledServiceDiagnostics = {
 	enabled: false,
 	path: undefined,
 	span: () => NOOP_END,
+	completedSpan: () => {},
 	instant: () => {},
 	setContextProvider: () => {},
 	addProbe: () => NOOP_END,
@@ -380,6 +381,37 @@ export function createServiceDiagnostics(options = {}) {
 					durationMs: roundMs(durationMs),
 				}))
 			}
+		},
+
+		/**
+		 * Record a span completed in another thread or process using its measured duration. Epoch-based start times keep worker spans on the same trace timeline without making the service thread participate in their timing.
+		 * @param {string} name
+		 * @param {Record<string, any>} [args]
+		 * @param {{ startedAtEpochMs?: number, durationMs?: number, tid?: number }} [timing]
+		 */
+		completedSpan(name, args, timing = {}) {
+			const durationMs = Math.max(0, Number(timing.durationMs) || 0)
+			const now = performance.now()
+			const epochStart = Number(timing.startedAtEpochMs)
+			const start = Number.isFinite(epochStart) && Number.isFinite(performance.timeOrigin)
+				? epochStart - performance.timeOrigin
+				: now - durationMs
+			const spanArgs = cleanArgs(args)
+			recentSpans.push({ name, args: spanArgs, durationMs, endedAt: now })
+			while (recentSpans.length > MAX_RECORDED_SPANS * 4) recentSpans.shift()
+			if (!recordAllSpans && durationMs < slowSpanMs) return
+			slowSpanCount += 1
+			write(makeEvent({
+				ph: "X",
+				name,
+				ts: start * 1000,
+				dur: durationMs * 1000,
+				pid,
+				tid: Number.isInteger(timing.tid) ? timing.tid : tid,
+			}, {
+				...spanArgs,
+				durationMs: roundMs(durationMs),
+			}))
 		},
 
 		/**

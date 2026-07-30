@@ -278,7 +278,7 @@ export async function fetchStreamingResponseWithRetries({
  * @param {(info:{status:number,headers:Record<string,string>}, model:object) => Promise<void>} [params.onResponse]
  * @param {(events: AsyncIterable) => AsyncIterable}      [params.mapEvents]   transform raw SSE events
  * @param {(rawText:string, status:number) => Promise<{message:string, friendly?:string, retryable?:boolean, code?:string, type?:string}>} [params.parseError]
- * @param {{id:string,nextEventSeq:number} | null} [params.modelLog]
+ * @param {{id:string|null,nextEventSeq:number} | null} [params.modelLog]
  * @param {string} [params.method]
  * @param {{serviceTier?: string}} [params.pricingContext]
  * @param {number|false|null} [params.responseHeaderTimeoutMs]

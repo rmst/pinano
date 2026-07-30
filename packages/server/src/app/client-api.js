@@ -2,7 +2,7 @@ import { normalizeReasoningLevel } from "../../../protocol/src/reasoning.js"
 import { parseBashShortcut, recordBashShortcut, runAgentBashShortcut } from "./bash-shortcut.js"
 import { availableModelEntries, buildModel, canonicalModelRef, eligibleSessionModelEntries, modelChoice, modelEntryMatches, modelRef, parseModelRef, sessionModelEligibilityError } from "./model/registry.js"
 import { overviewModelStatus } from "./overview/model-status.js"
-import { SESSION_ATTACHMENT_VARIANT_DISPLAY, SESSION_ATTACHMENT_VARIANT_ORIGINAL } from "./session/attachments.js"
+import { SESSION_ATTACHMENT_VARIANT_DISPLAY, SESSION_ATTACHMENT_VARIANT_ORIGINAL, readPromptImageAttachmentVariant } from "./session/attachments.js"
 import { loadSettings, redactedSettings, updateSetting, updateSettings } from "./settings.js"
 import { overviewDirectoryFilterUiStateKey, overviewDirectoryStateKey } from "./ui-state.js"
 import { WEB_CHAT_COMMANDS, WEB_COMMANDS, WEB_OVERVIEW_COMMANDS } from "../../../protocol/src/web-commands.js"
@@ -118,6 +118,8 @@ const apiPath = (prefix, path) => {
 }
 
 const sessionId = (context) => context.req.param("id") ?? ""
+
+const permissionToolCallId = (context) => context.req.param("toolCallId") ?? ""
 
 const attachmentId = (context) => context.req.param("attachmentId") ?? ""
 
@@ -304,7 +306,9 @@ export function createManagerClientApi(options) {
 				waitForCompletion: options.waitForCompletion === true,
 			}),
 		}),
-		projectPreviews: async (projectDir, previewOptions = {}) => manager.projectPreviewList(projectDir, previewOptions),
+		renameProject: (root, input) => manager.renameProject(root, input),
+		deleteProject: (root, input) => manager.deleteProject(root, input),
+		projectPreviews: async (projectDir) => manager.projectPreviewList(projectDir),
 		resolveSessionId: async (id) => {
 			const requestedSessionId = typeof id === "string" ? id.trim() : ""
 			if (!requestedSessionId) throw Object.assign(new Error("session id is required"), { status: 400 })
@@ -319,6 +323,7 @@ export function createManagerClientApi(options) {
 		previewSource: async (url) => manager.previewSourceForUrl(url),
 		overviewProject,
 		snapshot,
+		hydrateTranscriptEntries: (id, body = {}) => manager.hydrateTranscriptEntries(id || manager.initialSessionId, body.entryIds),
 		sessionStatus: (id) => manager.sessionStatus(id || manager.initialSessionId),
 		contextReport: (id) => manager.contextReport(id || manager.initialSessionId),
 		systemReport: (id) => manager.systemReport(id || manager.initialSessionId),
@@ -343,19 +348,21 @@ export function createManagerClientApi(options) {
 		setSettings: async (body) => ({ ok: true, settings: await setSettings(body) }),
 		getUiState: async (key) => {
 			const cleanedKey = cleanUiStateKey(key)
-			return uiStateResponse(cleanedKey, uiStateStore.getUiState(cleanedKey))
+			return uiStateResponse(cleanedKey, await uiStateStore.getUiState(cleanedKey))
 		},
 		setUiState: async (key, value) => {
 			const cleanedKey = cleanUiStateKey(key)
-			return { ok: true, ...uiStateResponse(cleanedKey, uiStateStore.setUiState(cleanedKey, value)) }
+			return { ok: true, ...uiStateResponse(cleanedKey, await uiStateStore.setUiState(cleanedKey, value)) }
 		},
 		deleteUiState: async (key) => {
 			const cleanedKey = cleanUiStateKey(key)
-			return { ok: true, key: cleanedKey, deleted: uiStateStore.deleteUiState(cleanedKey) }
+			return { ok: true, key: cleanedKey, deleted: await uiStateStore.deleteUiState(cleanedKey) }
 		},
 		attachmentContent: async (id, attachmentId, variant = SESSION_ATTACHMENT_VARIANT_DISPLAY) => {
 			const store = options.db ?? manager.db
-			const content = store?.getAttachmentVariant?.(id, attachmentId, variant)
+			const content = store
+				? await readPromptImageAttachmentVariant(store, id, attachmentId, variant, { diagnostics: manager.diagnostics })
+				: undefined
 			if (!content) throw Object.assign(new Error("Attachment not found"), { status: 404 })
 			return content
 		},
@@ -366,7 +373,8 @@ export function createManagerClientApi(options) {
 			const runtime = await manager.createSession(cwd)
 			if (prompt.trim() || images.length > 0) {
 				const submission = await runtime.beginPrompt(prompt, body.streamingBehavior, images)
-				runtime.observePromptAccepted(submission)
+				if (submission.streamingBehavior) runtime.observePromptAccepted(submission)
+				else await runtime.waitForPromptAccepted(submission)
 			}
 			return mutationResult(runtime.sessionId, {}, ["session", "sessions"])
 		},
@@ -399,6 +407,12 @@ export function createManagerClientApi(options) {
 			const response = await (await runtimeFor(id)).cancelCurrentPrompt({
 				restoreCurrentPrompt: body.restoreCurrentPrompt !== false,
 			})
+			return mutationResult(id, response)
+		},
+		permissionRequest: async (id, toolCallId) => await (await runtimeFor(id)).permissionRequest(toolCallId),
+		resolvePermission: async (id, body = {}) => {
+			const runtime = await runtimeFor(id)
+			const response = await runtime.resolvePermission(body.toolCallId, body.decision, body.input)
 			return mutationResult(id, response)
 		},
 		markCompleted: async (id) => {
@@ -566,7 +580,9 @@ export function createServiceClientApi(options) {
 		sessions: (cwd, options = {}) => client.sessions(cwd, options),
 		sessionsStatus: (cwd, options = {}) => client.sessionsStatus(cwd, options),
 		ensureProjectMaintenance: (projectDir, options = {}) => client.ensureProjectMaintenance(projectDir, options),
-		projectPreviews: (projectDir, previewOptions = {}) => client.projectPreviews(projectDir, previewOptions),
+		renameProject: (root, input) => client.renameProject(root, input),
+		deleteProject: (root, input) => client.deleteProject(root, input),
+		projectPreviews: (projectDir) => client.projectPreviews(projectDir),
 		sessionPreviews: async (id) => client.sessionPreviews(id || await ensureInitialSessionId()),
 		resolveSessionId: async (id) => {
 			if (typeof client.resolveSessionId === "function") return client.resolveSessionId(id)
@@ -580,6 +596,7 @@ export function createServiceClientApi(options) {
 		previewSource: (url) => client.previewSource(url),
 		overviewProject,
 		snapshot,
+		hydrateTranscriptEntries: async (id, body = {}) => client.hydrateTranscriptEntries(id || await ensureInitialSessionId(), body.entryIds),
 		sessionStatus: async (id) => client.sessionStatus(id || await ensureInitialSessionId()),
 		contextReport: async (id) => client.contextReport(id || await ensureInitialSessionId()),
 		systemReport: async (id) => client.systemReport(id || await ensureInitialSessionId()),
@@ -636,6 +653,11 @@ export function createServiceClientApi(options) {
 				draftClientSeq: body.draftClientSeq,
 				images,
 			})
+			return mutationResult(id, response)
+		},
+		permissionRequest: (id, toolCallId) => client.permissionRequest(id, toolCallId),
+		resolvePermission: async (id, body = {}) => {
+			const response = await client.resolvePermission(id, body.toolCallId, body.decision, { input: body.input })
 			return mutationResult(id, response)
 		},
 		draft: (id, body) => client.setPromptDraft(id, typeof body.text === "string" ? body.text : "", { clientId: body.clientId, clientSeq: body.clientSeq }),
@@ -742,6 +764,7 @@ export function registerClientApiRoutes(app, api, options = {}) {
 			...defaults,
 			includeSessions: params.get("includeSessions") === "1" || defaults.includeSessions === true,
 			includeContextMessages: params.get("includeContextMessages") === "1" || defaults.includeContextMessages === true,
+			...(params.get("transcript") === "deferred" ? { transcriptMode: "deferred" } : {}),
 		}
 	}
 
@@ -761,6 +784,22 @@ export function registerClientApiRoutes(app, api, options = {}) {
 		const cwd = cwdFilter(context)
 		return json({ sessions: await api.sessions(cwd, { includeDeleted: includeDeletedSessions(context), includeHidden: includeHiddenSessions(context) }), project: await api.overviewProject?.(cwd) })
 	}))
+	app.post(path("/projects/rename"), safe(async (context) => {
+		const body = await context.req.json()
+		if (typeof body?.root !== "string" || !body.root) throw Object.assign(new Error("root is required"), { status: 400 })
+		if (typeof body?.path !== "string" || !body.path) throw Object.assign(new Error("path is required"), { status: 400 })
+		if (typeof body?.name !== "string" || !body.name) throw Object.assign(new Error("name is required"), { status: 400 })
+		if (typeof api.renameProject !== "function") throw Object.assign(new Error("project rename is not supported"), { status: 501 })
+		return json(await api.renameProject(body.root, { path: body.path, name: body.name }))
+	}))
+	app.post(path("/projects/delete"), safe(async (context) => {
+		const body = await jsonBody(context)
+		if (typeof body?.root !== "string" || !body.root) throw Object.assign(new Error("root is required"), { status: 400 })
+		if (typeof body?.path !== "string" || !body.path) throw Object.assign(new Error("path is required"), { status: 400 })
+		if (typeof body?.confirmation !== "string" || !body.confirmation) throw Object.assign(new Error("confirmation is required"), { status: 400 })
+		if (typeof api.deleteProject !== "function") throw Object.assign(new Error("project deletion is not supported"), { status: 501 })
+		return json(await api.deleteProject(body.root, { path: body.path, confirmation: body.confirmation }))
+	}))
 	app.get(path("/sessions/status"), safe(async (context) => json(await api.sessionsStatus(cwdFilter(context), { includeDeleted: includeDeletedSessions(context), includeHidden: includeHiddenSessions(context) }))))
 	app.post(path("/projects/maintenance"), safe(async (context) => {
 		const body = await jsonBody(context)
@@ -776,10 +815,9 @@ export function registerClientApiRoutes(app, api, options = {}) {
 	app.get(path("/projects/previews"), safe(async (context) => {
 		const searchParams = urlFor(context).searchParams
 		const projectDir = searchParams.get("projectDir") || undefined
-		const sessionId = searchParams.get("sessionId") || undefined
 		if (typeof projectDir !== "string" || !projectDir) throw Object.assign(new Error("projectDir is required"), { status: 400 })
 		if (typeof api.projectPreviews !== "function") throw Object.assign(new Error("project previews are not supported"), { status: 501 })
-		return json(await api.projectPreviews(projectDir, { sessionId }))
+		return json(await api.projectPreviews(projectDir))
 	}))
 	app.get(path("/previews/resolve"), safe(async (context) => {
 		const previewUrl = urlFor(context).searchParams.get("url") || undefined
@@ -846,6 +884,7 @@ export function registerClientApiRoutes(app, api, options = {}) {
 	}))
 	app.get(path("/sessions/:id"), snapshotById)
 	app.get(path("/sessions/:id/snapshot"), snapshotById)
+	app.post(path("/sessions/:id/transcript-entries"), safe(async (context) => json(await api.hydrateTranscriptEntries(sessionId(context), await jsonBody(context)))))
 	app.get(path("/sessions/:id/context-report"), safe(async (context) => json({ lines: await api.contextReport(sessionId(context)) })))
 	app.get(path("/sessions/:id/system-report"), safe(async (context) => json({ lines: await api.systemReport(sessionId(context)) })))
 	app.get(path("/sessions/:id/worktrees"), safe(async (context) => json({ worktrees: await api.worktrees(sessionId(context)) })))
@@ -859,6 +898,8 @@ export function registerClientApiRoutes(app, api, options = {}) {
 	app.post(path("/sessions/:id/continue"), safe(async (context) => json(await api.continueRun(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
 	app.post(path("/sessions/:id/abort"), safe(async (context) => json(await api.abort(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
 	app.post(path("/sessions/:id/cancel-prompt"), safe(async (context) => json(await api.cancelPrompt(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
+	app.get(path("/sessions/:id/permissions/:toolCallId"), safe(async (context) => json(await api.permissionRequest(sessionId(context), permissionToolCallId(context)))))
+	app.post(path("/sessions/:id/permissions"), safe(async (context) => json(await api.resolvePermission(sessionId(context), await jsonBody(context), { snapshotOptions: routeSnapshotOptions() }))))
 	app.post(path("/sessions/:id/complete"), safe(async (context) => json(await api.markCompleted(sessionId(context), { cwd: cwdFilter(context) }))))
 	app.post(path("/sessions/:id/defer"), safe(async (context) => json(await api.markDeferred(sessionId(context), { cwd: cwdFilter(context) }))))
 	app.post(path("/sessions/:id/review"), safe(async (context) => json(await api.markReadyForReview(sessionId(context), { cwd: cwdFilter(context) }))))

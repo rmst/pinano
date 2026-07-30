@@ -1,6 +1,6 @@
 import { defineContract } from "./contract.js"
 
-export const WORKSPACE_CONTRACT_VERSION = 1
+export const WORKSPACE_CONTRACT_VERSION = 4
 export const WORKSPACE_CONTRACT_ROUTE = "/workspace/contract"
 export const WORKSPACE_FILES_ROUTE = "/workspace/files"
 export const WORKSPACE_DIRECTORY_RESOURCE = "workspace-directory"
@@ -11,6 +11,34 @@ const PROJECT_DISCOVERY_STATS_FIELDS = new Set(["visitedDirectories", "skippedDi
 
 function assertRecord(value, label = "value") {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new TypeError(`${label} must be an object`)
+}
+
+function assertProjectIdentityParams(value) {
+	assertRecord(value, "params")
+	assertString(value.cwd, "params.cwd")
+	assertOptionalString(value.id, "params.id")
+	if (value.replace !== undefined && typeof value.replace !== "boolean") throw new TypeError("params.replace must be a boolean")
+}
+
+function assertProjectIdentityResult(value) {
+	assertRecord(value, "result")
+	assertString(value.id, "result.id")
+	assertRecord(value.project, "result.project")
+	assertString(value.project.root, "result.project.root")
+	if (typeof value.changed !== "boolean") throw new TypeError("result.changed must be a boolean")
+}
+
+function assertProjectIdentityReadResult(value) {
+	assertRecord(value, "result")
+	assertOptionalString(value.id, "result.id")
+}
+
+function assertProjectRenameParams(value) {
+	assertRecord(value, "params")
+	assertString(value.root, "params.root")
+	assertRecord(value.input, "params.input")
+	assertString(value.input.path, "params.input.path")
+	assertString(value.input.name, "params.input.name")
 }
 
 function assertPreviewManifestResult(value) {
@@ -28,28 +56,43 @@ function assertPreviewManifestResult(value) {
 function assertPreviewDefinition(value, label) {
 	assertRecord(value, label)
 	assertString(value.name, `${label}.name`)
-	assertOptionalString(value.command, `${label}.command`)
+	if (value.kind !== "process" && value.kind !== "static") throw new TypeError(`${label}.kind must be process or static`)
 	assertOptionalString(value.description, `${label}.description`)
 	assertOptionalString(value.entryPath, `${label}.entryPath`)
 	assertOptionalString(value.healthPath, `${label}.healthPath`)
+	assertOptionalString(value.configPath, `${label}.configPath`)
+	assertOptionalString(value.projectDir, `${label}.projectDir`)
 	assertRecord(value.source, `${label}.source`)
 	assertString(value.source.kind, `${label}.source.kind`)
 	assertString(value.source.path, `${label}.source.path`)
 	assertOptionalString(value.source.configPath, `${label}.source.configPath`)
 	assertOptionalString(value.source.documentPath, `${label}.source.documentPath`)
-	if (value.source.kind === "preview-js") {
+	if (value.kind === "process") {
 		assertString(value.command, `${label}.command`)
+		assertString(value.cwd, `${label}.cwd`)
 		assertString(value.healthPath, `${label}.healthPath`)
+		if (value.source.kind !== "preview-json") throw new TypeError(`${label}.source.kind must be preview-json for process definitions`)
 		assertNonNegativeInteger(value.source.size, `${label}.source.size`)
 		assertNonNegativeInteger(value.source.mtimeMs, `${label}.source.mtimeMs`)
+		if (value.routeSourceMap !== undefined) {
+			if (!Array.isArray(value.routeSourceMap)) throw new TypeError(`${label}.routeSourceMap must be an array`)
+			for (const [index, mapping] of value.routeSourceMap.entries()) {
+				assertRecord(mapping, `${label}.routeSourceMap[${index}]`)
+				assertString(mapping.route, `${label}.routeSourceMap[${index}].route`)
+				assertString(mapping.source, `${label}.routeSourceMap[${index}].source`)
+			}
+		}
 	} else if (value.source.kind !== "static-directory") {
-		throw new TypeError(`${label}.source.kind is not supported`)
+		throw new TypeError(`${label}.source.kind must be static-directory for static definitions`)
 	}
 }
 
 function assertResolvedPreviewSourceResult(value) {
 	assertRecord(value, "result")
 	assertString(value.path, "result.path")
+	assertString(value.sourcePath, "result.sourcePath")
+	assertString(value.entryPath, "result.entryPath")
+	if (typeof value.configured !== "boolean") throw new TypeError("result.configured must be a boolean")
 	assertPreviewDefinition(value.definition, "result.definition")
 }
 
@@ -97,10 +140,28 @@ function assertProjectAddParams(value) {
 	for (const field of PROJECT_ADD_INPUT_FIELDS) assertOptionalString(value.input[field], `params.input.${field}`)
 }
 
+function assertProjectDeleteParams(value) {
+	assertRecord(value, "params")
+	assertString(value.root, "params.root")
+	assertRecord(value.input, "params.input")
+	assertString(value.input.path, "params.input.path")
+	assertString(value.input.confirmation, "params.input.confirmation")
+	if (value.input.validateOnly !== undefined && typeof value.input.validateOnly !== "boolean") {
+		throw new TypeError("params.input.validateOnly must be a boolean")
+	}
+}
+
 function assertProjectEntry(value, label) {
 	assertRecord(value, label)
 	for (const field of ["path", "relativePath", "label", "title", "directoryName"]) assertString(value[field], `${label}.${field}`)
 	for (const field of ["name", "remote", "lastCommitAt"]) assertOptionalString(value[field], `${label}.${field}`)
+}
+
+function assertProjectRenameResult(value) {
+	assertRecord(value, "result")
+	if (value.ok !== true) throw new TypeError("result.ok must be true")
+	for (const field of ["path", "previousPath", "relativePath", "previousRelativePath"]) assertString(value[field], `result.${field}`)
+	assertProjectEntry(value.project, "result.project")
 }
 
 function assertProjectDiscoveryResult(value) {
@@ -119,6 +180,13 @@ function assertProjectAddResult(value) {
 	if (value.ok !== true) throw new TypeError("result.ok must be true")
 	assertString(value.relativePath, "result.relativePath")
 	assertProjectEntry(value.project, "result.project")
+}
+
+function assertProjectDeleteResult(value) {
+	assertRecord(value, "result")
+	if (value.ok !== true) throw new TypeError("result.ok must be true")
+	assertString(value.path, "result.path")
+	assertString(value.relativePath, "result.relativePath")
 }
 
 function assertProjectDirParams(value) {
@@ -156,6 +224,14 @@ function assertWorktreeRecords(value) {
 function assertWorktreePathParams(value) {
 	assertRecord(value, "params")
 	assertString(value.path, "params.path")
+}
+
+function assertWorktreeLocationResult(value) {
+	if (value === null) return
+	assertRecord(value, "result")
+	assertString(value.checkoutRoot, "result.checkoutRoot")
+	assertString(value.repositoryRoot, "result.repositoryRoot")
+	if (typeof value.linked !== "boolean") throw new TypeError("result.linked must be a boolean")
 }
 
 function assertWorktreeStatusesParams(value) {
@@ -335,9 +411,13 @@ export const workspaceContract = defineContract({
 		"context.readProjectSkill": { params: assertProjectSkillPathParams, result: assertTextResult },
 		"project.info": { params: assertCwdParams, result: assertRecord },
 		"project.setName": { params: assertProjectNameParams, result: assertRecord },
+		"project.readIdentity": { params: assertCwdParams, result: assertProjectIdentityReadResult },
+		"project.ensureIdentity": { params: assertProjectIdentityParams, result: assertProjectIdentityResult },
 		"project.resolveRoot": { params: assertProjectRootParams, result: assertStringResult },
 		"project.discover": { params: assertProjectDiscoverParams, result: assertProjectDiscoveryResult },
 		"project.add": { params: assertProjectAddParams, result: assertProjectAddResult },
+		"project.rename": { params: assertProjectRenameParams, result: assertProjectRenameResult },
+		"project.delete": { params: assertProjectDeleteParams, result: assertProjectDeleteResult },
 		"preview.projectManifest": { params: assertProjectDirParams, result: assertPreviewManifestResult },
 		"preview.ensureProject": { params: assertProjectDirParams, result: assertPreviewManifestResult },
 		"preview.resolveSource": { params: assertPreviewSourceParams, result: assertResolvedPreviewSourceResult },
@@ -357,6 +437,7 @@ export const workspaceContract = defineContract({
 		"sourceControl.createCommit": { params: assertSourceControlParams, result: assertRecord },
 		"sourceControl.sync": { params: assertSourceControlParams, result: assertRecord },
 		"worktree.isLinked": { params: assertWorktreePathParams, result: assertBooleanResult },
+		"worktree.location": { params: assertWorktreePathParams, result: assertWorktreeLocationResult },
 		"worktree.statuses": { params: assertWorktreeStatusesParams, result: assertArrayResult },
 		"worktree.cleanup": { params: assertWorktreeCleanupParams, result: assertArrayResult },
 		"worktree.close": { params: assertWorktreeCloseParams, result: assertNullableRecord },

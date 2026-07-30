@@ -243,6 +243,14 @@ export function serverDbPath() {
 	return join(dataRoot(), "server.sqlite")
 }
 
+/**
+ * Content-free, periodically aggregated model API performance metrics.
+ * @returns {string}
+ */
+export function metricsDbPath() {
+	return join(dataRoot(), "metrics.sqlite")
+}
+
 /** @returns {string} */
 export function updateCheckStatePath() {
 	return join(dataRoot(), "update-check.json")

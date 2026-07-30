@@ -2,7 +2,12 @@ import { execFile } from "node:child_process"
 import { lstat, readFile, readlink, realpath, rm, stat } from "node:fs/promises"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { promisify } from "node:util"
-import { INITIAL_HEAD_CONFIG, LEGACY_INITIAL_HEAD_CONFIG } from "./worktree-events.js"
+import {
+	INITIAL_HEAD_CONFIG,
+	INTEGRATION_TARGET_CONFIG,
+	LEGACY_INITIAL_HEAD_CONFIG,
+	LEGACY_INTEGRATION_TARGET_CONFIG,
+} from "./worktree-events.js"
 
 const execFileAsync = promisify(execFile)
 
@@ -136,6 +141,32 @@ function cleanCommitAction(action) {
 	const value = typeof action === "string" && action ? action : "commit"
 	if (!COMMIT_ACTIONS.has(value)) throw Object.assign(new Error("valid commit action is required"), { status: 400 })
 	return value
+}
+
+async function gitConfigValue(root, key) {
+	try {
+		return (await git(["config", "--get", key], root)).trim()
+	} catch (err) {
+		if (err?.code === 1) return ""
+		throw err
+	}
+}
+
+async function requireGitIdentity(root) {
+	const [name, email] = await Promise.all([
+		gitConfigValue(root, "user.name"),
+		gitConfigValue(root, "user.email"),
+	])
+	const missing = [
+		...(!name ? ["user.name"] : []),
+		...(!email ? ["user.email"] : []),
+	]
+	if (!missing.length) return
+	const fields = missing.length === 2 ? `${missing[0]} and ${missing[1]}` : missing[0]
+	throw Object.assign(new Error(`Git identity is incomplete: ${fields} ${missing.length === 1 ? "is" : "are"} not configured. Ask the agent to set up your Git name and email, then try again.`), {
+		status: 409,
+		code: "gitIdentityMissing",
+	})
 }
 
 function gitCommandErrorMessage(err) {
@@ -487,16 +518,41 @@ async function resolvedCommit(root, hash, source = "manual") {
 	return { commit, shortHash, source }
 }
 
-async function repoWorktreeBase(root, branch) {
-	if (!branch) return undefined
-	const initialHead = await git(["config", "--get", `branch.${branch}.${INITIAL_HEAD_CONFIG}`], root)
+async function branchConfig(root, branch, key, legacyKey) {
+	if (!branch) return ""
+	return await git(["config", "--get", `branch.${branch}.${key}`], root)
 		.then((out) => out.trim())
 		.catch(() => "")
-		|| await git(["config", "--get", `branch.${branch}.${LEGACY_INITIAL_HEAD_CONFIG}`], root)
+		|| await git(["config", "--get", `branch.${branch}.${legacyKey}`], root)
 			.then((out) => out.trim())
 			.catch(() => "")
-	if (!initialHead) return undefined
-	return resolvedCommit(root, initialHead, "worktree").catch(() => undefined)
+}
+
+async function repoIntegrationTargetMergeBase(root, integrationTarget) {
+	if (!integrationTarget) return ""
+	const target = await git(["show-ref", "--verify", "--hash", `refs/heads/${integrationTarget}`], root)
+		.then((out) => out.trim())
+		.catch(() => "")
+	if (!target) return ""
+	return git(["merge-base", "HEAD", target], root)
+		.then((out) => out.trim())
+		.catch(() => "")
+}
+
+async function repoWorktreeBase(root, branch) {
+	if (!branch) return undefined
+	const [integrationTarget, initialHead] = await Promise.all([
+		branchConfig(root, branch, INTEGRATION_TARGET_CONFIG, LEGACY_INTEGRATION_TARGET_CONFIG),
+		branchConfig(root, branch, INITIAL_HEAD_CONFIG, LEGACY_INITIAL_HEAD_CONFIG),
+	])
+	const mergeBase = await repoIntegrationTargetMergeBase(root, integrationTarget)
+	if (mergeBase) {
+		const resolved = await resolvedCommit(root, mergeBase, "worktree").catch(() => undefined)
+		if (resolved) return resolved
+	}
+	return initialHead
+		? resolvedCommit(root, initialHead, "worktree").catch(() => undefined)
+		: undefined
 }
 
 async function repoComparison(root, options = {}, branchInfo = undefined) {
@@ -834,6 +890,7 @@ export async function sourceControlCreateCommit({ message, action: requestedActi
 		throw Object.assign(new Error("there are no staged changes to commit"), { status: 409 })
 	}
 
+	await requireGitIdentity(repo.root)
 	await git(["commit", ...(action === "amend" ? ["--amend"] : []), "--quiet", "--message", cleanMessage], repo.root)
 	const remoteAction = action === "commit-and-sync" ? "sync" : action === "commit-and-push" ? "push" : ""
 	const remoteFailure = remoteAction ? await runRemoteOperation(repo.root, remoteAction) : null

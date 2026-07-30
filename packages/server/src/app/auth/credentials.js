@@ -1,8 +1,9 @@
 // Multi-provider auth storage.
 //
-// One file per provider under $CEREX_HOME/auth/<provider>.json. Each file is
-// a small JSON document — shape is provider-defined but the registry below
-// captures the common ones we use.
+// One file per provider. Providers use the current Cerex home's private auth
+// directory unless deployment-owned configuration explicitly routes them to
+// another store. Each file is a small JSON document — shape is provider-defined
+// but the registry below captures the common ones we use.
 //
 // We deliberately keep the surface tiny: API-key credentials plus Codex
 // (ChatGPT subscription) OAuth. Adding a provider is a matter of adding a new
@@ -10,13 +11,65 @@
 
 import { readFileSync, rmSync } from "node:fs"
 import { chmod, mkdir, open, readFile, rename, rm, stat, writeFile, readdir } from "node:fs/promises"
-import { dirname, resolve } from "node:path"
+import { dirname, isAbsolute, resolve } from "node:path"
 
+import { readProductEnv } from "../../../../protocol/src/product.js"
 import { configuredProviderApiKey } from "../service/config.js"
-import { authDir, authFilePath } from "../paths.js"
+import { authDir } from "../paths.js"
+import { CredentialStoreRouter, credentialStoreRouterFromConfig } from "./credential-store-router.js"
 
 const LOCK_TTL_MS = 30_000
 const LOCK_RETRY_DELAY_MS = 50
+
+/** @type {CredentialStoreRouter} */
+let credentialStores = new CredentialStoreRouter(authDir)
+
+/** @param {unknown} config */
+export function configureCredentialStores(config = {}) {
+	credentialStores = credentialStoreRouterFromConfig(authDir, config)
+}
+
+/** @param {Record<string, string | undefined>} [env] */
+export function configureCredentialStoresFromEnvironment(env = process.env) {
+	const configPath = readProductEnv(env, "CREDENTIAL_STORES_FILE")
+	if (!configPath) {
+		configureCredentialStores()
+		return
+	}
+	if (!isAbsolute(configPath)) throw new Error("CEREX_CREDENTIAL_STORES_FILE must be an absolute path")
+	let config
+	try {
+		config = JSON.parse(readFileSync(configPath, "utf-8"))
+	} catch (err) {
+		throw new Error(`Could not load credential stores configuration from ${configPath}`, { cause: err })
+	}
+	configureCredentialStores(config)
+}
+
+/** @param {string} provider */
+export function credentialFilePath(provider) {
+	return credentialStores.filePath(provider)
+}
+
+/** @param {string} provider */
+export function credentialIsManaged(provider) {
+	return credentialStores.isManaged(provider)
+}
+
+/** @param {string} provider */
+function managedCredentialError(provider) {
+	const error = /** @type {Error & { code: string }} */ (new Error(`Credential for ${provider} is managed by this Cerex deployment`))
+	error.code = "CEREX_CREDENTIAL_MANAGED"
+	return error
+}
+
+/**
+ * @param {string} provider
+ * @param {boolean} allowManaged
+ */
+function assertCredentialMutationAllowed(provider, allowManaged) {
+	if (credentialIsManaged(provider) && !allowManaged) throw managedCredentialError(provider)
+}
 
 /**
  * @param {string} path
@@ -106,6 +159,7 @@ export const API_KEY_PROVIDER_INFOS = /** @type {const} */ ([
  * @property {string} path
  * @property {string} username
  * @property {string} token
+ * @property {boolean} [agentAccess]
  * @property {number} createdAt
  * @property {number} updatedAt
  */
@@ -115,6 +169,7 @@ export const API_KEY_PROVIDER_INFOS = /** @type {const} */ ([
  * @typedef {object} GitCredential
  * @property {"git"} kind
  * @property {Record<string, GitTokenCredentialEntry>} entries
+ * @property {boolean} [githubAgentAccess] Legacy global GitHub-agent permission, migrated to per-entry `agentAccess` when the store is updated.
  * @property {number} createdAt
  * @property {number} updatedAt
  */
@@ -221,7 +276,7 @@ async function releaseLock(lockPath, token) {
  */
 export async function getCredential(provider) {
 	try {
-		const text = await readFile(authFilePath(provider), "utf-8")
+		const text = await readFile(credentialFilePath(provider), "utf-8")
 		return /** @type {T} */ (JSON.parse(text))
 	} catch (/** @type {any} */ err) {
 		if (err.code === "ENOENT") return undefined
@@ -236,7 +291,8 @@ export async function getCredential(provider) {
  * @returns {Promise<void>}
  */
 export async function setCredential(provider, value, options = {}) {
-	const path = resolve(authFilePath(provider))
+	assertCredentialMutationAllowed(provider, false)
+	const path = resolve(credentialFilePath(provider))
 	const lockPath = `${path}.lock`
 	await ensureCredentialDir(path)
 	const token = await acquireLock(lockPath, options)
@@ -253,10 +309,12 @@ export async function setCredential(provider, value, options = {}) {
  * @param {string} provider
  * @param {(current: T | undefined) => Promise<T> | T} fn
  * @param {{ waitMs?: number, staleMs?: number }} [options]
+ * @param {boolean} allowManaged
  * @returns {Promise<T>}
  */
-export async function updateCredential(provider, fn, options = {}) {
-	const path = resolve(authFilePath(provider))
+async function updateCredentialValue(provider, fn, options, allowManaged) {
+	assertCredentialMutationAllowed(provider, allowManaged)
+	const path = resolve(credentialFilePath(provider))
 	const lockPath = `${path}.lock`
 	await ensureCredentialDir(path)
 	const token = await acquireLock(lockPath, options)
@@ -278,25 +336,72 @@ export async function updateCredential(provider, fn, options = {}) {
 }
 
 /**
+ * @template {Credential} T
  * @param {string} provider
- * @returns {Promise<void>}
+ * @param {(current: T | undefined) => Promise<T> | T} fn
+ * @param {{ waitMs?: number, staleMs?: number }} [options]
+ * @returns {Promise<T>}
  */
-export async function deleteCredential(provider) {
-	await rm(authFilePath(provider), { force: true })
+export async function updateCredential(provider, fn, options = {}) {
+	return await updateCredentialValue(provider, fn, options, false)
 }
 
-/** @returns {Promise<string[]>} */
-export async function listProviders() {
+/**
+ * Update a credential as part of its runtime lifecycle. Unlike user-managed
+ * changes, this permits token rotation in a deployment-managed store.
+ *
+ * @template {Credential} T
+ * @param {string} provider
+ * @param {(current: T | undefined) => Promise<T> | T} fn
+ * @param {{ waitMs?: number, staleMs?: number }} [options]
+ * @returns {Promise<T>}
+ */
+export async function refreshCredential(provider, fn, options = {}) {
+	return await updateCredentialValue(provider, fn, options, true)
+}
+
+/**
+ * @param {string} provider
+ * @param {{ waitMs?: number, staleMs?: number }} [options]
+ * @returns {Promise<void>}
+ */
+export async function deleteCredential(provider, options = {}) {
+	assertCredentialMutationAllowed(provider, false)
+	const path = resolve(credentialFilePath(provider))
+	const lockPath = `${path}.lock`
+	await ensureCredentialDir(path)
+	const token = await acquireLock(lockPath, options)
 	try {
-		const entries = await readdir(authDir())
+		await assertLockOwned(lockPath, token)
+		await rm(path, { force: true })
+	} finally {
+		await releaseLock(lockPath, token)
+	}
+}
+
+/** @param {string} directory */
+async function listProvidersInDirectory(directory) {
+	try {
+		const entries = await readdir(directory)
 		return entries
 			.filter((n) => n.endsWith(".json") && !n.endsWith(".lock"))
 			.map((n) => n.replace(/\.json$/, ""))
-			.sort()
+			.filter((provider) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(provider))
 	} catch (/** @type {any} */ err) {
 		if (err.code === "ENOENT") return []
 		throw err
 	}
+}
+
+/** @returns {Promise<string[]>} */
+export async function listProviders() {
+	const configuredRoutes = credentialStores.configuredRoutes()
+	const configuredProviders = new Set(configuredRoutes.map((route) => route.provider))
+	const providers = new Set((await listProvidersInDirectory(authDir())).filter((provider) => !configuredProviders.has(provider)))
+	for (const route of configuredRoutes) {
+		if (await getCredential(route.provider)) providers.add(route.provider)
+	}
+	return [...providers].sort()
 }
 
 /**

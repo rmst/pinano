@@ -6,7 +6,7 @@ import { initialSessionEnvironment, loadEnvironmentRegistry, resolveConfiguredEn
 import { environmentContainerHomePath as defaultEnvironmentContainerHomePath, environmentHomePath as defaultEnvironmentHomePath, managedContainerHomePath, optionalProductHomePath, optionalRuntimeSourceReferencePath } from "../paths.js"
 import { previewInstructions } from "../model/instructions/previews.js"
 import { assertReadOnlyMountsNotCoveredByWritable, effectiveSandboxMounts, mountedPathForHostPath } from "../sandbox/paths.js"
-import { sandboxWithSessionMounts } from "../session/config.js"
+import { sandboxMountsForRuntime, sandboxWithSessionMounts } from "../session/config.js"
 import { addImplicitStateMounts, addManagedContainerHomeMount, normalizeStateMount, stateMountEnabled } from "../workers/tool/state-mounts.js"
 
 function xmlText(value) {
@@ -89,7 +89,7 @@ function shouldUseManagedContainerIsolatedHome(environment) {
 }
 
 function effectiveMountsForContext(environment, initialCwd, runtimeSourceReferencePath, sessionWorkspacePath, stateDirPath, stateMount, sessionSandboxMounts = [], environmentContainerHomePath = defaultEnvironmentContainerHomePath) {
-	const sandbox = sandboxWithSessionMounts(environment?.sandbox, sessionSandboxMounts)
+	const sandbox = sandboxWithSessionMounts(environment?.sandbox, sessionSandboxMounts, initialCwd)
 	try {
 		let mounts = effectiveSandboxMounts({
 			sessionWd: initialCwd,
@@ -327,6 +327,7 @@ function sessionPreviewLines(previewPublicUrl) {
  * @param {string | undefined} [options.previewPublicUrl]
  * @param {unknown} [options.stateMount]
  * @param {any[]} [options.sandboxMounts]
+ * @param {boolean} [options.mountCurrentCwd]
  * @param {(environmentId: string) => string} [options.environmentHomePath]
  * @param {(environmentId: string) => string} [options.environmentContainerHomePath]
  */
@@ -350,6 +351,9 @@ export function environmentContextFor(options = {}) {
 	const environmentContainerHomePath = options.environmentContainerHomePath ?? defaultEnvironmentContainerHomePath
 	const environments = Object.values(registry.environments ?? {}).sort((a, b) => a.id.localeCompare(b.id))
 	const currentEnvironment = environments.find((environment) => environment.id === currentId)
+	const sandboxMountsForEnvironment = (environment) => options.mountCurrentCwd === true && environment.target?.type === "local"
+		? sandboxMountsForRuntime(sessionSandboxMounts, options.cwd)
+		: sessionSandboxMounts
 	const lines = [
 		"<environment_context>",
 		"Cerex tool calls run in one selected environment; this affects shell commands, filesystem access, and cwd.",
@@ -359,7 +363,7 @@ export function environmentContextFor(options = {}) {
 		"Switch environments or cwd with `cerex session set cwd <path>` or `cerex session set environment <id>`.",
 		...sessionWorkspaceLines(currentEnvironment, initialCwd, runtimeSourceReferencePath, sessionWorkspacePath, stateDirPath, stateMount, sessionSandboxMounts, sessionId, environmentContainerHomePath),
 		...sessionPreviewLines(previewPublicUrl),
-		...environments.flatMap((environment) => environmentBody(environment, initialCwd, platform, arch, environmentHomePath, environmentContainerHomePath, hostUserHome, runtimeSourceReferencePath, sessionWorkspacePath, stateDirPath, stateMount, sessionSandboxMounts)),
+		...environments.flatMap((environment) => environmentBody(environment, initialCwd, platform, arch, environmentHomePath, environmentContainerHomePath, hostUserHome, runtimeSourceReferencePath, sessionWorkspacePath, stateDirPath, stateMount, sandboxMountsForEnvironment(environment))),
 		"</environment_context>",
 	].filter(Boolean)
 	return lines.join("\n")

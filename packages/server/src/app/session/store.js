@@ -1,10 +1,10 @@
-// App-level session integration. SQLite is the canonical transcript/tree and
-// metadata store.
+// App-level session integration. The service uses the async persistence contract; standalone helpers retain the synchronous SQLite adapter.
 
 import { randomUUID } from "node:crypto"
 import { lstat } from "node:fs/promises"
 
-import { Session, SqliteSessionStorage } from "../../session-manager/index.js"
+import { PersistenceSessionStorage, Session, SqliteSessionStorage } from "../../session-manager/index.js"
+import { loadTranscriptMessages } from "../../session-manager/storage-sqlite.js"
 import { serverDbPath, sessionWorkspacePath } from "../paths.js"
 import { isProjectContextMessage } from "../project/context.js"
 import { openServerDb } from "../database/index.js"
@@ -14,32 +14,52 @@ import { sessionWorkspaceDirName } from "./workspace-names.js"
 
 /** @typedef {import("../../session-manager/types.js").SessionEntry} SessionEntry */
 /** @typedef {import("../database/index.js").ServerDb} ServerDb */
+/** @typedef {import("../../persistence/server-contract.js").ServerPersistence} ServerPersistence */
+/** @typedef {ServerDb | ServerPersistence} ServerPersistenceHandle */
 /** @typedef {{ enabled?: boolean, span?: (name: string, args?: Record<string, any>) => (extraArgs?: Record<string, any>) => void }} StorageDiagnostics */
 
 /** @type {{ path: string, db: ServerDb } | undefined} */
 let metadataDb
+let metadataDbPromise
+let metadataDbPromisePath
 
 /** @returns {Promise<ServerDb>} */
 async function getMetadataDb() {
 	const path = serverDbPath()
-	if (!metadataDb || metadataDb.path !== path) {
-		try { metadataDb?.db.close() } catch {}
-		const db = openServerDb()
+	if (metadataDb?.path === path) return metadataDb.db
+	if (metadataDbPromise && metadataDbPromisePath === path) return metadataDbPromise
+	const previous = metadataDbPromise?.catch(() => undefined)
+	const opening = (async () => {
+		await previous
+		if (metadataDb?.path === path) return metadataDb.db
+		try { await metadataDb?.db.close() } catch {}
+		metadataDb = undefined
+		const db = openServerDb({ path })
 		try {
-			assertNoSessionWorkspaceNameCollisions(db)
+			await assertNoSessionWorkspaceNameCollisions(db)
 		} catch (err) {
-			db.close()
+			await db.close()
 			throw err
 		}
 		metadataDb = { path, db }
+		return db
+	})()
+	metadataDbPromise = opening
+	metadataDbPromisePath = path
+	try {
+		return await opening
+	} finally {
+		if (metadataDbPromise === opening) {
+			metadataDbPromise = undefined
+			metadataDbPromisePath = undefined
+		}
 	}
-	return metadataDb.db
 }
 
-/** @param {ServerDb} db */
-export function assertNoSessionWorkspaceNameCollisions(db) {
+/** @param {ServerPersistenceHandle} db */
+export async function assertNoSessionWorkspaceNameCollisions(db) {
 	const byWorkspaceName = new Map()
-	for (const session of db.listSessionStatuses({ includeHidden: true })) {
+	for (const session of await db.listSessionStatuses({ includeHidden: true })) {
 		const workspaceName = sessionWorkspaceDirName(session.id)
 		const existing = byWorkspaceName.get(workspaceName)
 		if (existing && existing !== session.id) {
@@ -49,10 +69,10 @@ export function assertNoSessionWorkspaceNameCollisions(db) {
 	}
 }
 
-/** @param {ServerDb} db @param {string} id */
-function sessionWorkspaceNameUsedByActiveSession(db, id) {
+/** @param {ServerPersistenceHandle} db @param {string} id */
+async function sessionWorkspaceNameUsedByActiveSession(db, id) {
 	const workspaceName = sessionWorkspaceDirName(id)
-	return db.listSessionStatuses({ includeHidden: true }).some((session) => session.id !== id && sessionWorkspaceDirName(session.id) === workspaceName)
+	return (await db.listSessionStatuses({ includeHidden: true })).some((session) => session.id !== id && sessionWorkspaceDirName(session.id) === workspaceName)
 }
 
 /** @param {string} path */
@@ -66,13 +86,13 @@ async function pathExists(path) {
 	}
 }
 
-/** @param {ServerDb} db @param {string} id */
+/** @param {ServerPersistenceHandle} db @param {string} id */
 async function sessionWorkspaceNameAvailable(db, id) {
-	if (sessionWorkspaceNameUsedByActiveSession(db, id)) return false
+	if (await sessionWorkspaceNameUsedByActiveSession(db, id)) return false
 	return !await pathExists(sessionWorkspacePath(id))
 }
 
-/** @param {ServerDb} db */
+/** @param {ServerPersistenceHandle} db */
 async function generateSessionId(db) {
 	for (let i = 0; i < 200; i++) {
 		const id = randomUUID()
@@ -86,7 +106,7 @@ export async function createSessionId() {
 	return createSessionIdInDb(await getMetadataDb())
 }
 
-/** @param {ServerDb} db @returns {Promise<string>} */
+/** @param {ServerPersistenceHandle} db @returns {Promise<string>} */
 export async function createSessionIdInDb(db) {
 	return generateSessionId(db)
 }
@@ -168,16 +188,16 @@ export function sessionPreviewFromMessages(messages) {
  * @returns {Promise<SessionPreview>}
  */
 export async function loadSessionPreview(id) {
-	return loadSessionPreviewInDb(await getMetadataDb(), id)
+	return await loadSessionPreviewInDb(await getMetadataDb(), id)
 }
 
 /**
- * @param {ServerDb} db
+ * @param {ServerPersistenceHandle} db
  * @param {string} id
- * @returns {SessionPreview}
+ * @returns {Promise<SessionPreview>}
  */
-export function loadSessionPreviewInDb(db, id) {
-	return sessionPreviewFromMessages(db.loadSessionPreviewMessages(id))
+export async function loadSessionPreviewInDb(db, id) {
+	return sessionPreviewFromMessages(await db.loadSessionPreviewMessages(id))
 }
 
 /**
@@ -185,18 +205,18 @@ export function loadSessionPreviewInDb(db, id) {
  * @returns {Promise<Map<string, SessionPreview>>}
  */
 export async function loadSessionPreviews(ids) {
-	return loadSessionPreviewsInDb(await getMetadataDb(), ids)
+	return await loadSessionPreviewsInDb(await getMetadataDb(), ids)
 }
 
 /**
- * @param {ServerDb} db
+ * @param {ServerPersistenceHandle} db
  * @param {string[]} ids
- * @returns {Map<string, SessionPreview>}
+ * @returns {Promise<Map<string, SessionPreview>>}
  */
-export function loadSessionPreviewsInDb(db, ids) {
+export async function loadSessionPreviewsInDb(db, ids) {
 	/** @type {Map<string, Array<{ previewKind: "first" | "lastUser", timestamp: string, role: string, content: string | any[] }>>} */
 	const messagesBySessionId = new Map()
-	for (const row of db.loadSessionPreviewMessagesForSessions(ids)) {
+	for (const row of await db.loadSessionPreviewMessagesForSessions(ids)) {
 		const messages = messagesBySessionId.get(row.sessionId) ?? []
 		messages.push(row)
 		messagesBySessionId.set(row.sessionId, messages)
@@ -204,12 +224,18 @@ export function loadSessionPreviewsInDb(db, ids) {
 	return new Map(ids.map((id) => [id, sessionPreviewFromMessages(messagesBySessionId.get(id) ?? [])]))
 }
 
+/** Load selected transcript payloads through either the async persistence contract or the standalone synchronous SQLite adapter. */
+export async function loadTranscriptMessagesInDb(db, sessionId, entryIds) {
+	if (db.raw) return loadTranscriptMessages(db.raw, sessionId, entryIds)
+	return await db.loadTranscriptMessages(sessionId, entryIds)
+}
+
 /** List sessions, newest first. Optionally filter to a cwd.
  * @param {string} [filterCwd]
  * @returns {Promise<SessionListEntry[]>} */
 export async function listSessions(filterCwd) {
 	const db = await getMetadataDb()
-	return db.listSessionStatuses()
+	return (await db.listSessionStatuses())
 		.filter((entry) => !filterCwd || entry.cwd === filterCwd)
 		.map((entry) => ({
 			id: entry.id,
@@ -227,23 +253,25 @@ export async function createSession(cwd) {
 }
 
 /**
- * Create a session against an already-owned ServerDb handle.
- * @param {ServerDb} db
+ * Create a session against an already-owned persistence handle.
+ * @param {ServerPersistenceHandle} db
  * @param {string} cwd
  * @param {{ diagnostics?: StorageDiagnostics }} [context]
  * @returns {Promise<{ session: Session, id: string }>}
  */
 export async function createSessionInDb(db, cwd, context = {}) {
 	const id = await generateSessionId(db)
-	const storage = SqliteSessionStorage.create(db.raw, { cwd, sessionId: id, diagnostics: context.diagnostics })
+	const storage = db.raw
+		? SqliteSessionStorage.create(db.raw, { cwd, sessionId: id, diagnostics: context.diagnostics })
+		: new PersistenceSessionStorage(db, await db.createSessionStorage({ cwd, sessionId: id }))
 	await ensureSessionWorkspace(id)
 	return { session: new Session(storage), id }
 }
 
 /**
  * Create a new session that shares the source session's active branch prefix.
- * Conversation entries are immutable global DAG nodes, so this records new
- * session membership refs without duplicating message payload rows.
+ * Conversation payloads are immutable global rows, so this copies only the
+ * compact session-local branch rows without duplicating heavyweight payloads.
  * @param {string} sourceId
  * @param {{ cwd?: string, sessionId?: string, sourceEntryId?: string | null }} [options]
  * @returns {Promise<{ session: Session, id: string, sourceId: string }>}
@@ -253,8 +281,8 @@ export async function branchSession(sourceId, options = {}) {
 }
 
 /**
- * Create a branch against an already-owned ServerDb handle.
- * @param {ServerDb} db
+ * Create a branch against an already-owned persistence handle.
+ * @param {ServerPersistenceHandle} db
  * @param {string} sourceId
  * @param {{ cwd?: string, sessionId?: string, sourceEntryId?: string | null }} [options]
  * @param {{ diagnostics?: StorageDiagnostics }} [context]
@@ -262,12 +290,14 @@ export async function branchSession(sourceId, options = {}) {
  */
 export async function branchSessionInDb(db, sourceId, options = {}, context = {}) {
 	const id = options.sessionId ?? await generateSessionId(db)
-	const storage = SqliteSessionStorage.branchFrom(db.raw, sourceId, {
+	const storageOptions = {
 		sessionId: id,
 		cwd: options.cwd,
 		...(Object.prototype.hasOwnProperty.call(options, "sourceEntryId") ? { sourceEntryId: options.sourceEntryId } : {}),
-		diagnostics: context.diagnostics,
-	})
+	}
+	const storage = db.raw
+		? SqliteSessionStorage.branchFrom(db.raw, sourceId, { ...storageOptions, diagnostics: context.diagnostics })
+		: new PersistenceSessionStorage(db, await db.branchSessionStorage(sourceId, storageOptions))
 	await ensureSessionWorkspace(id)
 	const session = new Session(storage)
 	return { session, id, sourceId }
@@ -279,9 +309,9 @@ export async function branchSessionInDb(db, sourceId, options = {}, context = {}
  */
 export async function openSession(id) {
 	const db = await getMetadataDb()
-	const opened = openSessionInDb(db, id)
+	const opened = await openSessionInDb(db, id)
 	const meta = opened.session.getMetadata()
-	db.upsertSession({
+	await db.upsertSession({
 		id,
 		cwd: meta.cwd,
 		createdAt: meta.createdAt,
@@ -291,17 +321,25 @@ export async function openSession(id) {
 }
 
 /**
- * Open a session against an already-owned ServerDb handle. This intentionally
+ * Open a session against an already-owned persistence handle. This intentionally
  * does not touch the session row; callers that own the boundary should decide
  * whether a metadata refresh is needed.
- * @param {ServerDb} db
+ * @param {ServerPersistenceHandle} db
  * @param {string} id
  * @param {{ diagnostics?: StorageDiagnostics }} [context]
- * @returns {{ session: Session, id: string }}
+ * @returns {{ session: Session, id: string } | Promise<{ session: Session, id: string }>}
  */
 export function openSessionInDb(db, id, context = {}) {
-	const storage = SqliteSessionStorage.open(db.raw, id, { diagnostics: context.diagnostics })
-	return { session: new Session(storage), id }
+	if (db.raw) return { session: new Session(SqliteSessionStorage.open(db.raw, id, { diagnostics: context.diagnostics })), id }
+	return db.openSessionStorage(id)
+		.then((snapshot) => ({ session: new Session(new PersistenceSessionStorage(db, snapshot)), id }))
+}
+
+/** Open only the canonical compact session rows used for transcript-first reads. */
+export function openSessionManifestInDb(db, id, context = {}) {
+	if (db.raw) return { session: new Session(SqliteSessionStorage.openManifest(db.raw, id, { diagnostics: context.diagnostics })), id }
+	return db.openSessionManifestStorage(id)
+		.then((snapshot) => ({ session: new Session(new PersistenceSessionStorage(db, snapshot)), id }))
 }
 
 /** Refresh updatedAt from the latest persisted user/assistant message.
@@ -309,8 +347,8 @@ export function openSessionInDb(db, id, context = {}) {
  * @returns {Promise<void>} */
 export async function touchSession(id) {
 	const db = await getMetadataDb()
-	const { session } = openSessionInDb(db, id)
-	db.touchSession(id, undefined, sessionActivityAt(session))
+	const { session } = await openSessionInDb(db, id)
+	await db.touchSession(id, undefined, sessionActivityAt(session))
 }
 
 /**
@@ -333,7 +371,7 @@ export function sessionIsEmpty(session) {
  * @returns {Promise<void>} */
 export async function deleteSession(id) {
 	const db = await getMetadataDb()
-	db.markSessionDeleted(id)
+	await db.markSessionDeleted(id)
 }
 
 /**
@@ -346,14 +384,14 @@ export async function restoreSession(id) {
 }
 
 /**
- * Restore a soft-deleted session against an already-owned ServerDb handle.
- * @param {ServerDb} db
+ * Restore a soft-deleted session against an already-owned persistence handle.
+ * @param {ServerPersistenceHandle} db
  * @param {string} id
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
-export function restoreSessionInDb(db, id) {
-	if (sessionWorkspaceNameUsedByActiveSession(db, id)) {
+export async function restoreSessionInDb(db, id) {
+	if (await sessionWorkspaceNameUsedByActiveSession(db, id)) {
 		throw new Error(`Cannot restore Cerex session ${id}: active session already maps to workspace dir ${sessionWorkspaceDirName(id)}`)
 	}
-	return db.restoreSession(id)
+	return await db.restoreSession(id)
 }

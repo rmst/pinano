@@ -13,6 +13,10 @@ import { CliError, commandResult, gitOutput, postInternalEvent, run } from "./wo
 
 const VERSION = "cerex-worktree-add 0.1"
 
+function shellQuote(value) {
+	return `'${String(value).replaceAll("'", "'\\''")}'`
+}
+
 function usage() {
 	return `${VERSION}
 
@@ -284,6 +288,7 @@ export async function runManagedWorktreeAdd(config, options = {}) {
 	process.stdout.write(`integration target ${integrationTarget}\n`)
 	if (copy.copied > 0) process.stdout.write(`copied ${copy.copied} ignored ${copy.copied === 1 ? "entry" : "entries"}\n`)
 	if (submodules) process.stdout.write("initialized submodules\n")
+	process.stdout.write(`\nTo work in this worktree, first run:\ncerex session set cwd ${shellQuote(worktreePath)}\n`)
 	return { path: worktreePath, branch, integrationTarget, copied: copy.copied, submodules }
 }
 

@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path"
+import { applyProjectLocationToProperties, projectLocationChangeFromEntry } from "../../session-manager/project-location-entry.js"
 
 import { sessionInitialWd } from "./config.js"
 
@@ -14,6 +15,8 @@ export const SESSION_PROPERTY_STATES = [SESSION_DISCUSSING_STATE, SESSION_READY_
 export const SESSION_WORKTREE_MAINTENANCE_STATES = [SESSION_NEEDS_INPUT_STATE, SESSION_READY_FOR_REVIEW_STATE]
 const SESSION_PROPERTY_KEYS = ["state", "descriptionInUi", "projectTag", "projectDir", "cwd", "environmentId"]
 const SESSION_PROPERTY_KEY_SET = new Set(SESSION_PROPERTY_KEYS)
+
+// projectDir identifies the canonical project root and follows an actual project-folder move. A linked Git worktree is another checkout of that project, so it may be cwd but must never become projectDir. cwd is explicit event-sourced session state; Cerex changes it only at session creation or through an explicit session property event (including replay/rewind), never as a repair for a moved or missing path.
 
 /** @param {unknown} value @param {string} field @param {number} max */
 function cleanNullableText(value, field, max) {
@@ -137,6 +140,7 @@ export function getEffectiveSessionProperties(session, fromId = undefined) {
 			props = applySessionPropertyPatch(props, patch, entry.data?.updatedAt ?? entry.timestamp)
 			sawPropertyEntry = true
 		}
+		props = applyProjectLocationToProperties(props, projectLocationChangeFromEntry(entry))
 	}
 	return props
 }

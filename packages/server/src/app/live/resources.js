@@ -27,21 +27,25 @@ function appLiveScope(params) {
 
 async function appLiveSnapshot(api, params) {
 	if (params.worktreeStatusOnly === true) return { type: "worktree_status_snapshot" }
-	const sessionId = typeof params.sessionId === "string" && params.sessionId ? params.sessionId : undefined
-	if (sessionId) {
-		const { cwd, contextCwd, includeDeleted, includeHidden, activeSessionId, excludeSessions, excludeWorktreeStatus, worktreeStatusOnly, sessionId: ignoredSessionId, ...snapshotOptions } = params
+	if (params.readySnapshotOnly === true) return { type: "app_ready" }
+	const requestedSessionId = typeof params.sessionId === "string" && params.sessionId ? params.sessionId : undefined
+	const activeSessionId = typeof params.activeSessionId === "string" && params.activeSessionId ? params.activeSessionId : undefined
+	const snapshotSessionId = requestedSessionId ?? activeSessionId
+	if (snapshotSessionId) {
+		const { cwd, contextCwd, includeDeleted, includeHidden, activeSessionId: ignoredActiveSessionId, excludeSessions, excludeWorktreeStatus, readySnapshotOnly, worktreeStatusOnly, sessionId: ignoredSessionId, ...snapshotOptions } = params
 		void cwd
 		void contextCwd
 		void includeDeleted
 		void includeHidden
-		void activeSessionId
+		void ignoredActiveSessionId
 		void excludeSessions
 		void excludeWorktreeStatus
+		void readySnapshotOnly
 		void worktreeStatusOnly
 		void ignoredSessionId
-		const snapshot = await api.snapshot(sessionId, snapshotOptions)
-		if (snapshot.sessionId && snapshot.sessionId !== sessionId) throw new Error(`Session snapshot id mismatch: expected ${sessionId}, got ${snapshot.sessionId}`)
-		return { type: "snapshot", sessionId, snapshot }
+		const snapshot = await api.snapshot(snapshotSessionId, snapshotOptions)
+		if (snapshot.sessionId && snapshot.sessionId !== snapshotSessionId) throw new Error(`Session snapshot id mismatch: expected ${snapshotSessionId}, got ${snapshot.sessionId}`)
+		return { type: "snapshot", sessionId: snapshotSessionId, snapshot }
 	}
 	if (params.excludeSessions === true) return { type: "app_ready" }
 	const [sessions, project] = await Promise.all([
@@ -105,9 +109,7 @@ function defaultKey(params) {
 	return JSON.stringify(canonicalJsonValue(params))
 }
 
-/**
- * Share one demand-driven event subscription for each normalized key while retaining bounded replay history and taking a race-free snapshot for new subscribers.
- */
+/** Share one demand-driven event subscription for each normalized key while retaining bounded replay history and taking a race-free snapshot for new subscribers. A source descriptor may expose a ready promise when establishing its upstream subscription is asynchronous. */
 export function createSharedSubscribedResource(options) {
 	const states = new Map()
 	const normalize = options.normalize ?? (async (params) => params)
@@ -157,6 +159,8 @@ export function createSharedSubscribedResource(options) {
 					state.source = typeof source === "function" ? { unsubscribe: source } : source
 					if (typeof state.source?.unsubscribe !== "function") throw new Error("Live resource subscribe must return an unsubscribe function or source descriptor")
 				}
+				if (state.source.ready) await state.source.ready
+				if (context.signal?.aborted) throw abortError()
 				const refresh = typeof state.source.refresh === "function" ? { refresh: () => state.source?.refresh?.() } : {}
 				if (cursorValid(context.cursor) && !subscription.reset) {
 					return { resumed: true, cursor: context.cursor, unsubscribe, ...refresh }
@@ -181,8 +185,16 @@ export function createSharedSubscribedResource(options) {
 export function createServiceAppLiveResource({ api, client }) {
 	return createSharedSubscribedResource({
 		subscribe(params, publish) {
+			// Establish the service event stream with a lightweight readiness snapshot before the browser-facing snapshot starts, so cross-process proxying preserves the same subscribe-before-snapshot boundary as an in-process resource.
 			const scope = appLiveScope(params)
-			return client.subscribe((event) => {
+			let readySettled = false
+			let resolveReady
+			let rejectReady
+			const ready = new Promise((resolve, reject) => {
+				resolveReady = resolve
+				rejectReady = reject
+			})
+			const unsubscribe = client.subscribe((event) => {
 				if (event?.type === "service_live_reconnected" || appLiveEventMatches(params, scope, event)) publish(event)
 			}, {
 				...(scope.scope === "session" ? { sessionId: scope.sessionId } : {}),
@@ -193,7 +205,29 @@ export function createServiceAppLiveResource({ api, client }) {
 				...(params.excludeSessions === true ? { excludeSessions: true } : {}),
 				...(params.worktreeStatusOnly === true ? { worktreeStatusOnly: true } : {}),
 				emitInitialSnapshot: false,
+				readySnapshotOnly: true,
+				onReady() {
+					if (readySettled) return
+					readySettled = true
+					resolveReady()
+				},
+				onError(err) {
+					if (readySettled) return
+					readySettled = true
+					rejectReady(err)
+				},
 			})
+			return {
+				ready,
+				refresh: async () => publish(await appLiveSnapshot(api, params)),
+				unsubscribe: () => {
+					if (!readySettled) {
+						readySettled = true
+						rejectReady(abortError())
+					}
+					return unsubscribe()
+				},
+			}
 		},
 		snapshot: (params) => appLiveSnapshot(api, params),
 	})

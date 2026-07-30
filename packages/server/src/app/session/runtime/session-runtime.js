@@ -8,11 +8,14 @@ import { isModelIoLogEnabled } from "../../../ai-apis/model-io-log.js"
 import { closeModelSessionResources } from "../../../ai-apis/session-resources.js"
 import { contextLoadDisplayMessage } from "../../../session-manager/context-display.js"
 import { contextFileIdentity } from "../../../session-manager/context-identity.js"
+import { transcriptManifestMessage } from "../../../session-manager/session-entry-manifest.js"
 import { PLAN_UPDATE_CUSTOM_TYPE, normalizePlanUpdateEntryData, planUpdateDisplayMessage } from "../../../session-manager/plan-update-entry.js"
+import { PROJECT_LOCATION_CUSTOM_TYPE, applyProjectLocationToConfig, applyProjectLocationToProperties } from "../../../session-manager/project-location-entry.js"
 import { isProjectContextMessage, loadProjectContext } from "../../project/context.js"
 import { compact, summarizeMessages } from "../../compaction/index.js"
 import { modelRef, resolveModel, sessionModelEligibilityError } from "../../model/registry.js"
 import { sessionActivityAt } from "../activity.js"
+import { persistPromptImageAttachments, readPromptImageAttachmentVariant } from "../attachments.js"
 import { deriveSessionRunState, startedToolsWithoutDurableResult, synthesizeUnknownToolResultsForStartedTools } from "../run-state.js"
 import { completeEnvironmentPatch, getEnvironment, loadEnvironmentRegistry } from "../../environment/registry.js"
 import { handleFastCommand } from "../../agent/fast-mode.js"
@@ -29,11 +32,13 @@ import { formatSystemReport } from "../../project/context-display.js"
 import { sessionWorkspacePath } from "../../paths.js"
 import { stateMountFromSettings } from "../../settings.js"
 import { sessionSandboxBaseWd, sessionSandboxMounts } from "../config.js"
-import { ensureSessionWorkspace } from "../workspaces.js"
 import { pathIsWithin } from "../../sandbox/paths.js"
 import { createModelRetryPlan, modelRetryDelayMs } from "../../model/retry-policy.js"
 import { DOCKER_PROXY_ROUTE, handleDockerProxyRequest } from "../../../proxy-tools/docker/host.js"
-import { GIT_WORKTREE_ADD_OPERATION, GIT_WORKTREE_CLOSE_OPERATION, GIT_WORKTREE_CUSTOM_TYPE, GIT_WORKTREE_TERMINAL_APPLIED, WORKTREE_EVENT_ROUTE, closeSessionGitWorktree, normalizeGitWorktreeEventPayload, sessionGitWorktreeStatuses, sessionOpenGitWorktreeRecords } from "../../source-control/worktree-events.js"
+import { GITHUB_PROXY_ROUTE, handleGithubProxyRequest } from "../../../proxy-tools/github/host.js"
+import { GithubPermissionController } from "../../permissions/github.js"
+import { PermissionRequestBroker } from "../../permissions/tool.js"
+import { GIT_WORKTREE_CLOSE_OPERATION, GIT_WORKTREE_CUSTOM_TYPE, GIT_WORKTREE_TERMINAL_APPLIED, WORKTREE_EVENT_ROUTE, closeSessionGitWorktree, normalizeGitWorktreeEventPayload, sessionGitWorktreeStatuses, sessionOpenGitWorktreeRecords } from "../../source-control/worktree-events.js"
 import { internalHttpJsonResponse } from "../../workers/internal-http.js"
 import { SESSION_BRIDGE_ROUTE } from "../bridge-protocol.js"
 import { PROMPT_IMAGE_CLOSE_TAG, promptImageLabel, promptImageLabelsForText, promptImageOpenTag, promptImagePlaceholders } from "../../../../../protocol/src/prompt-images.js"
@@ -47,7 +52,6 @@ import {
 	createMaintenancePromptMessage,
 	createWorktreeLifecyclePromptMessage,
 	getEffectiveSessionProperties,
-	hasSessionPropertyEntries,
 	isAutomatedMaintenanceMessage,
 	isHumanUserEntry,
 	normalizeSessionPropertyPatch,
@@ -86,7 +90,7 @@ import {
 } from "./maintenance.js"
 /** @typedef {import("../../agent/runtime.js").AgentRuntime} Agent */
 /** @typedef {import("../../../session-manager/index.js").Session} Session */
-/** @typedef {import("../../database/index.js").ServerDb} ServerDb */
+/** @typedef {import("../../../persistence/server-contract.js").ServerPersistence} ServerPersistence */
 import {
 	UNKNOWN_TOOL_RECOVERY_MAX_ATTEMPTS,
 	parseInternalJsonBody,
@@ -102,11 +106,8 @@ import {
 	sessionInfoFromEntry,
 	projectCwdForSessionEntry,
 	projectCwdForSnapshot,
-	staleToolCwdPathChecks,
-	sessionUsesLocalTarget,
-	cwdFallbackNoticeMessage,
-	sessionHasCwdFallbackNotice,
 	applyAgentModel,
+	sessionConfigAt,
 } from "./runtime-helpers.js"
 
 const PROMPT_IMAGE_LABEL_TEXT_RE = /\[Image #\d+\]/g
@@ -118,7 +119,7 @@ export class SessionRuntime {
 	 * @param {string} options.cwd
 	 * @param {Session} options.session
 	 * @param {Agent} options.agent
-	 * @param {ServerDb} options.db
+	 * @param {ServerPersistence} options.db
 	 * @param {(event: any) => void} options.emit
 	 * @param {() => Promise<any[]>} options.sessions
 	 * @param {(sessionId: string) => Promise<void>} options.invalidateSnapshot
@@ -133,6 +134,9 @@ export class SessionRuntime {
 	 * @param {() => { providers?: Record<string, any> }} [options.getSettings]
 	 * @param {import("../../workspace/client.js").WorkspaceClient} options.workspace
 	 * @param {string} [options.workspaceRoot]
+	 * @param {(properties: any) => { version: 1, projectId: string, previousRoot: string, root: string } | undefined} [options.projectLocationChange]
+	 * @param {any} [options.legacySessionProperties]
+	 * @param {boolean} [options.projectMaintenanceSession]
 	 * @param {any} [options.subSessions]
 	 * @param {SessionBridge} [options.sessionBridge]
 	 * @param {{ span?: (name: string, args?: Record<string, any>) => (extraArgs?: Record<string, any>) => void }} [options.diagnostics]
@@ -157,12 +161,27 @@ export class SessionRuntime {
 		this.bumpViewEpoch = options.bumpViewEpoch
 		this.getSettings = options.getSettings
 		this.workspaceRoot = options.workspaceRoot
+		this.getProjectLocationChange = options.projectLocationChange
 		this.subSessions = options.subSessions
 		this.sessionBridge = options.sessionBridge
 		this.diagnostics = options.diagnostics
 		this.currentRunId = null
 		this.finishedRunIds = new Set()
 		this.activeToolCalls = new Map()
+		this.githubPermission = new GithubPermissionController()
+		this.runtimeNeedsInput = false
+		this.permissionRequests = new PermissionRequestBroker({
+			isGranted: (permission, context) => this.githubPermission.isGranted(permission, context),
+			requestContext: (permission) => this.githubPermission.requestContext(permission),
+			grant: (permission, request) => this.githubPermission.grant(permission, request),
+			settle: (permission, context, granted) => this.githubPermission.settle(permission, context, granted),
+			onPendingChange: (count) => {
+				const runtimeNeedsInput = count > 0
+				if (runtimeNeedsInput === this.runtimeNeedsInput) return
+				this.runtimeNeedsInput = runtimeNeedsInput
+				this.emit({ type: "session_list_changed", sessionId: this.sessionId })
+			},
+		})
 		this.nextMessageEventId = 1
 		this.messageEventIds = new WeakMap()
 		this.messageEventIdsByKey = new Map()
@@ -174,14 +193,17 @@ export class SessionRuntime {
 		this.currentPrompt = undefined
 		this.promptCancellation = undefined
 		this.codeModeApiScope = undefined
-		this.legacySessionProperties = hasSessionPropertyEntries(this.session) ? undefined : this.db.getAgentViewMetadata(this.sessionId)
+		this.legacySessionProperties = options.legacySessionProperties
+		this.projectMaintenanceSession = options.projectMaintenanceSession === true
 		this.currentRunToolNames = new Set()
 		this.automatedMaintenanceTurnActive = false
 		this.automatedMaintenanceKind = undefined
 		this.visibleMaintenanceToolCallIds = new Set()
 		this.currentSkillsContext = undefined
-		this.pendingCwdFallbackNotices = []
+		this.pendingProjectionTasks = new Set()
+		this.nextPromptImageNumberFloor = undefined
 		this.installCodeModeApi(this.agent)
+		this.agent.requestPermission = (toolCallId, permission, reason, signal) => this.permissionRequests.request(toolCallId, permission, reason, signal)
 		const existingModelForRequest = this.agent.modelForRequest
 		this.agent.modelForRequest = (ctx) => {
 			const maintenanceModel = this.maintenanceModelForRequest(ctx)
@@ -189,19 +211,12 @@ export class SessionRuntime {
 			return existingModelForRequest?.call(this.agent, ctx)
 		}
 		const existingPreTurnMessages = this.agent.preTurnMessages
-		const existingBeforeToolCall = this.agent.beforeToolCall
 		const existingMaxToolCalls = this.agent.maxToolCalls
 		this.agent.automatedFollowUp = (ctx) => this.automatedMaintenanceFollowUp(ctx)
 		this.agent.preTurnMessages = async (ctx) => [
-			...(await this.cwdFallbackPreTurn(ctx)),
 			...(await this.automatedMaintenancePreTurn(ctx)),
 			...((await existingPreTurnMessages?.call(this.agent, ctx)) ?? []),
 		]
-		this.agent.beforeToolCall = async (ctx, signal) => {
-			const fallback = await this.repairStaleToolCwd({ source: { kind: "cwd_fallback", phase: "before_tool_call" } })
-			if (fallback?.notice) this.pendingCwdFallbackNotices.push({ notice: fallback.notice, context: ctx.context })
-			return await existingBeforeToolCall?.call(this.agent, ctx, signal)
-		}
 		this.agent.maxToolCalls = async (ctx) => {
 			const existing = await existingMaxToolCalls?.call(this.agent, ctx)
 			const maintenance = this.preTurnSessionPropertiesMaxToolCalls(ctx)
@@ -219,7 +234,7 @@ export class SessionRuntime {
 		this.agent.environmentContext = () => this.environmentContext()
 		this.agent.skillsContext = () => this.currentSkillsContext
 		this.hydrateAgentFromSession()
-		this.unsubscribe = this.agent.subscribe(async (event) => {
+		this.unsubscribe = this.agent.subscribe((event) => this.trackProjection(async () => {
 			const end = this.diagnostics?.span?.("SessionRuntime.handleAgentEvent", {
 				sessionId: this.sessionId,
 				eventType: event.type,
@@ -231,19 +246,30 @@ export class SessionRuntime {
 			} finally {
 				end?.()
 			}
-		})
-		this.unsubscribeCompaction = this.agent.subscribeCompaction(async (message) => {
+		}))
+		this.unsubscribeCompaction = this.agent.subscribeCompaction((message) => this.trackProjection(async () => {
 			const end = this.diagnostics?.span?.("SessionRuntime.handleCompaction", { sessionId: this.sessionId })
 			try {
 				await this.handleCompaction(message)
 			} finally {
 				end?.()
 			}
-		})
+		}))
 	}
 
 	touch() {
 		this.lastActiveAt = Date.now()
+	}
+
+	trackProjection(operation) {
+		let tracked
+		tracked = operation().finally(() => this.pendingProjectionTasks.delete(tracked))
+		this.pendingProjectionTasks.add(tracked)
+		return tracked
+	}
+
+	async waitForPendingProjections() {
+		while (this.pendingProjectionTasks.size > 0) await Promise.all([...this.pendingProjectionTasks])
 	}
 
 	promptImageRefsByNumber() {
@@ -260,6 +286,21 @@ export class SessionRuntime {
 		return refs
 	}
 
+	promptImageMinimumNumber(refsByNumber = this.promptImageRefsByNumber()) {
+		let maximum = Math.max(0, ...refsByNumber.keys())
+		if (this.nextPromptImageNumberFloor === undefined) {
+			for (const entry of this.session.getEntries()) {
+				if (entry?.type !== "message" || !Array.isArray(entry.message?.content)) continue
+				for (const block of entry.message.content) {
+					const number = Number(block?.imageNumber)
+					if (block?.type === "image" && Number.isInteger(number) && number > maximum) maximum = number
+				}
+			}
+		}
+		this.nextPromptImageNumberFloor = Math.max(this.nextPromptImageNumberFloor ?? 1, maximum + 1)
+		return this.nextPromptImageNumberFloor
+	}
+
 	withPromptImageDetail(block, source) {
 		if (!block) return undefined
 		return {
@@ -268,9 +309,9 @@ export class SessionRuntime {
 		}
 	}
 
-	resolveSubmittedPromptImage(image, refsByNumber) {
+	async resolveSubmittedPromptImage(image, refsByNumber) {
 		if (image?.attachmentId) {
-			const block = this.db.getImageAttachment(image.attachmentId)
+			const block = await this.db.getImageAttachment(image.attachmentId)
 			if (!block || (image.attachmentSessionId && image.attachmentSessionId !== block.attachmentSessionId)) {
 				throw Object.assign(new Error(`Prompt image attachment not found: ${image.attachmentId}`), { status: 404 })
 			}
@@ -278,7 +319,7 @@ export class SessionRuntime {
 		}
 		const number = Number(image?.imageNumber)
 		if (Number.isInteger(number) && number > 0) {
-			return this.withPromptImageDetail(refsByNumber.get(number) ?? this.db.getImageAttachmentByNumber(this.sessionId, number), image)
+			return this.withPromptImageDetail(refsByNumber.get(number) ?? await this.db.getImageAttachmentByNumber(this.sessionId, number), image)
 		}
 		return undefined
 	}
@@ -299,16 +340,15 @@ export class SessionRuntime {
 		return content
 	}
 
-	materializePromptContent(message, images = []) {
+	async materializePromptContent(message, images = []) {
 		const originalText = String(message || "")
 		const originalLabels = promptImageLabelsForText(originalText)
 		const refsByNumber = this.promptImageRefsByNumber()
-		const maxReferenced = Math.max(0, ...refsByNumber.keys())
 		const submittedBlocks = new Array(images.length)
 		const inlineImages = []
 		const inlineIndexes = []
 		for (let i = 0; i < images.length; i += 1) {
-			const existing = this.resolveSubmittedPromptImage(images[i], refsByNumber)
+			const existing = await this.resolveSubmittedPromptImage(images[i], refsByNumber)
 			if (existing?.attachmentId) {
 				submittedBlocks[i] = existing
 			} else {
@@ -316,9 +356,21 @@ export class SessionRuntime {
 				inlineIndexes.push(i)
 			}
 		}
+		const numberingRefs = new Map(refsByNumber)
+		for (const block of submittedBlocks) {
+			const number = Number(block?.imageNumber)
+			if (Number.isInteger(number) && number > 0) numberingRefs.set(number, block)
+		}
 		const created = inlineImages.length > 0
-			? this.db.createPromptImageAttachments(this.sessionId, inlineImages, { minimumNumber: maxReferenced + 1 })
+			? await persistPromptImageAttachments(this.db, this.sessionId, inlineImages, {
+				minimumNumber: this.promptImageMinimumNumber(numberingRefs),
+				diagnostics: this.diagnostics,
+			})
 			: []
+		for (const block of created) {
+			const number = Number(block?.imageNumber)
+			if (Number.isInteger(number)) this.nextPromptImageNumberFloor = Math.max(this.nextPromptImageNumberFloor ?? 1, number + 1)
+		}
 		for (let i = 0; i < created.length; i += 1) submittedBlocks[inlineIndexes[i]] = created[i]
 
 		const replacements = new Map()
@@ -338,7 +390,7 @@ export class SessionRuntime {
 		for (const placeholder of promptImagePlaceholders(finalText)) {
 			const number = Number(placeholder.index)
 			if (included.has(number)) continue
-			const block = submittedByNumber.get(number) ?? refsByNumber.get(number) ?? this.db.getImageAttachmentByNumber(this.sessionId, number)
+			const block = submittedByNumber.get(number) ?? refsByNumber.get(number) ?? await this.db.getImageAttachmentByNumber(this.sessionId, number)
 			if (!block?.attachmentId) continue
 			included.add(number)
 			finalBlocks.push(block)
@@ -352,11 +404,13 @@ export class SessionRuntime {
 		return this.promptImageContentFromBlocks(finalText, finalBlocks)
 	}
 
-	resolveImageAttachmentsForModel(messages) {
-		const resolveBlock = (block) => {
+	async resolveImageAttachmentsForModel(messages) {
+		const resolveBlock = async (block) => {
 			if (block?.type !== "image" || block.data || !block.attachmentId) return block
 			const sessionId = block.attachmentSessionId ?? this.sessionId
-			const variant = this.db.getAttachmentVariant(sessionId, block.attachmentId)
+			const variant = await readPromptImageAttachmentVariant(this.db, sessionId, block.attachmentId, undefined, {
+				diagnostics: this.diagnostics,
+			})
 			if (!variant?.data) throw new Error(`Prompt image attachment not found: ${block.attachmentId}`)
 			return {
 				...block,
@@ -364,16 +418,16 @@ export class SessionRuntime {
 				mimeType: block.mimeType ?? variant.mimeType,
 			}
 		}
-		return messages.map((message) => {
+		return await Promise.all(messages.map(async (message) => {
 			if (!Array.isArray(message?.content)) return message
 			let changed = false
-			const content = message.content.map((block) => {
-				const resolved = resolveBlock(block)
+			const content = await Promise.all(message.content.map(async (block) => {
+				const resolved = await resolveBlock(block)
 				if (resolved !== block) changed = true
 				return resolved
-			})
+			}))
 			return changed ? { ...message, content } : message
-		})
+		}))
 	}
 
 	async normalizeUserCwd(cwd, label = "cwd") {
@@ -382,64 +436,6 @@ export class SessionRuntime {
 
 	async normalizeStoredCwd(cwd, label = "cwd") {
 		return this.workspace.paths.normalizeStoredCwd(cwd, label)
-	}
-
-	async cwdFallbackPreTurn() {
-		const fallback = await this.repairStaleToolCwd({ source: { kind: "cwd_fallback", phase: "pre_turn" } })
-		return fallback?.notice ? [fallback.notice] : []
-	}
-
-	async repairStaleToolCwd(options = {}) {
-		const props = this.effectiveSessionProperties()
-		const registry = loadEnvironmentRegistry()
-		if (!sessionUsesLocalTarget(props, registry)) return undefined
-		const config = this.session.getSessionConfig?.() ?? {}
-		const checks = staleToolCwdPathChecks(props, config, this.cwd)
-		const missingPaths = []
-		for (const check of checks) {
-			if (!await this.workspace.paths.resolveDirectory(check.path, check.label).then(() => true, () => false)) missingPaths.push(check)
-		}
-		if (missingPaths.length === 0) return undefined
-
-		const source = options.source ?? { kind: "cwd_fallback" }
-		const sessionDir = await this.normalizeStoredCwd(await ensureSessionWorkspace(this.sessionId), "session workspace cwd")
-		const report = {
-			previousCwd: typeof props.cwd === "string" && props.cwd ? props.cwd : this.cwd,
-			previousInitialWd: typeof config.initialWd === "string" && config.initialWd ? config.initialWd : undefined,
-			previousSandboxMounts: sessionSandboxMounts(config),
-			missingPaths,
-			sessionDir,
-		}
-		await this.session.appendConfigPatch({ initialWd: sessionDir, sandboxMounts: [sessionDir] })
-		const write = await this.appendSessionPropertyPatch({ cwd: sessionDir }, source, { allowStoredCwd: true })
-		if (write.noChange) this.refreshSessionPropertyCache({ source })
-		await this.invalidateSnapshot(this.sessionId)
-		return {
-			report,
-			write,
-			notice: sessionHasCwdFallbackNotice(this.session, report) ? undefined : cwdFallbackNoticeMessage(report),
-		}
-	}
-
-	async flushPendingCwdFallbackNotices() {
-		const pending = this.pendingCwdFallbackNotices.splice(0)
-		if (pending.length === 0) return
-		let appended = false
-		for (const { notice, context } of pending) {
-			const fallback = notice?.cwdFallback
-			const report = fallback ? {
-				previousCwd: fallback.previousCwd,
-				sessionDir: fallback.sessionDir,
-				missingPaths: fallback.missingPaths,
-			} : undefined
-			if (report && sessionHasCwdFallbackNotice(this.session, report)) continue
-			const entryId = await this.session.appendMessage(notice)
-			this.agent.state.messages.push(notice)
-			this.agent.msgToEntryId.set(notice, entryId)
-			if (Array.isArray(context?.messages) && !context.messages.includes(notice)) context.messages.push(notice)
-			appended = true
-		}
-		if (appended) await this.invalidateSnapshot(this.sessionId)
 	}
 
 	hydrateAgentFromSession() {
@@ -476,7 +472,7 @@ export class SessionRuntime {
 	}
 
 	async sessionInfo(id) {
-		const entry = this.db.getSession(id)
+		const entry = await this.db.getSession(id)
 		if (entry && !await this.storedSessionEntryAllowed(entry)) {
 			throw Object.assign(new Error(`session cwd is outside configured service.workspaceRoot (${this.workspaceRoot}): ${entry.cwd}`), { status: 403 })
 		}
@@ -486,13 +482,38 @@ export class SessionRuntime {
 		return info
 	}
 
-	effectiveSessionProperties() {
+	rawEffectiveSessionProperties(fromId = undefined) {
 		this.session.legacySessionProperties = this.legacySessionProperties
-		return getEffectiveSessionProperties(this.session)
+		return getEffectiveSessionProperties(this.session, fromId)
+	}
+
+	effectiveSessionProperties(fromId = undefined) {
+		const properties = this.rawEffectiveSessionProperties(fromId)
+		return applyProjectLocationToProperties(properties, this.getProjectLocationChange?.(properties))
+	}
+
+	effectiveSessionConfig(fromId = undefined) {
+		const config = fromId === undefined
+			? this.session.getSessionConfig?.() ?? {}
+			: sessionConfigAt(this.session, fromId)
+		const properties = this.rawEffectiveSessionProperties(fromId)
+		return applyProjectLocationToConfig(config, this.getProjectLocationChange?.(properties))
+	}
+
+	async reconcileProjectLocation() {
+		const properties = this.rawEffectiveSessionProperties()
+		const change = this.getProjectLocationChange?.(properties)
+		if (!change) return false
+		await this.session.appendCustomEntry(PROJECT_LOCATION_CUSTOM_TYPE, change)
+		await this.refreshSessionPropertyCache({ source: { kind: "project_location_changed" } })
+		this.hydrateAgentFromSession()
+		this.bumpViewEpoch()
+		await this.invalidateSnapshot(this.sessionId)
+		return true
 	}
 
 	isProjectMaintenanceSession() {
-		return Boolean(this.db.getProjectMaintenanceSessionBySessionId(this.sessionId))
+		return this.projectMaintenanceSession
 	}
 
 	visibleProjectionOptions(options = {}) {
@@ -518,8 +539,8 @@ export class SessionRuntime {
 
 	environmentContext() {
 		const props = this.effectiveSessionProperties()
-		const config = this.session.getSessionConfig?.() ?? {}
-		const sandboxBaseWd = sessionSandboxBaseWd(config, this.session.getMetadata?.()?.cwd ?? this.cwd)
+		const config = this.effectiveSessionConfig()
+		const sandboxBaseWd = sessionSandboxBaseWd(config, props.projectDir, props.cwd ?? this.cwd)
 		return environmentContextFor({
 			cwd: props.cwd ?? this.cwd,
 			initialCwd: sandboxBaseWd,
@@ -529,6 +550,7 @@ export class SessionRuntime {
 			sessionWorkspacePath: sessionWorkspacePath(this.sessionId),
 			previewPublicUrl: this.getPreviewPublicUrl?.() ?? previewPublicUrlFromSettings(this.getSettings?.()),
 			stateMount: stateMountFromSettings(this.getSettings?.()),
+			mountCurrentCwd: true,
 		})
 	}
 
@@ -560,17 +582,26 @@ export class SessionRuntime {
 		return entry ? entryMessageText(entry) : ""
 	}
 
-	refreshSessionPropertyCache(options = {}) {
-		const props = this.effectiveSessionProperties()
-		if (props.cwd && props.cwd !== this.cwd) {
-			this.cwd = props.cwd
-			this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
-		}
-		this.db.setSessionProjectDir(this.sessionId, props.projectDir ?? null)
+	async refreshSessionPropertyCache(options = {}) {
+		const raw = this.rawEffectiveSessionProperties()
+		const config = this.session.getSessionConfig?.() ?? {}
+		await this.db.setSessionTranscriptProjection(this.sessionId, {
+			cwd: raw.cwd,
+			initialWd: config.initialWd,
+			projectDir: raw.projectDir ?? null,
+			updatedAt: sessionActivityAt(this.session),
+		})
+		const props = applyProjectLocationToProperties(raw, this.getProjectLocationChange?.(raw))
+		if (props.cwd && props.cwd !== this.cwd) this.cwd = props.cwd
 		const metadata = sessionPropertiesToAgentView(props) ?? {}
-		this.db.setAgentViewMetadata(this.sessionId, metadata)
+		await this.db.setAgentViewMetadata(this.sessionId, metadata)
 		this.emitRuntimeEvent({ type: "agent_view_metadata", metadata, source: options.source })
 		return props
+	}
+
+	async touchSessionActivity(updatedAt = sessionActivityAt(this.session)) {
+		const cwd = this.rawEffectiveSessionProperties().cwd ?? this.session.getMetadata().cwd ?? this.cwd
+		await this.db.touchSession(this.sessionId, cwd, updatedAt)
 	}
 
 	async appendCwdContextLoad(cwd) {
@@ -597,6 +628,11 @@ export class SessionRuntime {
 					? await this.normalizeStoredCwd(normalized.cwd, "session cwd")
 					: await this.normalizeUserCwd(normalized.cwd, "session cwd"),
 			}
+		}
+		let projectRegistration
+		if (normalized.projectDir) {
+			projectRegistration = await this.registerProjectRoot?.(normalized.projectDir, { force: true })
+			if (projectRegistration?.projectDir) normalized = { ...normalized, projectDir: projectRegistration.projectDir }
 		}
 		if (normalized.projectDir) {
 			normalized = {
@@ -635,41 +671,15 @@ export class SessionRuntime {
 			updatedAt,
 			source,
 		})
-		const properties = this.refreshSessionPropertyCache({ source })
-		if (Object.prototype.hasOwnProperty.call(changed, "projectDir") && properties.projectDir) await this.registerProjectRoot?.(properties.projectDir, { force: true })
+		if (Object.prototype.hasOwnProperty.call(changed, "projectDir")) {
+			if (after.projectDir) {
+				if (projectRegistration?.projectId) await this.db.setSessionProject(this.sessionId, projectRegistration.projectId, projectRegistration.projectDir)
+			}
+			else await this.db.setSessionProject(this.sessionId, null, null)
+		}
+		const properties = await this.refreshSessionPropertyCache({ source })
 		if (Object.prototype.hasOwnProperty.call(changed, "cwd")) await this.appendCwdContextLoad(properties.cwd)
 		return writeResult(properties)
-	}
-
-	async remapClosedWorktreePaths(event) {
-		const worktreePath = typeof event?.path === "string" ? event.path : undefined
-		const repositoryRoot = typeof event?.repositoryRoot === "string" ? event.repositoryRoot : undefined
-		if (!worktreePath || !repositoryRoot) return undefined
-		const props = this.effectiveSessionProperties()
-		const cwd = typeof props.cwd === "string" ? props.cwd : undefined
-		const projectCwd = projectCwdForSnapshot(this.session, props, this.cwd)
-		const patch = {
-			...(cwd && pathIsWithin(worktreePath, cwd) && cwd !== repositoryRoot ? { cwd: repositoryRoot } : {}),
-			...(projectCwd && pathIsWithin(worktreePath, projectCwd) && projectCwd !== repositoryRoot ? { projectDir: repositoryRoot } : {}),
-		}
-		if (Object.keys(patch).length === 0) return undefined
-		const write = await this.appendSessionPropertyPatch(patch, { kind: "worktree_close" })
-		return {
-			...(Object.prototype.hasOwnProperty.call(patch, "cwd") ? {
-				cwd: {
-					oldPath: cwd,
-					newPath: repositoryRoot,
-					changed: Object.prototype.hasOwnProperty.call(write.changed ?? {}, "cwd"),
-				},
-			} : {}),
-			...(Object.prototype.hasOwnProperty.call(patch, "projectDir") ? {
-				projectDir: {
-					oldPath: projectCwd,
-					newPath: repositoryRoot,
-					changed: Object.prototype.hasOwnProperty.call(write.changed ?? {}, "projectDir"),
-				},
-			} : {}),
-		}
 	}
 
 	async refreshWorktreeModeExitLifecycle(source = undefined) {
@@ -693,6 +703,16 @@ export class SessionRuntime {
 		if (payload?.operation === GIT_WORKTREE_CLOSE_OPERATION) {
 			let result
 			try {
+				const request = normalizeGitWorktreeEventPayload(payload, { workerContext })
+				const cwd = this.effectiveSessionProperties().cwd ?? this.cwd
+				if (request?.path && cwd && pathIsWithin(request.path, cwd)) {
+					const record = sessionOpenGitWorktreeRecords(this.session).find((candidate) => candidate.path === request.path)
+					const example = record?.repositoryRoot ? ` For example: cerex session set cwd ${record.repositoryRoot}` : ""
+					throw Object.assign(new Error(`Session cwd is inside this worktree. Set cwd outside ${request.path} before closing it.${example}`), {
+						status: 409,
+						code: "worktreeContainsSessionCwd",
+					})
+				}
 				result = await closeSessionGitWorktree(this.session, payload, { workerContext, workspace: this.workspace })
 			} catch (err) {
 				const cleanup = err?.cleanup && typeof err.cleanup === "object" ? err.cleanup : undefined
@@ -704,7 +724,6 @@ export class SessionRuntime {
 				}, err?.status ?? 500)
 			}
 			if (!result) return internalHttpJsonResponse({ ok: true, recorded: false })
-			const remapped = await this.remapClosedWorktreePaths(result.event)
 			await this.refreshWorktreeModeExitLifecycle({ kind: "worktree_mode_exit", operation: payload.operation, terminalState: result.event?.terminalState })
 			await this.invalidateSnapshot(this.sessionId)
 			this.emit({ type: "session_list_changed", sessionId: this.sessionId })
@@ -716,8 +735,6 @@ export class SessionRuntime {
 				entryId: result.entryId,
 				event: result.event,
 				cleanup: result.cleanup,
-				...(remapped?.cwd ? { cwd: remapped.cwd } : {}),
-				...(remapped?.projectDir ? { projectDir: remapped.projectDir } : {}),
 				...(result.cleanupError ? { error: result.cleanupError } : {}),
 			}
 			return internalHttpJsonResponse(body, result.cleanupOk === false ? 409 : result.alreadyClosed ? 200 : 201)
@@ -725,7 +742,6 @@ export class SessionRuntime {
 		const event = normalizeGitWorktreeEventPayload(payload, { workerContext })
 		if (!event) return internalHttpJsonResponse({ ok: true, recorded: false })
 		const entryId = await this.session.appendCustomEntry(GIT_WORKTREE_CUSTOM_TYPE, event)
-		if (event.operation === GIT_WORKTREE_ADD_OPERATION) await this.registerProjectRoot?.(event.path).catch(() => undefined)
 		await this.invalidateSnapshot(this.sessionId)
 		this.emit({ type: "session_list_changed", sessionId: this.sessionId })
 		this.refreshWorktrees?.(this.sessionId, { force: true, reason: "internal_worktree_event" })
@@ -827,6 +843,11 @@ export class SessionRuntime {
 		if (url.pathname === SESSION_BRIDGE_ROUTE) return this.handleInternalBridgeSessionRequest(request)
 		if (url.pathname === WORKTREE_EVENT_ROUTE) return this.handleInternalWorktreeEvent(request, workerContext)
 		if (url.pathname === DOCKER_PROXY_ROUTE) return handleDockerProxyRequest(request, workerContext, { sessionId: this.sessionId })
+		if (url.pathname === GITHUB_PROXY_ROUTE) return handleGithubProxyRequest(request, workerContext, {
+			sessionId: this.sessionId,
+			onCredentialRequired: (credentialRequest) => this.githubPermission.credentialRequired(credentialRequest),
+			selectCredential: (target, candidates) => this.githubPermission.selectedCredential(target, candidates),
+		})
 		return internalHttpJsonResponse({ error: "Not Found" }, 404)
 	}
 
@@ -1057,7 +1078,7 @@ export class SessionRuntime {
 					role: event.message.role,
 				})
 				try {
-					this.db.touchSession(this.sessionId, this.cwd, activityAt)
+					await this.touchSessionActivity(activityAt)
 				} finally {
 					endTouch?.()
 				}
@@ -1075,10 +1096,9 @@ export class SessionRuntime {
 					? props.state === SESSION_NEEDS_INPUT_STATE || props.state === SESSION_DEFERRED_STATE || props.state === SESSION_COMPLETED_STATE
 					: props.state !== SESSION_DISCUSSING_STATE
 				if (shouldResetState) await this.appendSessionPropertyPatch({ state: SESSION_DISCUSSING_STATE }, { kind: "run_reset", runId: this.currentRunId })
-				else this.refreshSessionPropertyCache({ source: { kind: "run_reset", runId: this.currentRunId } })
+				else await this.refreshSessionPropertyCache({ source: { kind: "run_reset", runId: this.currentRunId } })
 			}
 		}
-		if (event.type === "turn_end") await this.flushPendingCwdFallbackNotices()
 		if (event.type === "agent_end") {
 			this.activeToolCalls.clear()
 			const endTouch = this.diagnostics?.span?.("SessionRuntime.db.touchSession", {
@@ -1086,12 +1106,12 @@ export class SessionRuntime {
 				eventType: "agent_end",
 			})
 			try {
-				this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
+				await this.touchSessionActivity()
 			} finally {
 				endTouch?.()
 			}
-			this.finishRunFromAgentEnd(event)
-			this.refreshSessionPropertyCache({ source: { kind: "agent_end" } })
+			await this.finishRunFromAgentEnd(event)
+			await this.refreshSessionPropertyCache({ source: { kind: "agent_end" } })
 		}
 		if (!event.message) {
 			if (!(this.automatedMaintenanceTurnActive && event.type?.startsWith?.("tool_execution_"))) this.emitRuntimeEvent(emitEvent)
@@ -1186,7 +1206,7 @@ export class SessionRuntime {
 		await this.invalidateSnapshot(this.sessionId)
 	}
 
-	finishRunFromAgentEnd(event) {
+	async finishRunFromAgentEnd(event) {
 		this.clearSkillsContext()
 		const runId = this.currentRunId
 		if (!runId || this.finishedRunIds.has(runId)) return
@@ -1197,16 +1217,16 @@ export class SessionRuntime {
 		const stopReason = event.interrupted ? "interrupted" : finalMessage?.stopReason
 		const errorMessage = finalMessage?.errorMessage
 		const status = event.interrupted ? "interrupted" : stopReason === "aborted" ? "aborted" : errorMessage ? "failed" : "completed"
-		this.db.finishRun(runId, { status, error: errorMessage, stopReason })
+		await this.db.finishRun(runId, { status, error: errorMessage, stopReason })
 		this.finishedRunIds.add(runId)
 		this.currentRunId = null
 		this.session.clearMutationRunId(runId)
 	}
 
-	finishRunFromFailure(runId, err) {
+	async finishRunFromFailure(runId, err) {
 		if (this.finishedRunIds.has(runId)) return
 		if (this.currentRunId === runId) this.clearSkillsContext()
-		this.db.finishRun(runId, {
+		await this.db.finishRun(runId, {
 			status: "failed",
 			error: /** @type {any} */ (err)?.message ?? String(err),
 			stopReason: "error",
@@ -1218,6 +1238,10 @@ export class SessionRuntime {
 
 	isStreaming() {
 		return this.agent.state.isStreaming
+	}
+
+	needsInput() {
+		return this.runtimeNeedsInput
 	}
 
 	waitingInfo() {
@@ -1279,18 +1303,11 @@ export class SessionRuntime {
 
 	async snapshot(options = {}) {
 		this.touch()
-		let properties = this.effectiveSessionProperties()
+		// Agent state changes before its listener persists and publishes the corresponding runtime event. Wait only for projections already in flight, then capture cursor-bound runtime state before any external await can pair an old cursor with a newer transcript.
+		await Promise.resolve()
+		await this.waitForPendingProjections()
+		const properties = this.effectiveSessionProperties()
 		const requestedProjectCwd = projectCwdForSnapshot(this.session, properties, this.cwd)
-		const [initialProject, subSessions] = await Promise.all([
-			this.workspace.project.info(requestedProjectCwd),
-			this.subSessions.list(this.sessionId, { includeClosed: true }),
-		])
-		const currentProperties = this.effectiveSessionProperties()
-		const currentProjectCwd = projectCwdForSnapshot(this.session, currentProperties, this.cwd)
-		const project = currentProjectCwd === requestedProjectCwd
-			? initialProject
-			: await this.workspace.project.info(currentProjectCwd)
-		properties = currentProjectCwd === requestedProjectCwd ? currentProperties : this.effectiveSessionProperties()
 		let logicalEntries
 		const endLogical = this.diagnostics?.span?.("SessionRuntime.snapshot.logicalEntries", { sessionId: this.sessionId })
 		try {
@@ -1324,13 +1341,26 @@ export class SessionRuntime {
 		const systemPrompt = this.agent.state.systemPrompt
 		const tools = this.agent.state.tools
 		const isStreaming = this.agent.state.isStreaming
+		const currentModelRequest = this.agent.state.currentModelRequest
 		const pendingToolCalls = [...this.agent.state.pendingToolCalls]
 		const pendingToolCallDetails = [...this.activeToolCalls.values()]
 		const pendingUserMessages = this.pendingUserMessages()
 		const errorMessage = this.agent.state.errorMessage
 		const streamingMessage = projectVisibleMessage(this.agent.state.streamingMessage, this.visibleProjectionOptions())
 		const streamingAssistantMessageId = this.streamingAssistantMessageId
-		const promptDraft = this.db.getPromptDraft(this.sessionId)
+		const promptDraft = await this.db.getPromptDraft(this.sessionId)
+		const messages = visibleDisplayEntries.map((entry) => ({
+			...(options.transcriptMode === "deferred" ? transcriptManifestMessage(entry.message) : entry.message),
+			entryId: entry.entryId,
+		}))
+		const snapshotContextMessages = options.includeContextMessages
+			? contextMessages.map((message) => ({ ...message, entryId: message.entryId ?? "context" }))
+			: undefined
+		endPayload?.({ messages: messages.length, contextMessages: contextStats.messageCount, includeContextMessages: options.includeContextMessages === true })
+		const [project, subSessions] = await Promise.all([
+			this.workspace.project.info(requestedProjectCwd),
+			this.subSessions.list(this.sessionId, { includeClosed: true }),
+		])
 		const snapshot = {
 			cwd: properties.cwd ?? this.cwd,
 			project,
@@ -1345,7 +1375,7 @@ export class SessionRuntime {
 			tools,
 			modelIoLogEnabled: isModelIoLogEnabled(),
 			isStreaming,
-			currentModelRequest: this.agent.state.currentModelRequest,
+			currentModelRequest,
 			pendingToolCalls,
 			pendingToolCallDetails,
 			pendingUserMessages,
@@ -1354,14 +1384,13 @@ export class SessionRuntime {
 			sessionProperties: properties,
 			promptDraft,
 			subSessions,
-			messages: visibleDisplayEntries.map((entry) => ({ ...entry.message, entryId: entry.entryId })),
+			messages,
 			contextStats,
 			streamingMessage: streamingMessage
 				? { ...streamingMessage, messageId: streamingAssistantMessageId }
 				: null,
 		}
-		if (options.includeContextMessages) snapshot.contextMessages = contextMessages.map((message) => ({ ...message, entryId: message.entryId ?? "context" }))
-		endPayload?.({ messages: snapshot.messages.length, contextMessages: contextStats.messageCount, includeContextMessages: options.includeContextMessages === true })
+		if (snapshotContextMessages) snapshot.contextMessages = snapshotContextMessages
 		if (options.includeSessions) snapshot.sessions = await this.sessions()
 		return snapshot
 	}
@@ -1380,14 +1409,15 @@ export class SessionRuntime {
 			sessionId: this.sessionId,
 			...this.snapshotCursor(),
 			isStreaming: this.agent.state.isStreaming === true,
+			runtimeNeedsInput: this.runtimeNeedsInput,
 			...(currentModelRequest?.startedAt ? { currentModelRequest: { startedAt: currentModelRequest.startedAt } } : {}),
 			pendingToolCallCount: this.agent.state.pendingToolCalls?.size ?? this.agent.state.pendingToolCalls?.length ?? 0,
 		}
 	}
 
-	startRunRecord() {
+	async startRunRecord() {
 		const runId = randomUUID()
-		this.db.startRun({
+		await this.db.startRun({
 			id: runId,
 			sessionId: this.sessionId,
 			expectedMutationVersion: this.session.getMutationVersion(),
@@ -1509,7 +1539,7 @@ export class SessionRuntime {
 		try {
 			await run
 		} catch (err) {
-			this.finishRunFromFailure(retry.runId, err)
+			await this.finishRunFromFailure(retry.runId, err)
 			this.emitRuntimeEvent({ type: "error", error: /** @type {any} */ (err)?.message ?? String(err) })
 			this.invalidateSnapshot(this.sessionId).catch(() => {})
 			return
@@ -1522,7 +1552,16 @@ export class SessionRuntime {
 
 	enqueueTurnStart(operation) {
 		const previous = this.turnStartQueue.catch(() => {})
-		const current = previous.then(operation)
+		const current = previous.then(() => {
+			if (this.disposed) {
+				throw Object.assign(new Error("Session runtime is no longer active. Retry the request to reopen it."), {
+					status: 409,
+					code: "sessionRuntimeDisposed",
+					sessionId: this.sessionId,
+				})
+			}
+			return operation()
+		})
 		this.turnStartQueue = current.then(() => undefined, () => undefined)
 		return current
 	}
@@ -1548,14 +1587,14 @@ export class SessionRuntime {
 		const endStartRun = this.diagnostics?.span?.("SessionRuntime.prompt.startRunRecord", { sessionId: this.sessionId })
 		let runId
 		try {
-			runId = this.startRunRecord()
+			runId = await this.startRunRecord()
 		} finally {
 			endStartRun?.()
 		}
 		this.currentPrompt = {
 			runId,
 			text: message,
-			preAgentView: this.db.getAgentViewMetadata(this.sessionId),
+			preAgentView: await this.db.getAgentViewMetadata(this.sessionId),
 			userEntryId: undefined,
 		}
 
@@ -1565,7 +1604,7 @@ export class SessionRuntime {
 		try {
 			;({ accepted, run } = this.agent.startPrompt(userMessage))
 		} catch (err) {
-			this.finishRunFromFailure(runId, err)
+			await this.finishRunFromFailure(runId, err)
 			if (this.currentPrompt?.runId === runId) this.currentPrompt = undefined
 			throw err
 		} finally {
@@ -1579,7 +1618,7 @@ export class SessionRuntime {
 	}
 
 	async beginPrompt(message, streamingBehavior, images = []) {
-		const content = this.materializePromptContent(message, images)
+		const content = await this.materializePromptContent(message, images)
 		return this.beginUserMessagePrompt({ role: "user", content, timestamp: Date.now() }, streamingBehavior)
 	}
 
@@ -1596,6 +1635,7 @@ export class SessionRuntime {
 			if (this.agent.state.isStreaming) return this.startStreamingPrompt(normalizedUserMessage, behavior)
 			await this.agent.waitForIdle()
 			if (this.agent.state.isStreaming) return this.startStreamingPrompt(normalizedUserMessage, behavior)
+			await this.reconcileProjectLocation()
 			this.hydrateAgentFromSession()
 			return this.startPromptRun(message, normalizedUserMessage)
 		})
@@ -1635,7 +1675,7 @@ export class SessionRuntime {
 			// boundary. Repeating the tool would be unsafe; keeping the failure tail in
 			// the model context would put a non-tool message between the assistant tool
 			// call and its recovered tool result.
-			this.session.moveTo(latestStartedEntryId)
+			await this.session.moveTo(latestStartedEntryId)
 			changed = true
 		}
 		const synthesized = await synthesizeUnknownToolResultsForStartedTools(this.session)
@@ -1643,13 +1683,13 @@ export class SessionRuntime {
 		if (changed) {
 			this.hydrateAgentFromSession()
 			this.bumpViewEpoch()
-			this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
+			await this.touchSessionActivity()
 			await this.invalidateSnapshot(this.sessionId)
 		}
 		return synthesized
 	}
 
-	rewindFailedAssistantTail() {
+	async rewindFailedAssistantTail() {
 		// If the last attempted turn ended with an aborted/errored assistant, rewind the session
 		// leaf to its parent so the next continuation can re-stream the turn. Without this,
 		// agent.continue() throws "Cannot continue from message role: assistant" — which the
@@ -1664,16 +1704,16 @@ export class SessionRuntime {
 		const parentMessage = messages[messages.length - 2]
 		const parentEntryId = this.agent.msgToEntryId.get(parentMessage)
 		if (!parentEntryId) return false
-		this.session.moveTo(parentEntryId)
+		await this.session.moveTo(parentEntryId)
 		this.hydrateAgentFromSession()
 		return true
 	}
 
 	async prepareContinuationState() {
 		await this.reconcileUnknownToolExecutions()
-		if (this.rewindFailedAssistantTail()) {
+		if (await this.rewindFailedAssistantTail()) {
 			this.bumpViewEpoch()
-			this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
+			await this.touchSessionActivity()
 			await this.invalidateSnapshot(this.sessionId)
 		}
 		return deriveSessionRunState(this.session)
@@ -1688,14 +1728,15 @@ export class SessionRuntime {
 		}
 		if (state.type !== "runnable") throw Object.assign(new Error(`Cannot continue: ${state.reason}`), { status: 409 })
 
+		await this.reconcileProjectLocation()
 		await this.replaceSkillsContextForText(this.latestHumanPromptText())
 		this.currentRunToolNames = new Set()
-		const runId = this.startRunRecord()
+		const runId = await this.startRunRecord()
 		let run
 		try {
 			run = this.agent.continue()
 		} catch (err) {
-			this.finishRunFromFailure(runId, err)
+			await this.finishRunFromFailure(runId, err)
 			throw err
 		}
 		const monitored = this.monitorRunForAutomaticRecovery(run, { runId, ...(options.retry ?? {}) })
@@ -1857,12 +1898,12 @@ export class SessionRuntime {
 				...cancellableBranchUserMessages(this.session, entry),
 				...queuedMessages,
 			]
-			this.session.moveTo(entry.parentId ?? null, { runId: prompt.runId })
+			await this.session.moveTo(entry.parentId ?? null, { runId: prompt.runId })
 			this.hydrateAgentFromSession()
 			this.agent.clearAllQueues?.()
 			this.agent.state.errorMessage = undefined
-			this.refreshSessionPropertyCache({ source: { kind: "cancel_prompt" } })
-			this.db.finishRun(prompt.runId, { status: "completed", stopReason: "cancelled" })
+			await this.refreshSessionPropertyCache({ source: { kind: "cancel_prompt" } })
+			await this.db.finishRun(prompt.runId, { status: "completed", stopReason: "cancelled" })
 			this.finishedRunIds.add(prompt.runId)
 			if (this.currentRunId === prompt.runId) this.currentRunId = null
 			this.session.clearMutationRunId(prompt.runId)
@@ -1870,7 +1911,7 @@ export class SessionRuntime {
 			this.streamingAssistantMessageId = null
 			if (this.promptCancellation?.runId === prompt.runId) this.promptCancellation = undefined
 			this.bumpViewEpoch()
-			this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
+			await this.touchSessionActivity()
 			this.emitRuntimeEvent({ type: "pending_user_messages_update", pendingUserMessages: this.pendingUserMessages() })
 			await this.invalidateSnapshot(this.sessionId)
 			restoreQueuedOnError = false
@@ -1955,7 +1996,7 @@ export class SessionRuntime {
 		}
 		let fileRestoreResult
 		if (options.restoreFiles === true) fileRestoreResult = await restoreFilesToCheckpoint(this.session, id, this.workspace)
-		if (restoreConversation) this.session.moveTo(entry.parentId ?? null)
+		if (restoreConversation) await this.session.moveTo(entry.parentId ?? null)
 		await this.session.appendCustomEntry(SESSION_CUSTOM_TYPE_REWIND, { targetEntryId: id, text: editorText, summary: restoreConversation && !!options.summary, restoreFiles: options.restoreFiles === true, restoreConversation })
 		if (fileRestoreResult) await appendFileRestoreEntry(this.session, id, fileRestoreResult)
 		if (branchSummary) {
@@ -1966,10 +2007,10 @@ export class SessionRuntime {
 				branchSummary: true,
 			})
 		}
+		await this.refreshSessionPropertyCache({ source: { kind: "rewind" } })
 		this.hydrateAgentFromSession()
 		this.bumpViewEpoch()
-		this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
-		this.refreshSessionPropertyCache({ source: { kind: "rewind" } })
+		await this.touchSessionActivity()
 		await this.invalidateSnapshot(this.sessionId)
 		return editorText
 	}
@@ -2013,25 +2054,36 @@ export class SessionRuntime {
 		if (!branchTips.some((tip) => tip.id === id)) throw Object.assign(new Error(`Branch tip not found: ${id}`), { status: 404 })
 		let switched = false
 		if (id !== this.session.getLeafId()) {
-			this.session.moveTo(id)
+			await this.session.moveTo(id)
 			await this.session.appendCustomEntry(SESSION_CUSTOM_TYPE_BRANCH_SWITCH, { targetEntryId: id })
 			switched = true
 		}
+		await this.refreshSessionPropertyCache({ source: { kind: "branch_switch" } })
 		this.hydrateAgentFromSession()
 		this.bumpViewEpoch()
-		this.db.touchSession(this.sessionId, this.cwd, sessionActivityAt(this.session))
-		this.refreshSessionPropertyCache({ source: { kind: "branch_switch" } })
+		await this.touchSessionActivity()
 		await this.invalidateSnapshot(this.sessionId)
 	}
 
 	dispose() {
 		this.disposed = true
 		try {
+			this.permissionRequests.dispose()
 			this.unsubscribe?.()
 			this.unsubscribeCompaction?.()
 			this.agent.dispose?.()
 		} finally {
 			closeModelSessionResources(this.sessionId)
 		}
+	}
+
+	async permissionRequest(toolCallId) {
+		this.touch()
+		return await this.permissionRequests.describe(toolCallId)
+	}
+
+	async resolvePermission(toolCallId, decision, input = undefined) {
+		this.touch()
+		return await this.permissionRequests.resolve(toolCallId, decision, input)
 	}
 }

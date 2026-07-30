@@ -28,6 +28,22 @@ export function createWorkspaceClient(peer, config = {}) {
 		readSource: (path, maxBytes, callOptions = undefined) => call("preview.readSource", { path, maxBytes }, callOptions),
 		readProjectLog: (projectDir, name, maxBytes, callOptions = undefined) => call("preview.readProjectLog", { projectDir, name, maxBytes }, callOptions),
 		process: freezeNamespace({
+			describe: (executionRoot, cwd = ".") => {
+				if (!config.previewTransport?.describeProcess) throw new Error("Workspace host does not provide preview processes")
+				return config.previewTransport.describeProcess(executionRoot, cwd)
+			},
+			start: (id, params) => {
+				if (!config.previewTransport?.startProcess) throw new Error("Workspace host does not provide preview processes")
+				return config.previewTransport.startProcess(id, params)
+			},
+			touch: (id) => {
+				if (!config.previewTransport?.touchProcess) throw new Error("Workspace host does not provide preview processes")
+				return config.previewTransport.touchProcess(id)
+			},
+			stop: (id) => {
+				if (!config.previewTransport?.stopProcess) throw new Error("Workspace host does not provide preview processes")
+				return config.previewTransport.stopProcess(id)
+			},
 			allocatePort: (host) => {
 				if (!config.previewTransport?.allocatePort) throw new Error("Workspace host does not provide preview processes")
 				return config.previewTransport.allocatePort(host)
@@ -76,9 +92,13 @@ export function createWorkspaceClient(peer, config = {}) {
 		browseAvailable: config.projectWorkspace?.browseAvailable === true,
 		info: (cwd, callOptions = undefined) => call("project.info", { cwd }, callOptions),
 		setName: (cwd, name, callOptions = undefined) => call("project.setName", { cwd, name }, callOptions),
+		readIdentity: (cwd, callOptions = undefined) => call("project.readIdentity", { cwd }, callOptions),
+		ensureIdentity: (cwd, options = {}, callOptions = undefined) => call("project.ensureIdentity", { cwd, ...options }, callOptions),
 		resolveRoot: (baseRoot, requestedRoot = "", callOptions = undefined) => call("project.resolveRoot", { baseRoot, requestedRoot }, callOptions),
 		discover: (root, callOptions = undefined) => call("project.discover", { root }, callOptions),
 		add: (root, input, callOptions = undefined) => call("project.add", { root, input }, callOptions),
+		rename: (root, input, callOptions = undefined) => call("project.rename", { root, input }, callOptions),
+		delete: (root, input, callOptions = undefined) => call("project.delete", { root, input }, callOptions),
 	})
 	const files = freezeNamespace({
 		browseAvailable: typeof config.projectWorkspace?.fetch === "function",
@@ -109,6 +129,7 @@ export function createWorkspaceClient(peer, config = {}) {
 	})
 	const worktrees = freezeNamespace({
 		isLinked: (path, callOptions = undefined) => call("worktree.isLinked", { path }, callOptions),
+		location: (path, callOptions = undefined) => call("worktree.location", { path }, callOptions),
 		statuses: (records, options = {}, callOptions = undefined) => call("worktree.statuses", { records, ...(options.limit !== undefined ? { limit: options.limit } : {}) }, callOptions),
 		cleanup: (records, callOptions = undefined) => call("worktree.cleanup", { records }, callOptions),
 		close: (records, payload, workerContext = {}, callOptions = undefined) => call("worktree.close", { records, payload, workerContext }, callOptions),

@@ -1,10 +1,15 @@
 import { randomUUID } from "node:crypto"
 
+import { syncOperationTracer } from "../operation-tracing.js"
 import {
 	ensureSessionOverviewProjection,
 	recomputeSessionOverviewProjections,
 	updateSessionOverviewForAppendedEntry,
 } from "./session-overviews.js"
+import {
+	sessionEntryFromManifestRow,
+	sessionEntryManifestPayload,
+} from "./session-entry-manifest.js"
 import { normalizeLegacyEntryData, normalizeLegacyMetadata } from "./metadata-compatibility.js"
 
 /** @typedef {import("./types.js").SessionEntry} SessionEntry */
@@ -256,22 +261,80 @@ function assertSessionMutationAllowed(db, sessionId, expectedVersion, ownerRunId
 }
 
 function nextSessionSeq(db, sessionId) {
-	const row = db.prepare("SELECT COALESCE(MAX(seq) + 1, 0) AS seq FROM session_entry_refs WHERE session_id = ?").get(sessionId)
+	const row = db.prepare("SELECT COALESCE(MAX(seq) + 1, 0) AS seq FROM session_entries WHERE session_id = ?").get(sessionId)
 	return Number(row?.seq ?? 0)
 }
 
-const runUntraced = (_stage, task) => task()
-
 function storageTracer(diagnostics, operation, args) {
-	if (diagnostics?.enabled === false || typeof diagnostics?.span !== "function") return runUntraced
-	return (stage, task) => {
-		const end = diagnostics?.span?.(`SqliteSessionStorage.${operation}.${stage}`, args)
-		try {
-			return task()
-		} finally {
-			end?.()
-		}
+	return syncOperationTracer(diagnostics, `SqliteSessionStorage.${operation}`, args)
+}
+
+export function sessionStorageSnapshot(storage) {
+	const entries = storage.getEntries()
+	return {
+		metadata: storage.getMetadata(),
+		entries,
+		entryGlobalIds: entries.map((entry) => [entry.id, storage.getGlobalEntryId(entry.id)]),
+		leafId: storage.getLeafId(),
+		mutationVersion: storage.getMutationVersion(),
 	}
+}
+
+export function setSqliteSessionLeaf(db, request, diagnostics) {
+	const { sessionId, leafId, expectedMutationVersion, ownerRunId = null } = request
+	const trace = storageTracer(diagnostics, "setLeafId", { sessionId })
+	trace("begin", () => db.exec("BEGIN IMMEDIATE"))
+	try {
+		trace("guard", () => assertSessionMutationAllowed(db, sessionId, expectedMutationVersion, ownerRunId))
+		trace("updateSession", () => db.prepare(`
+			UPDATE sessions
+			SET active_leaf_entry_id = ?,
+				mutation_version = mutation_version + 1
+			WHERE id = ? AND deleted_at IS NULL
+		`).run(leafId, sessionId))
+		trace("updateOverview", () => recomputeSessionOverviewProjections(db, [sessionId]))
+		trace("commit", () => db.exec("COMMIT"))
+	} catch (error) {
+		trace("rollback", () => db.exec("ROLLBACK"))
+		throw error
+	}
+	return { mutationVersion: expectedMutationVersion + 1 }
+}
+
+export function appendSqliteSessionEntry(db, request, diagnostics) {
+	const {
+		sessionId,
+		entry,
+		expectedMutationVersion,
+		ownerRunId = null,
+		targetGlobalId,
+	} = request
+	const globalId = randomUUID()
+	const spanArgs = {
+		sessionId,
+		entryType: entry.type,
+		messageRole: entry.type === "message" ? entry.message.role : undefined,
+		customType: entry.type === "custom" ? entry.customType : undefined,
+	}
+	const trace = storageTracer(diagnostics, "appendEntry", spanArgs)
+	trace("begin", () => db.exec("BEGIN IMMEDIATE"))
+	try {
+		trace("guard", () => assertSessionMutationAllowed(db, sessionId, expectedMutationVersion, ownerRunId))
+		const seq = trace("sequence", () => nextSessionSeq(db, sessionId))
+		trace("insert", () => insertEntry(db, sessionId, seq, entry, { globalId, targetGlobalId }))
+		trace("updateSession", () => db.prepare(`
+			UPDATE sessions
+			SET active_leaf_entry_id = ?,
+				mutation_version = mutation_version + 1
+			WHERE id = ? AND deleted_at IS NULL
+		`).run(entry.id, sessionId))
+		trace("updateOverview", () => updateSessionOverviewForAppendedEntry(db, sessionId, entry, entry.id))
+		trace("commit", () => db.exec("COMMIT"))
+	} catch (error) {
+		trace("rollback", () => db.exec("ROLLBACK"))
+		throw error
+	}
+	return { globalId, mutationVersion: expectedMutationVersion + 1 }
 }
 
 export class SqliteSessionStorage {
@@ -300,28 +363,27 @@ export class SqliteSessionStorage {
 	static create(db, options) {
 		const createdAt = options.createdAt ?? new Date().toISOString()
 		const initialWd = typeof options.initialWd === "string" && options.initialWd ? options.initialWd : options.cwd
-		db.prepare(`
-			INSERT INTO sessions (id, cwd, initial_wd, name, created_at, updated_at, deleted_at, active_leaf_entry_id, active_leaf_global_id)
-			VALUES (?, ?, ?, NULL, ?, ?, NULL, NULL, NULL)
+		const trace = storageTracer(options.diagnostics, "create", { sessionId: options.sessionId })
+		trace("upsertSession", () => db.prepare(`
+			INSERT INTO sessions (id, cwd, initial_wd, name, created_at, updated_at, deleted_at, active_leaf_entry_id)
+			VALUES (?, ?, ?, NULL, ?, ?, NULL, NULL)
 			ON CONFLICT(id) DO UPDATE SET
 				cwd = excluded.cwd,
 				initial_wd = COALESCE(sessions.initial_wd, excluded.initial_wd),
 				created_at = COALESCE(sessions.created_at, excluded.created_at),
 				updated_at = excluded.updated_at,
 				deleted_at = NULL,
-				active_leaf_entry_id = COALESCE(sessions.active_leaf_entry_id, excluded.active_leaf_entry_id),
-				active_leaf_global_id = COALESCE(sessions.active_leaf_global_id, excluded.active_leaf_global_id)
-		`).run(options.sessionId, options.cwd, initialWd, createdAt, options.updatedAt ?? createdAt)
-		const row = db.prepare(`
-			SELECT
-				mutation_version AS mutationVersion,
-				active_leaf_entry_id AS activeLeafEntryId,
-				active_leaf_global_id AS activeLeafGlobalId
+				active_leaf_entry_id = COALESCE(sessions.active_leaf_entry_id, excluded.active_leaf_entry_id)
+		`).run(options.sessionId, options.cwd, initialWd, createdAt, options.updatedAt ?? createdAt))
+		const row = trace("metadata", () => db.prepare(`
+			SELECT mutation_version AS mutationVersion, active_leaf_entry_id AS activeLeafEntryId
 			FROM sessions
 			WHERE id = ?
-		`).get(options.sessionId)
-		if (row?.activeLeafEntryId || row?.activeLeafGlobalId) recomputeSessionOverviewProjections(db, [options.sessionId])
-		else ensureSessionOverviewProjection(db, options.sessionId)
+		`).get(options.sessionId))
+		trace("updateOverview", () => {
+			if (row?.activeLeafEntryId) recomputeSessionOverviewProjections(db, [options.sessionId])
+			else ensureSessionOverviewProjection(db, options.sessionId)
+		})
 		return new SqliteSessionStorage(db, {
 			id: options.sessionId,
 			createdAt,
@@ -332,55 +394,59 @@ export class SqliteSessionStorage {
 	static branchFrom(db, sourceSessionId, options = {}) {
 		const createdAt = options.createdAt ?? new Date().toISOString()
 		const targetSessionId = options.sessionId ?? randomUUID()
+		const trace = storageTracer(options.diagnostics, "branchFrom", {
+			sourceSessionId,
+			targetSessionId,
+		})
 		const hasSourceEntryId = Object.prototype.hasOwnProperty.call(options, "sourceEntryId") && options.sourceEntryId !== undefined
-		const source = db.prepare(`
-			SELECT id, cwd, active_leaf_entry_id AS activeLeafEntryId, active_leaf_global_id AS activeLeafGlobalId
+		const source = trace("source", () => db.prepare(`
+			SELECT id, cwd, active_leaf_entry_id AS activeLeafEntryId
 			FROM sessions
 			WHERE id = ? AND deleted_at IS NULL
-		`).get(sourceSessionId)
+		`).get(sourceSessionId))
 		if (!source) throw new Error(`Session not found: ${sourceSessionId}`)
 		const targetCwd = options.cwd ?? source.cwd
 		const targetInitialWd = typeof options.initialWd === "string" && options.initialWd ? options.initialWd : targetCwd
 		const sourceEntryId = hasSourceEntryId ? options.sourceEntryId : source.activeLeafEntryId
 		if (sourceEntryId !== null && sourceEntryId !== undefined && (typeof sourceEntryId !== "string" || !sourceEntryId)) throw new Error("sourceEntryId must be a non-empty string or null")
-		const sourceEntryGlobalIdStmt = db.prepare(`
-			SELECT ser.global_id AS globalId
-			FROM session_entry_refs ser
-			JOIN conversation_entries ce ON ce.global_id = ser.global_id
-			WHERE ser.session_id = ? AND ce.id = ?
-			LIMIT 1
-		`)
-		const sourceEntryGlobalIdFor = (entryId) => entryId
-			? sourceEntryGlobalIdStmt.get(sourceSessionId, entryId)?.globalId
-			: null
-		const sourceEntryGlobalId = hasSourceEntryId
-			? sourceEntryGlobalIdFor(sourceEntryId)
-			: source.activeLeafGlobalId ?? sourceEntryGlobalIdFor(source.activeLeafEntryId)
-		if (hasSourceEntryId && sourceEntryId && !sourceEntryGlobalId) throw new Error(`Entry not found in session ${sourceSessionId}: ${sourceEntryId}`)
-		const branch = sourceEntryGlobalId
-			? db.prepare(`
+		const branch = trace("entries", () => {
+			if (sourceEntryId && !db.prepare("SELECT 1 FROM session_entries WHERE session_id = ? AND entry_id = ?").get(sourceSessionId, sourceEntryId)) {
+				throw new Error(`Entry not found in session ${sourceSessionId}: ${sourceEntryId}`)
+			}
+			return sourceEntryId ? db.prepare(`
 				WITH RECURSIVE
-					branch(global_id, parent_global_id, depth) AS (
-						SELECT ce.global_id, ce.parent_global_id, 0
-						FROM conversation_entries ce
-						WHERE ce.global_id = ?
+					branch(entry_id, parent_entry_id, depth) AS (
+						SELECT entry_id, parent_entry_id, 0
+						FROM session_entries
+						WHERE session_id = ? AND entry_id = ?
 						UNION ALL
-						SELECT parent.global_id, parent.parent_global_id, branch.depth + 1
+						SELECT parent.entry_id, parent.parent_entry_id, branch.depth + 1
 						FROM branch
-						JOIN conversation_entries parent ON parent.global_id = branch.parent_global_id
+						JOIN session_entries parent
+							ON parent.session_id = ?
+							AND parent.entry_id = branch.parent_entry_id
 					)
-				SELECT branch.global_id AS globalId, ce.id, branch.depth
+				SELECT
+					se.global_id AS globalId,
+					se.entry_id AS id,
+					se.parent_entry_id AS parentEntryId,
+					se.timestamp,
+					se.kind,
+					se.manifest_json AS manifestJson,
+					branch.depth
 				FROM branch
-				JOIN conversation_entries ce ON ce.global_id = branch.global_id
+				JOIN session_entries se
+					ON se.session_id = ?
+					AND se.entry_id = branch.entry_id
 				ORDER BY branch.depth DESC
-			`).all(sourceEntryGlobalId)
+			`).all(sourceSessionId, sourceEntryId, sourceSessionId, sourceSessionId)
 			: []
+		})
 		const activeLeaf = branch.at(-1)
-		const activeLeafEntryId = activeLeaf?.id ?? (hasSourceEntryId ? null : source.activeLeafEntryId ?? null)
-		const activeLeafGlobalId = activeLeaf?.globalId ?? (hasSourceEntryId ? null : source.activeLeafGlobalId ?? null)
-		db.exec("BEGIN IMMEDIATE")
+		const activeLeafEntryId = activeLeaf?.id ?? null
+		trace("begin", () => db.exec("BEGIN IMMEDIATE"))
 		try {
-			db.prepare(`
+			trace("insertSession", () => db.prepare(`
 				INSERT INTO sessions (
 					id,
 					cwd,
@@ -390,13 +456,11 @@ export class SqliteSessionStorage {
 					updated_at,
 					deleted_at,
 					active_leaf_entry_id,
-					active_leaf_global_id,
 					branched_from_session_id,
 					branched_from_entry_id,
-					branched_from_entry_global_id,
 					branched_at
 				)
-				VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+				VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?)
 			`).run(
 				targetSessionId,
 				targetCwd,
@@ -404,21 +468,37 @@ export class SqliteSessionStorage {
 				createdAt,
 				createdAt,
 				activeLeafEntryId,
-				activeLeafGlobalId,
 				sourceSessionId,
 				activeLeafEntryId,
-				activeLeafGlobalId,
 				createdAt,
-			)
-			const insertRef = db.prepare("INSERT INTO session_entry_refs (session_id, global_id, seq) VALUES (?, ?, ?)")
-			branch.forEach((entry, seq) => insertRef.run(targetSessionId, entry.globalId, seq))
-			recomputeSessionOverviewProjections(db, [targetSessionId])
-			db.exec("COMMIT")
+			))
+			trace("copyEntries", () => {
+				const insertEntry = db.prepare(`
+					INSERT INTO session_entries (
+						session_id, seq, global_id, entry_id, parent_entry_id, timestamp, kind, manifest_json
+					)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+				`)
+				branch.forEach((entry, seq) => insertEntry.run(
+					targetSessionId,
+					seq,
+					entry.globalId,
+					entry.id,
+					entry.parentEntryId ?? null,
+					entry.timestamp,
+					entry.kind,
+					entry.manifestJson,
+				))
+			})
+			trace("updateOverview", () => recomputeSessionOverviewProjections(db, [targetSessionId]))
+			trace("commit", () => db.exec("COMMIT"))
 		} catch (err) {
-			db.exec("ROLLBACK")
+			trace("rollback", () => db.exec("ROLLBACK"))
 			throw err
 		}
-		return SqliteSessionStorage.open(db, targetSessionId, { diagnostics: options.diagnostics })
+		return SqliteSessionStorage.open(db, targetSessionId, {
+			diagnostics: options.diagnostics,
+		})
 	}
 
 	static open(db, sessionId, options = {}) {
@@ -431,7 +511,6 @@ export class SqliteSessionStorage {
 					cwd,
 					created_at AS createdAt,
 					active_leaf_entry_id AS activeLeafEntryId,
-					active_leaf_global_id AS activeLeafGlobalId,
 					mutation_version AS mutationVersion
 				FROM sessions
 				WHERE id = ? AND deleted_at IS NULL
@@ -441,20 +520,15 @@ export class SqliteSessionStorage {
 		const { entries, entryGlobalIds } = loaded
 		const activeLeaf = trace("resolveLeaf", () => {
 			const last = db.prepare(`
-				SELECT ce.id, ser.seq
-				FROM session_entry_refs ser
-				JOIN conversation_entries ce ON ce.global_id = ser.global_id
-				WHERE ser.session_id = ?
-				ORDER BY ser.seq DESC
+				SELECT entry_id AS id, seq
+				FROM session_entries
+				WHERE session_id = ?
+				ORDER BY seq DESC
 				LIMIT 1
 			`).get(sessionId)
-			const entryIdByGlobalId = new Map([...entryGlobalIds].map(([id, globalId]) => [globalId, id]))
 			let leaf = last?.id ?? null
 			if (row.activeLeafEntryId && entries.some((entry) => entry.id === row.activeLeafEntryId)) {
 				leaf = row.activeLeafEntryId
-			}
-			if (row.activeLeafGlobalId && entryIdByGlobalId.has(row.activeLeafGlobalId)) {
-				leaf = entryIdByGlobalId.get(row.activeLeafGlobalId)
 			}
 			return leaf
 		})
@@ -463,6 +537,45 @@ export class SqliteSessionStorage {
 			createdAt: row.createdAt,
 			cwd: row.cwd,
 		}, entries, entryGlobalIds, activeLeaf, Number(row.mutationVersion ?? 0), diagnostics)
+	}
+
+	static openManifest(db, sessionId, options = {}) {
+		const diagnostics = options.diagnostics
+		const trace = storageTracer(diagnostics, "openManifest", { sessionId })
+		const row = trace("metadata", () => db.prepare(`
+			SELECT
+				id,
+				cwd,
+				created_at AS createdAt,
+				active_leaf_entry_id AS activeLeafEntryId,
+				mutation_version AS mutationVersion
+			FROM sessions
+			WHERE id = ? AND deleted_at IS NULL
+		`).get(sessionId))
+		if (!row) throw new Error(`Session not found: ${sessionId}`)
+		const manifestRows = trace("entries", () => db.prepare(`
+			SELECT
+				seq,
+				global_id AS globalId,
+				entry_id AS entryId,
+				parent_entry_id AS parentEntryId,
+				timestamp,
+				kind,
+				manifest_json AS manifestJson
+			FROM session_entries
+			WHERE session_id = ?
+			ORDER BY seq ASC
+		`).all(sessionId))
+		const entries = manifestRows.map(sessionEntryFromManifestRow)
+		const entryGlobalIds = new Map(manifestRows.map((entry) => [entry.entryId, entry.globalId]))
+		const leafId = row.activeLeafEntryId && entryGlobalIds.has(row.activeLeafEntryId)
+				? row.activeLeafEntryId
+				: manifestRows.at(-1)?.entryId ?? null
+		return new SqliteSessionStorage(db, {
+			id: row.id,
+			createdAt: row.createdAt,
+			cwd: row.cwd,
+		}, entries, entryGlobalIds, leafId, Number(row.mutationVersion ?? 0), diagnostics)
 	}
 
 	getMetadata() {
@@ -476,26 +589,14 @@ export class SqliteSessionStorage {
 	}
 	setLeafId(id, options = {}) {
 		if (id !== null && !this.#byId.has(id)) throw new Error(`Entry ${id} not found`)
-		const globalId = id === null ? null : this.#globalById.get(id)
-		const ownerRunId = mutationOwnerRunId(options)
-		this.#db.exec("BEGIN IMMEDIATE")
-		try {
-			assertSessionMutationAllowed(this.#db, this.#metadata.id, this.#mutationVersion, ownerRunId)
-			this.#db.prepare(`
-				UPDATE sessions
-				SET active_leaf_entry_id = ?,
-					active_leaf_global_id = ?,
-					mutation_version = mutation_version + 1
-				WHERE id = ? AND deleted_at IS NULL
-			`).run(id, globalId ?? null, this.#metadata.id)
-			recomputeSessionOverviewProjections(this.#db, [this.#metadata.id])
-			this.#db.exec("COMMIT")
-		} catch (err) {
-			this.#db.exec("ROLLBACK")
-			throw err
-		}
+		const result = setSqliteSessionLeaf(this.#db, {
+			sessionId: this.#metadata.id,
+			leafId: id,
+			expectedMutationVersion: this.#mutationVersion,
+			ownerRunId: mutationOwnerRunId(options),
+		}, this.#diagnostics)
 		this.#leafId = id
-		this.#mutationVersion += 1
+		this.#mutationVersion = result.mutationVersion
 	}
 	createEntryId() {
 		return shortId(this.#byId)
@@ -520,54 +621,26 @@ export class SqliteSessionStorage {
 	}
 
 	async appendEntry(entry, options = {}) {
-		const globalId = randomUUID()
-		const parentGlobalId = entry.parentId ? this.#globalById.get(entry.parentId) : null
-		if (entry.parentId && !parentGlobalId) throw new Error(`Parent entry ${entry.parentId} not found`)
+		if (entry.parentId && !this.#byId.has(entry.parentId)) throw new Error(`Parent entry ${entry.parentId} not found`)
 		const targetGlobalId = entry.type === "label" ? this.#globalById.get(entry.targetId) : undefined
 		if (entry.type === "label" && !targetGlobalId) throw new Error(`Entry ${entry.targetId} not found`)
-		const ownerRunId = mutationOwnerRunId(options)
-		const spanArgs = {
+		const result = appendSqliteSessionEntry(this.#db, {
 			sessionId: this.#metadata.id,
-			entryType: entry.type,
-			messageRole: entry.type === "message" ? entry.message.role : undefined,
-			customType: entry.type === "custom" ? entry.customType : undefined,
-		}
-		const trace = storageTracer(this.#diagnostics, "appendEntry", spanArgs)
-		trace("begin", () => this.#db.exec("BEGIN IMMEDIATE"))
-		try {
-			trace("guard", () => {
-				assertSessionMutationAllowed(this.#db, this.#metadata.id, this.#mutationVersion, ownerRunId)
-			})
-			const seq = trace("sequence", () => nextSessionSeq(this.#db, this.#metadata.id))
-			trace("insert", () => {
-				insertEntry(this.#db, this.#metadata.id, seq, entry, { globalId, parentGlobalId, targetGlobalId })
-			})
-			trace("updateSession", () => this.#db.prepare(`
-					UPDATE sessions
-					SET active_leaf_entry_id = ?,
-						active_leaf_global_id = ?,
-						mutation_version = mutation_version + 1
-					WHERE id = ? AND deleted_at IS NULL
-				`)
-				.run(entry.id, globalId, this.#metadata.id))
-			trace("updateOverview", () => {
-				updateSessionOverviewForAppendedEntry(this.#db, this.#metadata.id, entry, entry.id)
-			})
-			trace("commit", () => this.#db.exec("COMMIT"))
-		} catch (err) {
-			trace("rollback", () => this.#db.exec("ROLLBACK"))
-			throw err
-		}
+			entry,
+			expectedMutationVersion: this.#mutationVersion,
+			ownerRunId: mutationOwnerRunId(options),
+			targetGlobalId,
+		}, this.#diagnostics)
 		this.#entries.push(entry)
 		this.#byId.set(entry.id, entry)
-		this.#globalById.set(entry.id, globalId)
+		this.#globalById.set(entry.id, result.globalId)
 		if (entry.type === "label") {
 			const trimmed = entry.label?.trim()
 			if (trimmed) this.#labels.set(entry.targetId, trimmed)
 			else this.#labels.delete(entry.targetId)
 		}
 		this.#leafId = entry.id
-		this.#mutationVersion += 1
+		this.#mutationVersion = result.mutationVersion
 	}
 
 	getPathToRoot(leafId) {
@@ -602,6 +675,43 @@ const MESSAGE_COLUMNS_SQL = `
 	em.extra_json AS extraJson
 `
 
+const MANIFEST_MESSAGE_COLUMNS_SQL = `
+	em.global_id AS globalId,
+	em.role,
+	em.content_format AS contentFormat,
+	em.timestamp,
+	em.provider,
+	em.model,
+	em.auth_json AS authJson,
+	em.response_model AS responseModel,
+	em.response_id AS responseId,
+	em.model_request_id AS modelRequestId,
+	em.stop_reason AS stopReason,
+	em.error_message AS errorMessage,
+	em.tool_call_id AS toolCallId,
+	em.tool_name AS toolName,
+	em.is_error AS isError,
+	CASE WHEN em.role = 'toolResult' AND COALESCE(em.is_error, 0) = 0 THEN NULL ELSE em.details_json END AS detailsJson,
+	em.extra_json AS extraJson
+`
+
+const MANIFEST_DEFERRED_MESSAGE_CONTENT_SQL = `
+	(
+		em.role = 'toolResult'
+		AND COALESCE(em.is_error, 0) = 0
+	)
+	OR (
+		em.extra_json IS NOT NULL
+		AND json_valid(em.extra_json)
+		AND (
+			COALESCE(json_extract(em.extra_json, '$.projectContext'), 0) = 1
+			OR COALESCE(json_extract(em.extra_json, '$.hidden'), json_extract(em.extra_json, '$.pinanoHidden'), 0) = 1
+			OR COALESCE(json_extract(em.extra_json, '$.compactionMemento'), json_extract(em.extra_json, '$.pinanoCompactionMemento'), 0) = 1
+			OR COALESCE(json_extract(em.extra_json, '$.compactionSummary'), json_extract(em.extra_json, '$.pinanoCompactionSummary'), 0) = 1
+		)
+	)
+`
+
 const MESSAGE_BLOCK_COLUMNS_SQL = `
 	emb.ordinal,
 	emb.type,
@@ -633,6 +743,18 @@ const MESSAGE_BLOCK_COLUMNS_SQL = `
 	emb.payload_json AS payloadJson
 `
 
+const MANIFEST_CUSTOM_ENTRY_DATA_COLUMNS_SQL = `
+	CASE
+		WHEN ece.custom_type IN ('config', 'session_global_config', 'session_properties', 'project_location_changed', 'bash_shortcut', 'plan_update') THEN ece.data_json
+		WHEN ece.custom_type = 'compaction' AND json_valid(ece.data_json) THEN json_object(
+			'cutEntryId', json_extract(ece.data_json, '$.cutEntryId'),
+			'displayMessage', json_extract(ece.data_json, '$.displayMessage')
+		)
+		WHEN ece.custom_type = 'tool_execution' THEN ece.data_json
+		ELSE NULL
+	END AS dataJson
+`
+
 const USAGE_COLUMNS_SQL = `
 	eu.global_id AS globalId,
 	eu.input_tokens AS input,
@@ -652,23 +774,7 @@ const USAGE_COLUMNS_SQL = `
 	eu.raw_json AS rawJson
 `
 
-const CUSTOM_ENTRY_DATA_COLUMNS_SQL = `
-	CASE
-		WHEN ece.custom_type != 'tool_execution' THEN ece.data_json
-		WHEN NOT json_valid(ece.data_json) THEN ece.data_json
-		WHEN COALESCE(json_extract(ece.data_json, '$.phase'), '') != 'ended' THEN ece.data_json
-		ELSE NULL
-	END AS dataJson,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) THEN json_extract(ece.data_json, '$.version') END AS customVersion,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) THEN json_extract(ece.data_json, '$.phase') END AS customPhase,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) THEN json_extract(ece.data_json, '$.runId') END AS customRunId,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) THEN json_extract(ece.data_json, '$.toolCallId') END AS customToolCallId,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) THEN json_extract(ece.data_json, '$.toolName') END AS customToolName,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) THEN json_extract(ece.data_json, '$.isError') END AS customIsError,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) THEN json_extract(ece.data_json, '$.messageEntryId') END AS customMessageEntryId,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) THEN json_extract(ece.data_json, '$.hasDurableMessage') END AS customHasDurableMessage,
-	CASE WHEN ece.custom_type = 'tool_execution' AND json_valid(ece.data_json) AND json_type(ece.data_json, '$.message') IS NOT NULL THEN 1 ELSE 0 END AS customHasRecoveryMessage
-`
+const CUSTOM_ENTRY_DATA_COLUMNS_SQL = "ece.data_json AS dataJson"
 
 function groupedRowsByGlobalId(rows) {
 	return rows.reduce((groups, row) => {
@@ -683,40 +789,32 @@ function rowsByGlobalId(rows) {
 	return new Map(rows.map((row) => [row.globalId, row]))
 }
 
-// Session refs point throughout global entry tables. Resolve rowids through their indexes first, then read payload rows in physical order so cold opens do not become thousands of random table-page reads.
+// Session rows point throughout global entry tables. Resolve rowids through their indexes first, then read payload rows in physical order so full-payload opens do not become thousands of random table-page reads.
 function selectedEntryRowIdsSql(table, condition = "") {
 	return `
 		SELECT selected.rowid
-		FROM session_entry_refs ser
+		FROM session_entries ser
 		JOIN ${table} selected ON selected.global_id = ser.global_id
 		WHERE ser.session_id = ? ${condition}
 	`
 }
 
-function loadEntries(db, sessionId) {
+export function loadEntries(db, sessionId, options = {}) {
+	const manifestOnly = options.manifestOnly === true
 	const refs = db.prepare(`
-		SELECT global_id AS globalId
-		FROM session_entry_refs
-		WHERE session_id = ?
-		ORDER BY seq ASC
-	`).all(sessionId)
-	const entryRows = rowsByGlobalId(db.prepare(`
 		SELECT
-			ce.global_id AS globalId,
-			ce.id,
-			ce.parent_global_id AS parentGlobalId,
-			ce.timestamp AS entryTimestamp,
-			ce.kind AS entryType
-		FROM conversation_entries ce
-		WHERE ce.rowid IN (${selectedEntryRowIdsSql("conversation_entries")})
-		ORDER BY ce.rowid ASC
-	`).all(sessionId))
-	const rows = refs.map((ref) => entryRows.get(ref.globalId)).filter(Boolean).map((row) => ({
-		...row,
-		parentId: row.parentGlobalId ? entryRows.get(row.parentGlobalId)?.id : null,
-	}))
+			ser.global_id AS globalId,
+			ser.entry_id AS id,
+			ser.parent_entry_id AS parentId,
+			ser.timestamp AS entryTimestamp,
+			ser.kind AS entryType
+		FROM session_entries ser
+		WHERE ser.session_id = ?
+		ORDER BY ser.seq ASC
+	`).all(sessionId)
+	const rows = refs.map((row) => ({ ...row, parentId: row.parentId ?? null }))
 	const messages = rowsByGlobalId(db.prepare(`
-		SELECT ${MESSAGE_COLUMNS_SQL}
+		SELECT ${manifestOnly ? MANIFEST_MESSAGE_COLUMNS_SQL : MESSAGE_COLUMNS_SQL}
 		FROM entry_messages em
 		WHERE em.rowid IN (${selectedEntryRowIdsSql("entry_messages")})
 		ORDER BY em.rowid ASC
@@ -726,17 +824,18 @@ function loadEntries(db, sessionId) {
 			emb.global_id AS globalId,
 			emb.ordinal,
 			emb.type,
-			emb.text,
+			${manifestOnly ? `CASE WHEN ${MANIFEST_DEFERRED_MESSAGE_CONTENT_SQL} THEN NULL ELSE emb.text END` : "emb.text"} AS text,
 			emb.text_signature AS textSignature,
-			emb.thinking,
+			${manifestOnly ? "NULL" : "emb.thinking"} AS thinking,
 			emb.thinking_signature AS thinkingSignature,
 			emb.redacted,
 			emb.tool_call_id AS toolCallId,
 			emb.tool_name AS toolName,
 			emb.tool_args_json AS toolArgsJson,
 			emb.tool_input AS toolInput,
-			emb.payload_json AS payloadJson
+			${manifestOnly ? `CASE WHEN ${MANIFEST_DEFERRED_MESSAGE_CONTENT_SQL} THEN NULL ELSE emb.payload_json END` : "emb.payload_json"} AS payloadJson
 		FROM entry_message_blocks emb
+		${manifestOnly ? "LEFT JOIN entry_messages em ON em.global_id = emb.global_id" : ""}
 		WHERE emb.rowid IN (${selectedEntryRowIdsSql("entry_message_blocks", "AND selected.type != 'image'")})
 		ORDER BY emb.rowid ASC
 	`).all(sessionId)
@@ -758,14 +857,17 @@ function loadEntries(db, sessionId) {
 		ORDER BY eu.rowid ASC
 	`).all(sessionId))
 	const labels = rowsByGlobalId(db.prepare(`
-		SELECT el.global_id AS globalId, target.id AS targetId, el.label
-		FROM entry_labels el
-		JOIN conversation_entries target ON target.global_id = el.target_global_id
-		WHERE el.rowid IN (${selectedEntryRowIdsSql("entry_labels")})
-		ORDER BY el.rowid ASC
+		SELECT el.global_id AS globalId, target.entry_id AS targetId, el.label
+		FROM session_entries source
+		JOIN entry_labels el ON el.global_id = source.global_id
+		JOIN session_entries target
+			ON target.session_id = source.session_id
+			AND target.global_id = el.target_global_id
+		WHERE source.session_id = ?
+		ORDER BY source.seq ASC
 	`).all(sessionId))
 	const customEntries = rowsByGlobalId(db.prepare(`
-		SELECT ece.global_id AS globalId, ece.custom_type AS customType, ${CUSTOM_ENTRY_DATA_COLUMNS_SQL}
+		SELECT ece.global_id AS globalId, ece.custom_type AS customType, ${manifestOnly ? MANIFEST_CUSTOM_ENTRY_DATA_COLUMNS_SQL : CUSTOM_ENTRY_DATA_COLUMNS_SQL}
 		FROM entry_custom_entries ece
 		WHERE ece.rowid IN (${selectedEntryRowIdsSql("entry_custom_entries")})
 		ORDER BY ece.rowid ASC
@@ -782,61 +884,17 @@ function loadEntries(db, sessionId) {
 		ORDER BY ecl.rowid ASC
 	`).all(sessionId))
 	const contextFiles = groupedRowsByGlobalId(db.prepare(`
-		SELECT ecf.global_id AS globalId, ecf.ordinal, ecf.path, ecf.scope_dir AS scopeDir, ecf.identity_path AS identityPath, ecf.content, ecf.hash
+		SELECT ecf.global_id AS globalId, ecf.ordinal, ecf.path, ecf.scope_dir AS scopeDir, ecf.identity_path AS identityPath, ${manifestOnly ? "NULL" : "ecf.content"} AS content, ecf.hash
 		FROM entry_context_files ecf
 		WHERE ecf.rowid IN (${selectedEntryRowIdsSql("entry_context_files")})
 		ORDER BY ecf.rowid ASC
 	`).all(sessionId))
 	contextFiles.forEach((files) => files.sort((a, b) => a.ordinal - b.ordinal))
-	const recoveryMessageStmt = db.prepare(`
-		SELECT CASE WHEN json_valid(data_json) THEN json_extract(data_json, '$.message') END AS messageJson
-		FROM entry_custom_entries
-		WHERE global_id = ?
-	`)
-	const data = { messages, messageBlocks, usage, labels, customEntries, contextLoads, contextFiles, recoveryMessageStmt }
-	const entryGlobalIds = new Map(rows.map((row) => [row.id, row.globalId]))
-	return { entries: rows.map((row) => entryFromRows(row, data)), entryGlobalIds }
-}
-
-function withDefined(object, key, value) {
-	if (value !== null && value !== undefined) object[key] = value
-	return object
-}
-
-function defineLazyJsonField(object, key, loadText) {
-	let loaded = false
-	let value
-	Object.defineProperty(object, key, {
-		enumerable: true,
-		configurable: true,
-		get() {
-			if (!loaded) {
-				value = parseJson(loadText())
-				loaded = true
-			}
-			return value
-		},
-	})
-	return object
-}
-
-function toolExecutionDataFromRow(row, loadRecoveryMessage) {
-	if (!row) return undefined
-	if (row.dataJson !== null && row.dataJson !== undefined) return parseJson(row.dataJson)
-	const data = {}
-	withDefined(data, "version", row.customVersion)
-	withDefined(data, "phase", row.customPhase)
-	withDefined(data, "runId", row.customRunId)
-	withDefined(data, "toolCallId", row.customToolCallId)
-	withDefined(data, "toolName", row.customToolName)
-	if (row.customIsError !== null && row.customIsError !== undefined) data.isError = intToBool(row.customIsError)
-	withDefined(data, "messageEntryId", row.customMessageEntryId)
-	if (row.customHasDurableMessage !== null && row.customHasDurableMessage !== undefined) data.hasDurableMessage = intToBool(row.customHasDurableMessage)
-	if (row.customHasRecoveryMessage) {
-		data.hasRecoveryMessage = true
-		defineLazyJsonField(data, "message", loadRecoveryMessage)
+	const data = { messages, messageBlocks, usage, labels, customEntries, contextLoads, contextFiles }
+	return {
+		entries: rows.map((row) => entryFromRows(row, data)),
+		entryGlobalIds: new Map(rows.map((row) => [row.id, row.globalId])),
 	}
-	return data
 }
 
 function contextLoadFromRow(row, files) {
@@ -868,10 +926,7 @@ function entryFromRows(row, data) {
 	if (row.entryType === "custom") {
 		const custom = data.customEntries.get(row.globalId)
 		const customType = custom?.customType ?? "unknown"
-		const loadRecoveryMessage = () => data.recoveryMessageStmt.get(row.globalId)?.messageJson
-		const customData = normalizeLegacyEntryData(customType === "tool_execution"
-			? toolExecutionDataFromRow(custom, loadRecoveryMessage)
-			: parseJson(custom?.dataJson))
+		const customData = normalizeLegacyEntryData(parseJson(custom?.dataJson))
 		return withContextLoad({ ...base, type: "custom", customType, data: customData })
 	}
 	if (row.entryType === "context") return { ...base, type: "context", contextLoad: contextLoad ?? { source: "unknown", files: [] } }
@@ -962,14 +1017,45 @@ export function loadMessage(db, globalId) {
 	return messageFromRow(row, blockRows, usageRow)
 }
 
+export function loadTranscriptMessages(db, sessionId, entryIds) {
+	if (!Array.isArray(entryIds) || entryIds.length === 0) return []
+	const placeholders = entryIds.map(() => "?").join(", ")
+	const rows = db.prepare(`
+		SELECT
+			se.entry_id AS entryId,
+			se.global_id AS globalId
+		FROM session_entries se
+		WHERE se.session_id = ?
+			AND se.kind = 'message'
+			AND se.entry_id IN (${placeholders})
+	`).all(sessionId, ...entryIds)
+	const byEntryId = new Map(rows.map((row) => [row.entryId, loadMessage(db, row.globalId)]))
+	return entryIds.flatMap((entryId) => byEntryId.has(entryId)
+		? [{ entryId, message: byEntryId.get(entryId) }]
+		: [])
+}
+
 export function insertEntry(db, sessionId, seq, entry, ids) {
 	db.prepare(`
-		INSERT INTO conversation_entries (global_id, id, parent_global_id, created_by_session_id, timestamp, kind)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`).run(ids.globalId, entry.id, ids.parentGlobalId ?? null, sessionId, entry.timestamp, entryKind(entry))
-	db.prepare("INSERT INTO session_entry_refs (session_id, global_id, seq) VALUES (?, ?, ?)")
-		.run(sessionId, ids.globalId, seq)
-	if (entry.type === "message") insertMessage(db, ids.globalId, entry.message)
+		INSERT INTO entries (global_id)
+		VALUES (?)
+	`).run(ids.globalId)
+	db.prepare(`
+		INSERT INTO session_entries (
+			session_id, seq, global_id, entry_id, parent_entry_id, timestamp, kind, manifest_json
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`).run(
+		sessionId,
+		seq,
+		ids.globalId,
+		entry.id,
+		entry.parentId ?? null,
+		entry.timestamp,
+		entryKind(entry),
+		JSON.stringify(sessionEntryManifestPayload(entry)),
+	)
+	if (entry.type === "message") insertStoredMessage(db, ids.globalId, entry.message)
 	else if (entry.type === "label") {
 		db.prepare("INSERT INTO entry_labels (global_id, target_global_id, label) VALUES (?, ?, ?)")
 			.run(ids.globalId, ids.targetGlobalId, entry.label ?? null)
@@ -994,7 +1080,7 @@ function insertContextLoad(db, globalId, load) {
 	})
 }
 
-function insertMessage(db, globalId, message) {
+export function insertStoredMessage(db, globalId, message) {
 	const usage = message?.usage
 	db.prepare(`
 		INSERT INTO entry_messages (

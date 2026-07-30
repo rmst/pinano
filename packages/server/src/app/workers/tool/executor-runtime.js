@@ -1,15 +1,16 @@
 import { createHash } from "node:crypto"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { markUncertainToolExecution } from "../../../agent-core/tool-errors.js"
+import { availableHostProxyToolNames } from "../../../proxy-tools/registry.js"
 import { PROCESS_SESSION_IDLE_TTL_MS } from "../../../tools/process-session-limits.js"
 import { loadEnvironmentRegistry, resolveExecutionEnvironment, resolveSessionWd } from "../../environment/registry.js"
 import { recordFileCheckpoint } from "../../session/file-checkpoints.js"
 import { JsonLineRpc } from "../../json-rpc-lines.js"
 import { optionalSessionWorkspacePath } from "../../paths.js"
 import { stateMountFromSettings } from "../../settings.js"
-import { sandboxWithSessionMounts, sessionSandboxBaseWd, sessionSandboxMounts } from "../../session/config.js"
+import { sandboxMountsForRuntime, sandboxWithSessionMounts, sessionSandboxBaseWd, sessionSandboxMounts } from "../../session/config.js"
 import { getEffectiveSessionProperties } from "../../session/properties.js"
 import { ManagedContainerPreviewProcess, createWorkerLauncher } from "../launchers.js"
 import { WORKER_PROTOCOL_VERSION, assertWorkerProtocolVersion } from "../protocol.js"
@@ -21,9 +22,9 @@ const DEFAULT_IDLE_WORKER_TTL_MS = 60 * 1000
 const DEFAULT_IDLE_WORKER_RECHECK_MS = 60 * 1000
 const PROCESS_SESSION_BACKGROUND_GRACE_MS = 30 * 1000
 
-function sandboxBaseWdForSession(session, fallbackCwd) {
+function sandboxBaseWdForSession(session, props, fallbackCwd) {
 	const config = session?.getSessionConfig?.() ?? {}
-	return sessionSandboxBaseWd(config, session?.getMetadata?.()?.cwd ?? fallbackCwd)
+	return sessionSandboxBaseWd(config, props?.projectDir, session?.getMetadata?.()?.cwd ?? fallbackCwd)
 }
 
 const delay = (ms, value) => new Promise((resolve) => setTimeout(() => resolve(value), ms))
@@ -63,6 +64,7 @@ class ToolWorkerConnection {
 	 * @param {string | undefined} options.sessionDir
 	 * @param {string | undefined} options.sessionId
 	 * @param {string | undefined} options.previewAccessToken
+	 * @param {Promise<string[]>} options.proxyTools
 	 * @param {any} options.launcher
 	 * @param {string} options.workerPath
 	 * @param {() => import("../../../session-manager/session.js").Session | null | undefined} options.getSession
@@ -92,13 +94,15 @@ class ToolWorkerConnection {
 		this.pendingToolUpdates = new Map()
 		this.codeModeCells = new Map()
 		this.exitPromise = Promise.resolve(undefined)
-		this.ready = this.startWorker()
-			.then(() => {
+		this.proxyTools = Promise.resolve(options.proxyTools)
+		this.ready = Promise.all([this.startWorker(), this.proxyTools])
+			.then(([, proxyTools]) => {
 				if (this.dead) throw new Error("Tool executor was disposed before init")
 				return this.initWorker({
 					protocolVersion: WORKER_PROTOCOL_VERSION,
 					cwd: this.startCwd,
 					previewAccessToken: this.previewAccessToken,
+					proxyTools,
 				})
 			})
 			.then((result) => {
@@ -435,6 +439,7 @@ export class ToolExecutorRuntime {
 	 * @param {() => any} [options.getSettings]
 	 * @param {import("../../workspace/client.js").WorkspaceClient} [options.workspace]
 	 * @param {string} [options.previewAccessToken]
+	 * @param {(env?: Record<string, string | undefined>) => Promise<string[]>} [options.detectHostProxyTools]
 	 * @param {number} [options.idleWorkerTtlMs]
 	 * @param {number} [options.idleWorkerRecheckMs]
 	 * @param {number} [options.idleWorkerInspectTimeoutMs]
@@ -450,6 +455,7 @@ export class ToolExecutorRuntime {
 		this.getSettings = options.getSettings
 		this.workspace = options.workspace
 		this.previewAccessToken = options.previewAccessToken
+		this.detectHostProxyTools = options.detectHostProxyTools ?? availableHostProxyToolNames
 		this.idleWorkerTtlMs = nonNegativeFiniteMs(options.idleWorkerTtlMs, DEFAULT_IDLE_WORKER_TTL_MS, "idleWorkerTtlMs")
 		this.idleWorkerRecheckMs = nonNegativeFiniteMs(options.idleWorkerRecheckMs, Math.min(DEFAULT_IDLE_WORKER_RECHECK_MS, Math.max(1000, this.idleWorkerTtlMs || 1000)), "idleWorkerRecheckMs")
 		this.idleWorkerInspectTimeoutMs = nonNegativeFiniteMs(options.idleWorkerInspectTimeoutMs, DEFAULT_WORKER_INSPECT_TIMEOUT_MS, "idleWorkerInspectTimeoutMs")
@@ -485,8 +491,8 @@ export class ToolExecutorRuntime {
 		const effectiveProps = environmentId ? { ...(props ?? {}), environmentId } : props
 		const target = resolveExecutionEnvironment(effectiveProps, this.cwd, registry)
 		const config = session?.getSessionConfig?.() ?? {}
-		const sandbox = sandboxWithSessionMounts(target.sandbox, sessionSandboxMounts(config))
-		const sessionWd = resolveSessionWd(effectiveProps, sandboxBaseWdForSession(session, this.cwd), registry)
+		const sandbox = sandboxWithSessionMounts(target.sandbox, sandboxMountsForRuntime(sessionSandboxMounts(config), target.target?.type === "local" ? effectiveProps?.cwd : undefined), effectiveProps?.projectDir)
+		const sessionWd = resolveSessionWd(effectiveProps, sandboxBaseWdForSession(session, effectiveProps, this.cwd), registry)
 		const sessionId = session?.getMetadata?.()?.id
 		const sessionDir = target.target?.type === "local" ? optionalSessionWorkspacePath(sessionId) : undefined
 		const stateMount = stateMountFromSettings(this.getSettings?.())
@@ -498,6 +504,32 @@ export class ToolExecutorRuntime {
 		const session = this.getSession()
 		const props = session ? getEffectiveSessionProperties(session) : undefined
 		return this.resolveTargetFor(session, props, registry)
+	}
+
+	resolvePreviewTarget(executionRoot) {
+		if (typeof executionRoot !== "string" || !executionRoot) throw new Error("Preview execution root is required")
+		const root = resolve(executionRoot)
+		const registry = this.environmentRegistry?.() ?? loadEnvironmentRegistry()
+		const target = this.resolveTargetFor(undefined, {
+			environmentId: registry.default,
+			cwd: root,
+			projectDir: root,
+		}, registry)
+		return {
+			...target,
+			sessionDir: undefined,
+			sessionId: undefined,
+			workerScope: `preview:${root}`,
+		}
+	}
+
+	describePreviewProcess(executionRoot, cwd = ".") {
+		const target = this.resolvePreviewTarget(executionRoot)
+		return {
+			executionRoot: resolve(executionRoot),
+			environmentId: target.environmentId,
+			cwd: resolve(target.cwd, cwd),
+		}
 	}
 
 	workerKey(target) {
@@ -590,7 +622,7 @@ export class ToolExecutorRuntime {
 	}
 
 	async workerFor(target, key = this.workerKey(target)) {
-		let startCwd = target.cwd
+		let startCwd = target.sessionDir ?? target.cwd
 		if (target.sandbox?.type && target.sandbox.type !== "none") {
 			if (!this.startCwds.has(key)) this.startCwds.set(key, target.sandbox?.useSessionWd === false ? undefined : target.sessionWd ?? target.cwd)
 			startCwd = this.startCwds.get(key)
@@ -606,6 +638,9 @@ export class ToolExecutorRuntime {
 			existing.dispose()
 			this.removeWorker(key, existing, { clearLastWorker: this.lastWorker === existing })
 		}
+		const proxyTools = Promise.resolve(this.detectHostProxyTools(process.env)).then((names) => this.getSettings?.()?.web === true
+			? names
+			: names.filter((name) => name !== "gh"))
 		const worker = new ToolWorkerConnection({
 			environmentId: target.environmentId,
 			target: target.target,
@@ -617,6 +652,7 @@ export class ToolExecutorRuntime {
 			launcher: this.fixedWorkerLauncher ?? createWorkerLauncher({ target: target.target, sandbox: target.sandbox, stateMount: target.stateMount }),
 			workerPath: this.workerPath,
 			previewAccessToken: this.previewAccessToken,
+			proxyTools,
 			getSession: this.getSession,
 			codeModeApiRequest: this.codeModeApiRequest,
 		})
@@ -625,6 +661,7 @@ export class ToolExecutorRuntime {
 		try {
 			await worker.ready
 		} catch (err) {
+			worker.dispose()
 			this.removeWorker(key, worker, { clearLastWorker: true })
 			throw err
 		}
@@ -769,10 +806,10 @@ export class ToolExecutorRuntime {
 
 	assertPreviewTargetSupported(target) {
 		if (target.target?.type !== "local") {
-			throw Object.assign(new Error("Session previews currently require a local worker environment"), { status: 501 })
+			throw Object.assign(new Error("Process previews require a local worker environment"), { status: 501 })
 		}
 		if (target.sandbox?.type === "container" && target.sandbox?.container) {
-			throw Object.assign(new Error("Session previews require a Cerex-managed container, local, or native worker environment"), { status: 501 })
+			throw Object.assign(new Error("Process previews require a Cerex-managed container, local, or native worker environment"), { status: 501 })
 		}
 	}
 
@@ -787,8 +824,6 @@ export class ToolExecutorRuntime {
 			id,
 			baseCwd: target.cwd,
 			sessionWd: target.sessionWd,
-			sessionDir: target.sessionDir,
-			sessionId: target.sessionId,
 			environmentId: target.environmentId,
 			sandbox: target.sandbox,
 			stateMount: target.stateMount,
@@ -802,20 +837,24 @@ export class ToolExecutorRuntime {
 
 	async startPreviewProcess(id, params) {
 		if (this.disposed) throw new Error("Tool executor is not running")
-		const target = this.resolveTarget()
+		const { executionRoot, ...processParams } = params
+		const target = this.resolvePreviewTarget(executionRoot)
 		this.assertPreviewTargetSupported(target)
-		if (target.sandbox?.type === "container") return await this.startManagedContainerPreview(id, params, target)
+		if (target.sandbox?.type === "container") {
+			const result = await this.startManagedContainerPreview(id, processParams, target)
+			return { ...this.describePreviewProcess(executionRoot, processParams.cwd), ...result }
+		}
 		const key = this.workerKey(target)
 		const worker = await this.workerFor(target, key)
 		this.clearWorkerIdleTimer(key)
 		try {
 			const result = await worker.startPreviewProcess({
-				...params,
+				...processParams,
 				id,
 				baseCwd: target.cwd,
 			})
 			if (result?.running !== false) this.knownPreviewProcesses.set(workerPreviewProcessKey(key, id), Date.now())
-			return result
+			return { ...this.describePreviewProcess(executionRoot, processParams.cwd), ...result }
 		} finally {
 			if (!this.disposed && this.workers.get(key) === worker && !worker.dead) this.scheduleWorkerIdleCheck(key, worker)
 		}

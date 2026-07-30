@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto"
 
 import { Session } from "./session.js"
 import { MemorySessionStorage } from "./storage-memory.js"
+import { PersistenceSessionStorage } from "./storage-persistence.js"
 import { SqliteSessionStorage } from "./storage-sqlite.js"
 
-export { Session, MemorySessionStorage, SqliteSessionStorage }
+export { Session, MemorySessionStorage, PersistenceSessionStorage, SqliteSessionStorage }
 export * from "./bash-shortcut-entry.js"
 export { contextLoadDisplayFiles, contextLoadDisplayMessage, contextLoadDisplayText, contextLoadPathsFromMessage } from "./context-display.js"
 

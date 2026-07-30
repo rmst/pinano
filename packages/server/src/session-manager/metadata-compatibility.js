@@ -18,36 +18,11 @@ const LEGACY_FIELD_NAMES = Object.freeze({
 	pinanoBranchNotice: "branchNotice",
 })
 
-function cloneWithDescriptors(value) {
-	return Object.create(Object.getPrototypeOf(value), Object.getOwnPropertyDescriptors(value))
-}
-
-function cloneWithoutProperty(value, key) {
-	const descriptors = Object.getOwnPropertyDescriptors(value)
-	delete descriptors[key]
-	return Object.create(Object.getPrototypeOf(value), descriptors)
-}
-
 function normalizeOwnProperty(value, key, normalize) {
-	const descriptor = Object.getOwnPropertyDescriptor(value, key)
-	if (!descriptor) return value
-	if (Object.hasOwn(descriptor, "value")) {
-		const normalizedValue = normalize(descriptor.value)
-		if (normalizedValue === descriptor.value) return value
-		const normalized = cloneWithoutProperty(value, key)
-		Object.defineProperty(normalized, key, { ...descriptor, value: normalizedValue })
-		return normalized
-	}
-	if (!descriptor.get) return value
-	const normalized = cloneWithoutProperty(value, key)
-	const get = descriptor.get
-	Object.defineProperty(normalized, key, {
-		...descriptor,
-		get() {
-			return normalize(get.call(this))
-		},
-	})
-	return normalized
+	if (!Object.hasOwn(value, key)) return value
+	const ownValue = value[key]
+	const normalizedValue = normalize(ownValue)
+	return normalizedValue === ownValue ? value : { ...value, [key]: normalizedValue }
 }
 
 export function normalizeLegacyMetadata(value) {
@@ -55,7 +30,7 @@ export function normalizeLegacyMetadata(value) {
 	let normalized = value
 	for (const [legacy, current] of Object.entries(LEGACY_FIELD_NAMES)) {
 		if (!Object.hasOwn(value, legacy)) continue
-		if (normalized === value) normalized = cloneWithDescriptors(value)
+		if (normalized === value) normalized = { ...value }
 		if (!Object.hasOwn(normalized, current)) normalized[current] = normalized[legacy]
 		delete normalized[legacy]
 	}

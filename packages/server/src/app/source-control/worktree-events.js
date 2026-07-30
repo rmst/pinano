@@ -246,7 +246,7 @@ function runGit(args, options = {}) {
 			clearTimeout(timer)
 			resolve({ code: 127, stdout, stderr: stderr || err?.message || String(err), timedOut })
 		})
-		child.on("exit", (code, signal) => {
+		child.on("close", (code, signal) => {
 			clearTimeout(timer)
 			resolve({ code: code ?? (timedOut ? 124 : 1), signal, stdout, stderr, timedOut })
 		})
@@ -263,6 +263,32 @@ async function runGitOutput(args, options = {}) {
 	if (result?.timedOut || result?.code !== 0) return undefined
 	const output = String(result.stdout ?? "").trim()
 	return output || undefined
+}
+
+function gitWorktreeDiscoveryError(message, args, result = undefined) {
+	const detail = gitOutputDetail(result)
+	return Object.assign(new Error(`${message}: git ${args.join(" ")}${detail ? ` (${detail})` : ""}`), {
+		code: "CEREX_GIT_WORKTREE_DISCOVERY_FAILED",
+		status: 500,
+		...(result?.timedOut ? { timedOut: true } : {}),
+	})
+}
+
+async function runGitWorktreeDiscoveryOutput(args, options = {}, allowNotRepository = false) {
+	let result
+	try {
+		result = await (options.runGit ?? runGit)(args, options)
+	} catch (err) {
+		throw gitWorktreeDiscoveryError(`Git failed while inspecting a worktree (${err?.message ?? err})`, args)
+	}
+	if (result?.timedOut) throw gitWorktreeDiscoveryError("Git timed out while inspecting a worktree", args, result)
+	if (result?.code !== 0) {
+		if (allowNotRepository && /\bnot a git repository\b/i.test(gitOutputDetail(result))) return undefined
+		throw gitWorktreeDiscoveryError("Git failed while inspecting a worktree", args, result)
+	}
+	const output = String(result.stdout ?? "").trim()
+	if (!output) throw gitWorktreeDiscoveryError("Git returned no worktree metadata", args, result)
+	return output
 }
 
 async function runCloseGit(args, options = {}) {
@@ -294,12 +320,34 @@ async function gitDirForWorktree(path, options = {}) {
 }
 
 export async function isLinkedGitWorktree(path, options = {}) {
-	const [gitDir, gitCommonDir] = await Promise.all([
-		gitDirForWorktree(path, options),
-		gitCommonDirForWorktree(path, options),
-	])
-	if (!gitDir || !gitCommonDir) return false
-	return resolve(gitDir) !== resolve(gitCommonDir)
+	return (await gitWorktreeLocation(path, options))?.linked === true
+}
+
+export async function gitWorktreeLocation(path, options = {}) {
+	if (!existsSync(path)) return undefined
+	const metadataArgs = ["-C", path, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--show-toplevel"]
+	const metadata = await runGitWorktreeDiscoveryOutput(metadataArgs, options, true)
+	if (!metadata) return undefined
+	const [gitDir, gitCommonDir, checkoutRoot] = metadata.split(/\r?\n/)
+	if (!gitDir || !gitCommonDir || !checkoutRoot) throw gitWorktreeDiscoveryError("Git returned incomplete worktree metadata", metadataArgs, { code: 0, stdout: metadata })
+	const resolvedCheckoutRoot = resolve(checkoutRoot)
+	const linked = resolve(gitDir) !== resolve(gitCommonDir)
+	if (!linked) {
+		return {
+			checkoutRoot: resolvedCheckoutRoot,
+			repositoryRoot: resolvedCheckoutRoot,
+			linked: false,
+		}
+	}
+	const listArgs = ["--git-dir", gitCommonDir, "worktree", "list", "--porcelain"]
+	const roots = parseWorktreeListPaths(await runGitWorktreeDiscoveryOutput(listArgs, options))
+	const repositoryRoot = roots[0]
+	if (!repositoryRoot) throw gitWorktreeDiscoveryError("Git returned a worktree list without a repository root", listArgs)
+	return {
+		checkoutRoot: resolvedCheckoutRoot,
+		repositoryRoot,
+		linked: true,
+	}
 }
 
 async function gitCommandBaseForWorktree(record, options = {}) {
